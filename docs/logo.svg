@@ -1,7 +1,13 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 360 130" width="720" height="260">
   <!-- BORG logo v11: b matches g style -->
-  
-  <g fill="none" stroke="black" stroke-linecap="round" stroke-linejoin="round">
+  <style>
+    .text { stroke: black; }
+    @media (prefers-color-scheme: dark) {
+      .text { stroke: white; }
+    }
+  </style>
+
+  <g fill="none" class="text" stroke-linecap="round" stroke-linejoin="round">
     
     <!-- "b" = circle + left stem (mirrors g construction) -->
     <circle cx="48" cy="60" r="24" stroke-width="9"/>
