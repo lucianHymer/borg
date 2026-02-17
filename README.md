@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/logo.svg" alt="borg logo" width="360">
+</p>
+
 # borg
 
 **bot org**
