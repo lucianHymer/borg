@@ -1,5 +1,8 @@
 <p align="center">
-  <img src="docs/logo.svg" alt="borg logo" width="360">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/logo-dark.svg">
+    <img src="docs/logo.svg" alt="borg logo" width="360">
+  </picture>
 </p>
 
 # borg

@@ -1,0 +1,75 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 360 130" width="720" height="260">
+  <!-- BORG logo v11: b matches g style (dark mode variant) -->
+
+  <g fill="none" stroke="white" stroke-linecap="round" stroke-linejoin="round">
+
+    <!-- "b" = circle + left stem (mirrors g construction) -->
+    <circle cx="48" cy="60" r="24" stroke-width="9"/>
+    <line x1="24" y1="10" x2="24" y2="84" stroke-width="9"/>
+
+    <!-- First "o" left half -->
+    <path d="M108,36 A24,24 0 0,0 108,84" stroke-width="9"/>
+
+    <!-- Second "o" right half -->
+    <path d="M204,36 A24,24 0 0,1 204,84" stroke-width="9"/>
+
+    <!-- "r" -->
+    <line x1="246" y1="36" x2="246" y2="84" stroke-width="9"/>
+    <path d="M246,48 Q246,36 261,36" stroke-width="9" fill="none"/>
+
+    <!-- "g" -->
+    <circle cx="294" cy="60" r="24" stroke-width="9"/>
+    <line x1="318" y1="48" x2="318" y2="104" stroke-width="9"/>
+    <path d="M318,104 Q318,118 302,118 Q286,118 280,108" stroke-width="9" fill="none"/>
+  </g>
+
+  <!-- Robot hands (dark gray) -->
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M108,36 A24,24 0 0,1 108,84" stroke-width="9" stroke="#555"/>
+    <path d="M204,36 A24,24 0 0,0 204,84" stroke-width="9" stroke="#555"/>
+  </g>
+
+  <!-- ROBOT -->
+  <g stroke-linecap="round" stroke-linejoin="round">
+
+    <!-- Arms -->
+    <line x1="132" y1="60" x2="148" y2="60" stroke-width="6" stroke="#888"/>
+    <line x1="164" y1="60" x2="180" y2="60" stroke-width="6" stroke="#888"/>
+
+    <!-- Body (skinny t-stem) -->
+    <rect x="148" y="48" width="16" height="28" rx="4" stroke-width="3.5" fill="#ccc" stroke="#666"/>
+
+    <!-- Belly screen -->
+    <rect x="151" y="57" width="10" height="7" rx="2" stroke-width="2" fill="#aaa" stroke="#777"/>
+
+    <!-- Neck -->
+    <line x1="156" y1="40" x2="156" y2="48" stroke-width="4" stroke="#888"/>
+
+    <!-- Head (same width as body) -->
+    <rect x="148" y="14" width="16" height="26" rx="6" stroke-width="3.5" fill="#ccc" stroke="#666"/>
+
+    <!-- Eyes (small rounded rectangles, gray, tighter) -->
+    <rect x="152" y="23" width="3.5" height="4.5" rx="1.2" fill="#666" stroke="none"/>
+    <rect x="157" y="23" width="3.5" height="4.5" rx="1.2" fill="#666" stroke="none"/>
+
+    <!-- Mouth -->
+    <path d="M152,32 Q156,36 160,32" stroke-width="2" fill="none" stroke="#666"/>
+
+    <!-- Antenna -->
+    <line x1="156" y1="14" x2="156" y2="6" stroke-width="2.5" stroke="#888"/>
+    <circle cx="156" cy="5" r="3" fill="#aaa" stroke="#666" stroke-width="2"/>
+
+    <!-- Ear bumps -->
+    <circle cx="146" cy="26" r="3.5" fill="#ccc" stroke="#666" stroke-width="2.5"/>
+    <circle cx="166" cy="26" r="3.5" fill="#ccc" stroke="#666" stroke-width="2.5"/>
+
+    <!-- Legs (tight) -->
+    <line x1="154" y1="76" x2="152" y2="88" stroke-width="4" stroke="#888"/>
+    <line x1="158" y1="76" x2="160" y2="88" stroke-width="4" stroke="#888"/>
+
+    <!-- Feet -->
+    <ellipse cx="149" cy="90" rx="5" ry="3.5" stroke-width="2.5" fill="#ccc" stroke="#666"/>
+    <ellipse cx="163" cy="90" rx="5" ry="3.5" stroke-width="2.5" fill="#ccc" stroke="#666"/>
+
+  </g>
+</svg>
