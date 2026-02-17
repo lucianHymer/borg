@@ -22,5 +22,8 @@
         ]
       }
     ]
+  },
+  "enabledPlugins": {
+    "mim-ai@mim-marketplace": true
   }
 }
