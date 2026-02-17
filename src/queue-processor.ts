@@ -11,7 +11,6 @@ import fs from "fs";
 import path from "path";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import type {
-  SDKMessage,
   SDKAssistantMessage,
   SDKResultMessage,
   SDKToolProgressMessage,
@@ -40,6 +39,7 @@ import {
   configureThread,
   buildThreadPrompt,
   buildHeartbeatPrompt,
+  formatHumanTime,
 } from "./session-manager.js";
 import type { ThreadConfig } from "./session-manager.js";
 import { z } from "zod/v4";
@@ -228,6 +228,85 @@ function syncAllActiveSessionLogs(): void {
   }
 }
 
+// ─── Heartbeat State Management ───
+
+type HeartbeatTier = "quick" | "hourly" | "daily";
+
+interface HeartbeatTimestamps {
+    quick: number;
+    hourly: number;
+    daily: number;
+}
+
+type HeartbeatState = Record<string, HeartbeatTimestamps>;
+
+const DEFAULT_TIMESTAMPS: HeartbeatTimestamps = { quick: 0, hourly: 0, daily: 0 };
+const HOURLY_INTERVAL_MS = 60 * 60 * 1000;
+const DAILY_INTERVAL_MS = 24 * HOURLY_INTERVAL_MS;
+
+const HEARTBEAT_STATE_FILE = path.join(BORG_DIR, "heartbeat-state.json");
+
+const HeartbeatTimestampsSchema = z.object({
+    quick: z.number(),
+    hourly: z.number(),
+    daily: z.number(),
+});
+const HeartbeatStateSchema = z.record(z.string(), HeartbeatTimestampsSchema);
+
+let heartbeatStateCache: HeartbeatState | null = null;
+let heartbeatStateMtime = 0;
+
+function loadHeartbeatState(): HeartbeatState {
+    try {
+        const mtime = fs.statSync(HEARTBEAT_STATE_FILE).mtimeMs;
+        if (heartbeatStateCache && mtime === heartbeatStateMtime) return heartbeatStateCache;
+        const raw: unknown = JSON.parse(fs.readFileSync(HEARTBEAT_STATE_FILE, "utf8"));
+        const parsed = HeartbeatStateSchema.safeParse(raw);
+        if (!parsed.success) return {};
+        heartbeatStateCache = parsed.data;
+        heartbeatStateMtime = mtime;
+        return heartbeatStateCache;
+    } catch {
+        heartbeatStateCache = null;
+        heartbeatStateMtime = 0;
+        return {};
+    }
+}
+
+function saveHeartbeatState(state: HeartbeatState): void {
+    const dir = path.dirname(HEARTBEAT_STATE_FILE);
+    if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+    }
+    const tmp = HEARTBEAT_STATE_FILE + ".tmp";
+    fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
+    fs.renameSync(tmp, HEARTBEAT_STATE_FILE);
+    heartbeatStateCache = state;
+    heartbeatStateMtime = fs.statSync(HEARTBEAT_STATE_FILE).mtimeMs;
+}
+
+function getDueTier(threadId: string): HeartbeatTier {
+    const state = loadHeartbeatState();
+    const ts = state[threadId] || DEFAULT_TIMESTAMPS;
+    const now = Date.now();
+
+    if (now - ts.daily > DAILY_INTERVAL_MS) return "daily";
+    if (now - ts.hourly > HOURLY_INTERVAL_MS) return "hourly";
+    return "quick";
+}
+
+function updateHeartbeatState(threadId: string, tier: HeartbeatTier): void {
+    const state = loadHeartbeatState();
+    const now = Date.now();
+    if (!state[threadId]) state[threadId] = { ...DEFAULT_TIMESTAMPS };
+
+    state[threadId].quick = now;
+    if (tier === "hourly" || tier === "daily") state[threadId].hourly = now;
+    if (tier === "daily") state[threadId].daily = now;
+
+    saveHeartbeatState(state);
+}
+
 // ─── Logger ───
 
 function log(level: string, message: string): void {
@@ -315,17 +394,8 @@ function buildRetryFilename(filename: string, retryNum: number): string {
 // ─── Time Injection ───
 
 function formatCurrentTime(): string {
-  const settings = loadSettings();
-  return new Date().toLocaleString("en-US", {
-    timeZone: settings.timezone,
-    weekday: "long",
-    year: "numeric",
-    month: "short",
-    day: "numeric",
-    hour: "numeric",
-    minute: "2-digit",
-    timeZoneName: "short",
-  });
+    const settings = loadSettings();
+    return formatHumanTime(settings.timezone);
 }
 
 // ─── Source-Aware Prefix ───
@@ -470,40 +540,45 @@ async function collectQueryResponse(
 // ─── Heartbeat Processing (one-shot, no persistent session) ───
 
 async function processHeartbeat(msg: IncomingMessage): Promise<string> {
-  const threads = loadThreads();
-  const threadConfig = threads[String(msg.threadId)];
-  if (!threadConfig) {
-    return "[NO_UPDATES]";
-  }
+    const threads = loadThreads();
+    const threadKey = String(msg.threadId);
+    const threadConfig = threads[threadKey];
+    if (!threadConfig) {
+        return "[NO_UPDATES]";
+    }
 
-  const heartbeatPrompt = buildHeartbeatPrompt(threadConfig);
-  const now = formatCurrentTime();
-  const fullPrompt = `[${now}] ${heartbeatPrompt}`;
+    const dueTier = getDueTier(threadKey);
+    const heartbeatPrompt = buildHeartbeatPrompt(threadConfig, dueTier);
 
-  log("INFO", `Heartbeat one-shot for thread ${msg.threadId}`);
+    log("INFO", `Heartbeat one-shot for thread ${msg.threadId} (tier: ${dueTier})`);
 
-  const q = query({
-    prompt: fullPrompt,
-    options: {
-      model: "haiku",
-      cwd: threadConfig.cwd,
-      canUseTool: sdkCanUseTool,
-      settingSources: ["project"],
-      systemPrompt: {
-        type: "preset",
-        preset: "claude_code",
-        append: buildThreadPrompt(threadConfig),
-      },
-      mcpServers: {
-        borg: createBorgMcpServer(msg.threadId),
-      },
-      permissionMode: "bypassPermissions",
-      allowDangerouslySkipPermissions: true,
-    },
-  });
+    const q = query({
+        prompt: heartbeatPrompt,
+        options: {
+            model: "haiku",
+            cwd: threadConfig.cwd,
+            canUseTool: sdkCanUseTool,
+            settingSources: ["project"],
+            systemPrompt: {
+                type: "preset",
+                preset: "claude_code",
+                append: buildThreadPrompt(threadConfig),
+            },
+            mcpServers: {
+                borg: createBorgMcpServer(msg.threadId),
+            },
+            permissionMode: "bypassPermissions",
+            allowDangerouslySkipPermissions: true,
+        },
+    });
 
-  const { text } = await collectQueryResponse(q);
-  return text.trim() || "[NO_UPDATES]";
+    const { text } = await collectQueryResponse(q);
+    const response = text.trim() || "[NO_UPDATES]";
+
+    // Always update state on successful response
+    updateHeartbeatState(threadKey, dueTier);
+
+    return response;
 }
 
 // ─── Route a message to the right model ───

@@ -25,7 +25,7 @@ import {
     formatSSHConfig,
 } from "./docker-client.js";
 import { parseMeminfo, parseCpuPercent, getDiskUsage, countQueueFiles } from "./host-metrics.js";
-import { loadThreads } from "./session-manager.js";
+import { loadThreads, loadSettings, formatHumanTime } from "./session-manager.js";
 import { toErrorMessage, parseSSHPublicKey, parseDevEmail } from "./types.js";
 
 const PROJECT_DIR = path.resolve(__dirname, "..");
@@ -467,11 +467,86 @@ export function createBorgMcpServer(sourceThreadId: number) {
         },
     );
 
+    const getCurrentTime = tool(
+        "get_current_time",
+        "Get the current date and time. Use this instead of guessing the time.",
+        {
+            timezone: z.string().optional()
+                .describe("IANA timezone (e.g., 'America/New_York'). Defaults to bot timezone."),
+        },
+        async ({ timezone }) => {
+            try {
+                const settings = loadSettings();
+                const tz = timezone || settings.timezone;
+                const now = new Date();
+                const human = formatHumanTime(tz, now);
+                return {
+                    content: [textContent(JSON.stringify({
+                        iso: now.toISOString(),
+                        human,
+                        timezone: tz,
+                        epoch_ms: now.getTime(),
+                    }))],
+                };
+            } catch (err) {
+                return {
+                    content: [textContent(`Failed to get current time: ${toErrorMessage(err)}`)],
+                    isError: true,
+                };
+            }
+        },
+    );
+
+    const getElapsedTime = tool(
+        "get_elapsed_time",
+        "Calculate how much time has passed since a timestamp. Use this instead of doing date math yourself.",
+        {
+            since: z.string()
+                .describe("ISO 8601 timestamp (e.g., '2026-02-17T14:30:00Z') or epoch milliseconds as string (e.g., '1708185600000')"),
+        },
+        async ({ since }) => {
+            try {
+                const parsed = /^\d+$/.test(since) ? Number(since) : new Date(since).getTime();
+                if (isNaN(parsed) || !isFinite(parsed)) {
+                    return { content: [textContent("Invalid timestamp format. Use ISO 8601 or epoch milliseconds.")], isError: true };
+                }
+                const now = Date.now();
+                const diffMs = now - parsed;
+                const absMinutes = Math.floor(Math.abs(diffMs) / 60000);
+                const totalHours = Math.floor(absMinutes / 60);
+                const totalDays = Math.floor(totalHours / 24);
+
+                const parts: string[] = [];
+                if (totalDays > 0) parts.push(`${totalDays}d`);
+                if (totalHours % 24 > 0) parts.push(`${totalHours % 24}h`);
+                if (absMinutes % 60 > 0 || parts.length === 0) parts.push(`${absMinutes % 60}m`);
+                const human = (diffMs < 0 ? "in " : "") + parts.join(" ") + (diffMs >= 0 ? " ago" : "");
+
+                return {
+                    content: [textContent(JSON.stringify({
+                        elapsed_ms: Math.abs(diffMs),
+                        total_minutes: absMinutes,
+                        total_hours: totalHours,
+                        total_days: totalDays,
+                        human,
+                        is_future: diffMs < 0,
+                    }))],
+                };
+            } catch (err) {
+                return {
+                    content: [textContent(`Failed to calculate elapsed time: ${toErrorMessage(err)}`)],
+                    isError: true,
+                };
+            }
+        },
+    );
+
     // Build tool list: base tools + read-only monitoring for all threads, mutating tools for master only
     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- heterogeneous tool schemas require type erasure
     const tools: Array<ReturnType<typeof tool<any>>> = [
         sendMessage, listThreads, queryKnowledgeBase,
         getContainerStats, getSystemStatus, getHostMemory,
+        getCurrentTime, getElapsedTime,
     ];
     if (sourceThreadId === 1) {
         tools.push(
