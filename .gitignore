@@ -27,3 +27,7 @@ secrets/
 .vscode/
 .idea/
 *.swp
+
+# Mim - Transient/local state files
+.claude/knowledge/unresolved.md
+.claude/knowledge/mim.log

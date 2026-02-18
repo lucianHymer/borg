@@ -425,11 +425,11 @@ function buildSourcePrefix(msg: IncomingMessage): string {
 
 // ─── Status File Helpers ───
 
-function writeStatus(messageId: string, text: string): void {
+function writeStatus(messageId: string, label: string, startTs: number): void {
     try {
         const statusFile = path.join(QUEUE_STATUS, `${messageId}.json`);
         const tmpFile = statusFile + ".tmp";
-        fs.writeFileSync(tmpFile, JSON.stringify({ text, ts: Date.now() }));
+        fs.writeFileSync(tmpFile, JSON.stringify({ label, ts: Date.now(), startTs }));
         fs.renameSync(tmpFile, statusFile);
     } catch {
         // Status updates are best-effort — never crash the process
@@ -769,22 +769,27 @@ async function processMessage(messageFile: string): Promise<void> {
             const options = buildQueryOptions(threadId, threadConfig, effectiveModel);
             const q = query({ prompt: fullPrompt, options });
 
-            // Emit initial "Thinking..." status immediately
+            // Write initial status; the telegram-client computes elapsed time from startTs
             const statusStartTime = Date.now();
-            writeStatus(messageId, "🕐 Thinking... (0s)");
+            let currentStatusLabel = "Thinking";
+            writeStatus(messageId, currentStatusLabel, statusStartTime);
 
+            // Refresh the status file every 2 seconds to keep ts fresh (for staleness detection)
+            // and to pick up label changes from the observer callbacks
+            const statusInterval = setInterval(() => {
+                writeStatus(messageId, currentStatusLabel, statusStartTime);
+            }, 2000);
+
+            // Observer callbacks set intent; the interval handles all file writes
             const observer: QueryEventObserver = {
                 onToolUse(toolName: string) {
-                    const elapsed = Math.round((Date.now() - statusStartTime) / 1000);
-                    writeStatus(messageId, `🕐 Using ${toolName}... (${elapsed}s)`);
+                    currentStatusLabel = `Using ${toolName}`;
                 },
-                onToolProgress(toolName: string, _elapsedSeconds: number) {
-                    const elapsed = Math.round((Date.now() - statusStartTime) / 1000);
-                    writeStatus(messageId, `🕐 Using ${toolName}... (${elapsed}s)`);
+                onToolProgress(toolName: string) {
+                    currentStatusLabel = `Using ${toolName}`;
                 },
                 onCompacting() {
-                    const elapsed = Math.round((Date.now() - statusStartTime) / 1000);
-                    writeStatus(messageId, `🕐 Compacting context... (${elapsed}s)`);
+                    currentStatusLabel = "Compacting context";
                 },
             };
 
@@ -793,6 +798,7 @@ async function processMessage(messageFile: string): Promise<void> {
                     q,
                     observer,
                 );
+                clearInterval(statusInterval);
                 responseText = text.trim();
 
                 // Persist session ID for future resume
@@ -808,6 +814,7 @@ async function processMessage(messageFile: string): Promise<void> {
                     }
                 }
             } catch (queryErr) {
+                clearInterval(statusInterval);
                 log(
                     "ERROR",
                     `Query error for thread ${threadId}: ${toErrorMessage(queryErr)}`,

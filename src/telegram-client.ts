@@ -96,12 +96,14 @@ const topicNames = new Map<number, string>();
 // ─── Pending Messages ───
 
 interface PendingMessage {
-    ctx: Context;
+    ctx?: Context;          // present for user messages, absent for cross-thread
     chatId: number;
     threadId: number;
     telegramMessageId: number;
     statusMessageId?: number;
     lastStatusText?: string;
+    lastStatusLabel?: string;   // base label for change detection
+    lastEditTs?: number;        // last Telegram edit timestamp for throttling
 }
 
 const pendingMessages = new Map<string, PendingMessage>();
@@ -136,6 +138,26 @@ function splitMessage(text: string, maxLength = 4096): string[] {
 
 const settings = loadSettings();
 const bot = new Bot<Context>(settings.telegram_bot_token);
+
+// ─── Helpers ───
+
+/** Send a message to the correct forum topic, using ctx if available or bot API directly */
+async function sendInThread(
+    pending: PendingMessage,
+    text: string,
+): Promise<{ message_id: number }> {
+    const threadId = getThreadOpt(pending);
+    if (pending.ctx) {
+        return pending.ctx.reply(text, { message_thread_id: threadId });
+    }
+    return bot.api.sendMessage(pending.chatId, text, { message_thread_id: threadId });
+}
+
+/** Resolve the Telegram message_thread_id for a pending message */
+function getThreadOpt(pending: PendingMessage): number | undefined {
+    return pending.ctx?.msg?.message_thread_id
+        ?? (pending.threadId !== 1 ? pending.threadId : undefined);
+}
 
 bot.api.config.use(autoRetry({ maxRetryAttempts: 3, maxDelaySeconds: 60 }));
 
@@ -311,15 +333,29 @@ async function pollOutgoingQueue(): Promise<void> {
                     // Cross-thread message: post to the target topic
                     const chatId = settings.telegram_chat_id;
                     const chunks = splitMessage(data.message);
+                    let firstSentId: number | undefined;
 
                     for (const chunk of chunks) {
                         const sent = await bot.api.sendMessage(chatId, chunk, {
                             message_thread_id: data.targetThreadId,
                         });
+                        if (!firstSentId) firstSentId = sent.message_id;
                         if (data.model) {
                             storeMessageModel(sent.message_id, data.model);
                             await reactWithModel(chatId, sent.message_id, data.model);
                         }
+                    }
+
+                    // Register pending message so status updates and final response are tracked.
+                    // The incoming queue message uses the base ID (without _tg suffix).
+                    const chatIdNum = Number(chatId);
+                    if (firstSentId && Number.isFinite(chatIdNum)) {
+                        const incomingId = data.messageId.replace(/_tg$/, "");
+                        pendingMessages.set(incomingId, {
+                            chatId: chatIdNum,
+                            threadId: data.targetThreadId,
+                            telegramMessageId: firstSentId,
+                        });
                     }
 
                     log(
@@ -363,9 +399,7 @@ async function pollOutgoingQueue(): Promise<void> {
                             }
                             // Send remaining chunks as new messages
                             for (let i = 1; i < chunks.length; i++) {
-                                const sent = await pending.ctx.reply(chunks[i], {
-                                    message_thread_id: pending.ctx.msg?.message_thread_id,
-                                });
+                                const sent = await sendInThread(pending, chunks[i]);
                                 if (data.model) {
                                     storeMessageModel(sent.message_id, data.model);
                                 }
@@ -373,9 +407,7 @@ async function pollOutgoingQueue(): Promise<void> {
                         } else {
                             // No status message or edit failed — send all chunks normally
                             for (const chunk of chunks) {
-                                const sent = await pending.ctx.reply(chunk, {
-                                    message_thread_id: pending.ctx.msg?.message_thread_id,
-                                });
+                                const sent = await sendInThread(pending, chunk);
                                 if (data.model) {
                                     storeMessageModel(sent.message_id, data.model);
                                     await reactWithModel(pending.chatId, sent.message_id, data.model);
@@ -429,10 +461,12 @@ function cleanupPendingMessages(): void {
     const timeout = 5 * 60 * 1000; // 5 minutes
 
     for (const [messageId, pending] of pendingMessages) {
+        // User messages: "{ts}_{rand}", cross-thread: "cross_{ts}_{rand}"
         const parts = messageId.split("_");
-        const timestamp = parseInt(parts[0], 10);
+        const tsStr = messageId.startsWith("cross_") ? parts[1] : parts[0];
+        const timestamp = parseInt(tsStr, 10);
 
-        if (now - timestamp > timeout) {
+        if (!Number.isFinite(timestamp) || now - timestamp > timeout) {
             // Delete Telegram status message if it exists
             if (pending.statusMessageId) {
                 bot.api.deleteMessage(pending.chatId, pending.statusMessageId).catch(() => {});
@@ -455,15 +489,31 @@ async function pollStatusFiles(): Promise<void> {
     for (const [messageId, pending] of pendingMessages) {
         const statusFile = path.join(QUEUE_STATUS, `${messageId}.json`);
 
-        let statusData: { text: string; ts: number };
+        let statusData: { label: string; ts: number; startTs: number };
         try {
             if (!fs.existsSync(statusFile)) continue;
             statusData = JSON.parse(fs.readFileSync(statusFile, "utf8"));
+            if (!statusData.label || !statusData.startTs) continue; // invalid format
         } catch {
             continue; // File may be mid-write or already deleted
         }
 
-        if (statusData.text === pending.lastStatusText) continue;
+        // Compute elapsed time from processing start
+        const elapsed = Math.round((Date.now() - statusData.startTs) / 1000);
+
+        // Detect stalled processing (queue processor should write every 2s)
+        const isStale = Date.now() - statusData.ts > 15_000;
+        const displayText = isStale
+            ? `🕐 ${statusData.label}... — stalled`
+            : `🕐 ${statusData.label}... (${elapsed}s)`;
+
+        // Skip if display text hasn't changed
+        if (displayText === pending.lastStatusText) continue;
+
+        // Label changes: edit immediately. Timer-only changes: throttle to every 20s.
+        const labelChanged = statusData.label !== pending.lastStatusLabel;
+        const timeSinceLastEdit = Date.now() - (pending.lastEditTs ?? 0);
+        if (!labelChanged && !isStale && timeSinceLastEdit < 20_000) continue;
 
         try {
             if (pending.statusMessageId) {
@@ -471,22 +521,23 @@ async function pollStatusFiles(): Promise<void> {
                 await bot.api.editMessageText(
                     pending.chatId,
                     pending.statusMessageId,
-                    statusData.text,
+                    displayText,
                 );
-                pending.lastStatusText = statusData.text;
             } else {
                 // Send new status message as reply to original
                 const sent = await bot.api.sendMessage(
                     pending.chatId,
-                    statusData.text,
+                    displayText,
                     {
-                        message_thread_id: pending.ctx.msg?.message_thread_id,
+                        message_thread_id: getThreadOpt(pending),
                         reply_parameters: { message_id: pending.telegramMessageId },
                     },
                 );
                 pending.statusMessageId = sent.message_id;
-                pending.lastStatusText = statusData.text;
             }
+            pending.lastStatusText = displayText;
+            pending.lastStatusLabel = statusData.label;
+            pending.lastEditTs = Date.now();
         } catch {
             // editMessageText may fail if message was deleted or content unchanged — ignore
         }
@@ -501,7 +552,7 @@ async function sendTypingForPending(): Promise<void> {
     for (const [, pending] of pendingMessages) {
         try {
             await bot.api.sendChatAction(pending.chatId, "typing", {
-                message_thread_id: pending.ctx.msg?.message_thread_id,
+                message_thread_id: getThreadOpt(pending),
             });
         } catch {
             // Ignore errors — bot may not have started yet or chat may be unavailable

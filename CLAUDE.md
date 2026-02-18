@@ -52,3 +52,9 @@ npm run telegram # Start Telegram client
 npm run queue    # Start queue processor
 ./borg.sh start  # Start all via tmux
 ```
+
+
+## Mim Knowledge
+
+@.claude/knowledge/INSTRUCTIONS.md
+@.claude/knowledge/KNOWLEDGE_MAP_CLAUDE.md
