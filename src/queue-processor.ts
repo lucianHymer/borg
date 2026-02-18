@@ -453,6 +453,7 @@ function buildQueryOptions(
     threadId: number,
     threadConfig: ThreadConfig,
     effectiveModel: string,
+    stderrLines?: string[],
 ): Options {
     const opts: Options = {
         model: effectiveModel,
@@ -469,6 +470,9 @@ function buildQueryOptions(
         },
         permissionMode: "bypassPermissions",
         allowDangerouslySkipPermissions: true,
+        stderr: stderrLines
+            ? (data: string) => { stderrLines.push(data); }
+            : undefined,
     };
 
     // Resume existing session if available
@@ -564,6 +568,7 @@ async function processHeartbeat(msg: IncomingMessage): Promise<string> {
 
     log("INFO", `Heartbeat one-shot for thread ${msg.threadId} (tier: ${dueTier})`);
 
+    const stderrLines: string[] = [];
     const q = query({
         prompt: heartbeatPrompt,
         options: {
@@ -581,16 +586,27 @@ async function processHeartbeat(msg: IncomingMessage): Promise<string> {
             },
             permissionMode: "bypassPermissions",
             allowDangerouslySkipPermissions: true,
+            stderr: (data: string) => { stderrLines.push(data); },
         },
     });
 
-    const { text } = await collectQueryResponse(q);
-    const response = text.trim() || "[NO_UPDATES]";
+    try {
+        const { text } = await collectQueryResponse(q);
+        const response = text.trim() || "[NO_UPDATES]";
 
-    // Always update state on successful response
-    updateHeartbeatState(threadKey, dueTier);
+        // Always update state on successful response
+        updateHeartbeatState(threadKey, dueTier);
 
-    return response;
+        return response;
+    } catch (err) {
+        const stderrOutput = stderrLines.join("").trim();
+        log(
+            "ERROR",
+            `Heartbeat query error for thread ${msg.threadId}: ${toErrorMessage(err)}` +
+                (stderrOutput ? `\n  stderr: ${stderrOutput.slice(0, 2000)}` : ""),
+        );
+        throw err;
+    }
 }
 
 // ─── Route a message to the right model ───
@@ -766,7 +782,8 @@ async function processMessage(messageFile: string): Promise<void> {
             });
 
             // ─── Send query ───
-            const options = buildQueryOptions(threadId, threadConfig, effectiveModel);
+            const stderrLines: string[] = [];
+            const options = buildQueryOptions(threadId, threadConfig, effectiveModel, stderrLines);
             const q = query({ prompt: fullPrompt, options });
 
             // Write initial status; the telegram-client computes elapsed time from startTs
@@ -815,9 +832,11 @@ async function processMessage(messageFile: string): Promise<void> {
                 }
             } catch (queryErr) {
                 clearInterval(statusInterval);
+                const stderrOutput = stderrLines.join("").trim();
                 log(
                     "ERROR",
-                    `Query error for thread ${threadId}: ${toErrorMessage(queryErr)}`,
+                    `Query error for thread ${threadId}: ${toErrorMessage(queryErr)}` +
+                        (stderrOutput ? `\n  stderr: ${stderrOutput.slice(0, 2000)}` : ""),
                 );
 
                 // Clear stale sessionId on error
