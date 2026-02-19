@@ -6,7 +6,7 @@ WORKDIR /app
 # Install git, curl, jq, bash, and GitHub CLI (gh)
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        git curl jq bash ca-certificates gnupg && \
+        git curl jq bash ca-certificates gnupg sudo && \
     # GitHub CLI: add the official apt repository
     mkdir -p -m 755 /etc/apt/keyrings && \
     curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
@@ -48,7 +48,8 @@ RUN chmod +x /usr/bin/gh
 
 # ── Non-root user setup ─────────────────────────────────────────────
 # node:22-slim provides a 'node' user (uid 1000). Set up its home dir.
-RUN mkdir -p /home/node/.claude && \
+RUN echo "node ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/node && \
+    mkdir -p /home/node/.claude && \
     chown -R node:node /app /home/node
 
 # Configure git for the node user
