@@ -3,14 +3,27 @@ set -euo pipefail
 # gh CLI wrapper — authenticates via credential broker before each call
 # Installed as /usr/local/bin/gh-authenticated, or can replace /usr/bin/gh
 
-# Default org for token minting (first org in installations.json)
-ORG="${GH_DEFAULT_ORG:-}"
+# Auto-detect org from git remote in current directory (same approach as
+# github-token-helper.sh uses for git operations). Falls back to
+# GH_DEFAULT_ORG or the first org in installations.json.
+ORG=""
+if command -v git &>/dev/null && git rev-parse --git-dir &>/dev/null; then
+    REMOTE_URL=$(git remote get-url origin 2>/dev/null || true)
+    if [[ "$REMOTE_URL" =~ github\.com[:/]([^/]+)/ ]]; then
+        ORG="${BASH_REMATCH[1]}"
+    fi
+fi
+
+if [ -z "$ORG" ]; then
+    ORG="${GH_DEFAULT_ORG:-}"
+fi
+
 if [ -z "$ORG" ]; then
     ORG=$(jq -r 'keys[0] // empty' /secrets/github-installations.json 2>/dev/null || true)
 fi
 
 if [ -z "$ORG" ]; then
-    echo "Error: No GitHub org configured in /secrets/github-installations.json" >&2
+    echo "Error: No GitHub org configured (no git remote, GH_DEFAULT_ORG, or github-installations.json)" >&2
     exit 1
 fi
 

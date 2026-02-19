@@ -38,40 +38,14 @@ app.get("/token", async (req, res) => {
   // Check cache
   const cached = cache.get(installationId);
   if (cached && new Date(cached.expiresAt) > new Date(Date.now() + 5 * 60 * 1000)) {
-    return res.json({ token: cached.token, expires_at: cached.expiresAt, permissions: cached.permissions });
+    return res.json({ token: cached.token, expires_at: cached.expiresAt });
   }
 
   try {
     const auth = createAppAuth({ appId, privateKey, installationId: Number(installationId) });
-
-    // Explicitly request permissions — the default "all" behavior doesn't
-    // reliably inherit every installation permission (observed: pull_requests
-    // downgraded to read despite installation having write).
-    const requestedPermissions = {
-      // Read & write
-      actions: "write",
-      contents: "write",
-      deployments: "write",
-      discussions: "write",
-      issues: "write",
-      pull_requests: "write",
-      repository_projects: "write",
-      // Read-only
-      checks: "read",
-      metadata: "read",
-      packages: "read",
-      pages: "read",
-      repository_hooks: "read",
-      security_events: "read",
-      statuses: "read",
-      vulnerability_alerts: "read",
-    };
-
-    const result = await auth({ type: "installation", permissions: requestedPermissions });
-    const { token, expiresAt, permissions } = result;
-    console.log(`Token minted for installation ${installationId}:`, JSON.stringify({ permissions }));
-    cache.set(installationId, { token, expiresAt, permissions });
-    res.json({ token, expires_at: expiresAt, permissions });
+    const { token, expiresAt } = await auth({ type: "installation" });
+    cache.set(installationId, { token, expiresAt });
+    res.json({ token, expires_at: expiresAt });
   } catch (err) {
     console.error(`Token error for installation ${installationId}:`, err.message);
     res.status(500).json({ error: "Failed to mint token" });
