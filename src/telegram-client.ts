@@ -29,6 +29,21 @@ const QUEUE_OUTGOING = path.join(SCRIPT_DIR, ".borg/queue/outgoing");
 const LOG_FILE = path.join(SCRIPT_DIR, ".borg/logs/telegram.log");
 const MESSAGE_MODELS_FILE = path.join(SCRIPT_DIR, ".borg/message-models.json");
 const QUEUE_STATUS = path.join(SCRIPT_DIR, ".borg/status");
+const DEDUP_WINDOW_MS = 10_000; // 10 seconds
+
+// ─── Message Deduplication ───
+
+/** Track last message per (threadId, senderId) for dedup */
+const lastMessages = new Map<string, { text: string; ts: number }>();
+
+function isDuplicate(threadId: number, senderId: string, text: string): boolean {
+    const key = `${threadId}:${senderId}`;
+    const now = Date.now();
+    const prev = lastMessages.get(key);
+    // Always update the tracker
+    lastMessages.set(key, { text, ts: now });
+    return !!prev && prev.text === text && (now - prev.ts) < DEDUP_WINDOW_MS;
+}
 
 // ─── Ensure Directories Exist ───
 
@@ -265,6 +280,12 @@ bot.on("message:text").filter(
         // Restrict to configured chat ID
         if (String(ctx.chat.id) !== settings.telegram_chat_id) return;
 
+        // Deduplicate: skip if same sender + thread + text within window
+        if (isDuplicate(threadId, String(ctx.from.id), ctx.message.text)) {
+            log("INFO", `Dedup: skipping duplicate from ${ctx.from.first_name} in thread ${threadId}`);
+            return;
+        }
+
         const messageId = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
         const topicName = topicNames.get(threadId);
         const queueData = {
@@ -361,10 +382,12 @@ async function pollOutgoingQueue(): Promise<void> {
                     const chatId = settings.telegram_chat_id;
                     const chunks = splitMessage(data.message);
 
+                    const threadOpt = data.targetThreadId !== 1
+                        ? { message_thread_id: data.targetThreadId }
+                        : {};
+
                     for (const chunk of chunks) {
-                        const sent = await bot.api.sendMessage(chatId, chunk, {
-                            message_thread_id: data.targetThreadId,
-                        });
+                        const sent = await bot.api.sendMessage(chatId, chunk, threadOpt);
                         if (!firstSentId) firstSentId = sent.message_id;
                         if (data.model) {
                             storeMessageModel(sent.message_id, data.model, data.targetThreadId);
