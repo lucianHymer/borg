@@ -27,6 +27,8 @@ import {
 import { parseMeminfo, parseCpuPercent, getDiskUsage, countQueueFiles } from "./host-metrics.js";
 import { loadThreads, loadSettings, formatHumanTime } from "./session-manager.js";
 import { toErrorMessage, parseSSHPublicKey, parseDevEmail } from "./types.js";
+import { logCorrection, ROUTING_LOG, mergeCorrectionsOntoDecisions } from "./routing-logger.js";
+import { readRecentJsonl } from "./jsonl-reader.js";
 
 const PROJECT_DIR = path.resolve(__dirname, "..");
 const BORG_DIR = path.join(PROJECT_DIR, ".borg");
@@ -36,6 +38,25 @@ const DOCKER_PROXY_URL = process.env.DOCKER_PROXY_URL || "http://docker-proxy:23
 const PUBLIC_HOST = process.env.PUBLIC_HOST || "localhost";
 const DEV_NETWORK = process.env.DEV_NETWORK || "borg_dev";
 const COMPOSE_PROJECT = String(process.env["COMPOSE_PROJECT"] ?? "");
+
+// ─── Message Model Lookup (for correction validation) ───
+
+const MESSAGE_MODELS_FILE = path.join(BORG_DIR, "message-models.json");
+
+function lookupMessageModel(messageId: number): { model: string; threadId: number } | undefined {
+    try {
+        const data = fs.readFileSync(MESSAGE_MODELS_FILE, "utf8");
+        const raw = JSON.parse(data) as Record<string, unknown>;
+        const entry = raw[String(messageId)];
+        if (typeof entry === "string") return { model: entry, threadId: 0 };
+        if (entry && typeof entry === "object" && "model" in entry) {
+            return entry as { model: string; threadId: number };
+        }
+        return undefined;
+    } catch {
+        return undefined;
+    }
+}
 
 function textContent(text: string) {
     return { type: "text" as const, text };
@@ -467,6 +488,71 @@ export function createBorgMcpServer(sourceThreadId: number) {
         },
     );
 
+    const getRoutingDecisions = tool(
+        "get_routing_decisions",
+        "Get recent routing decisions from the routing log. Returns tier, model, confidence, signals, prompt text, and any user corrections.",
+        {
+            n: z.number().optional().describe("Number of entries (default 50, max 200)"),
+            threadId: z.number().optional().describe("Filter by thread ID"),
+            correctionsOnly: z.boolean().optional().describe("Only return entries with user corrections"),
+        },
+        async ({ n = 50, threadId, correctionsOnly }) => {
+            try {
+                const raw = readRecentJsonl<Record<string, unknown>>(ROUTING_LOG, Math.min(n, 200));
+                const decisions = mergeCorrectionsOntoDecisions(raw);
+
+                let filtered = decisions;
+                if (threadId !== undefined) {
+                    filtered = filtered.filter(d => d.threadId === threadId);
+                }
+                if (correctionsOnly) {
+                    filtered = filtered.filter(d => d.userCorrection !== undefined);
+                }
+
+                return { content: [textContent(JSON.stringify(filtered, null, 2))] };
+            } catch (err) {
+                return {
+                    content: [textContent(`Failed to read routing decisions: ${toErrorMessage(err)}`)],
+                    isError: true,
+                };
+            }
+        },
+    );
+
+    const logRoutingCorrection = tool(
+        "log_routing_correction",
+        "Log a routing correction for a message that was routed to the wrong model. Master-only.",
+        {
+            messageId: z.number().describe("Telegram message ID of the misrouted response"),
+            correctedModel: z.enum(["haiku", "sonnet", "opus"]).describe("The model that should have handled this"),
+        },
+        async ({ messageId, correctedModel }) => {
+            try {
+                const stored = lookupMessageModel(messageId);
+                if (!stored) {
+                    return { content: [textContent("Message not found in model cache (may be pruned)")] };
+                }
+                if (correctedModel === stored.model) {
+                    return { content: [textContent("Same model — not a correction")] };
+                }
+                logCorrection({
+                    ts: Date.now(),
+                    type: "correction",
+                    messageId,
+                    threadId: stored.threadId || undefined,
+                    originalModel: stored.model,
+                    correctedModel,
+                }, ROUTING_LOG);
+                return { content: [textContent(`Correction logged: ${stored.model} → ${correctedModel}`)] };
+            } catch (err) {
+                return {
+                    content: [textContent(`Failed to log correction: ${toErrorMessage(err)}`)],
+                    isError: true,
+                };
+            }
+        },
+    );
+
     const getCurrentTime = tool(
         "get_current_time",
         "Get the current date and time. Use this instead of guessing the time.",
@@ -546,12 +632,14 @@ export function createBorgMcpServer(sourceThreadId: number) {
     const tools: Array<ReturnType<typeof tool<any>>> = [
         sendMessage, listThreads, queryKnowledgeBase,
         getContainerStats, getSystemStatus, getHostMemory,
+        getRoutingDecisions,
         getCurrentTime, getElapsedTime,
     ];
     if (sourceThreadId === 1) {
         tools.push(
             updateContainerMemory,
             createDevContainerTool, stopDevContainerTool, startDevContainerTool, deleteDevContainerTool,
+            logRoutingCorrection,
         );
     }
 

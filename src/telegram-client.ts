@@ -6,7 +6,7 @@
 
 import fs from "fs";
 import path from "path";
-import { Bot, Context } from "grammy";
+import { Bot, Context, API_CONSTANTS } from "grammy";
 import { autoRetry } from "@grammyjs/auto-retry";
 import {
     loadThreads,
@@ -18,6 +18,8 @@ import {
 import type { ThreadConfig, ThreadsMap, Settings } from "./session-manager.js";
 import type { OutgoingMessage } from "./types.js";
 import { toErrorMessage } from "./types.js";
+import { RoutingMetadataSchema } from "./types.js";
+import { logDecision, logCorrection, ROUTING_LOG } from "./routing-logger.js";
 
 // ─── Constants ───
 
@@ -49,21 +51,36 @@ function log(level: string, message: string): void {
 
 // ─── Message Model Tracking ───
 
-let messageModelsCache: Record<string, string> | null = null;
+let messageModelsCache: Record<string, { model: string; threadId: number }> | null = null;
 
-function loadMessageModels(): Record<string, string> {
+function loadMessageModels(): Record<string, { model: string; threadId: number }> {
     if (messageModelsCache) return messageModelsCache;
     try {
         const data = fs.readFileSync(MESSAGE_MODELS_FILE, "utf8");
-        messageModelsCache = JSON.parse(data) as Record<string, string>;
+        const raw = JSON.parse(data) as Record<string, unknown>;
+        // Normalize on load: old string values → {model, threadId: 0}
+        let needsRewrite = false;
+        const normalized: Record<string, { model: string; threadId: number }> = {};
+        for (const [key, value] of Object.entries(raw)) {
+            if (typeof value === "string") {
+                normalized[key] = { model: value, threadId: 0 };
+                needsRewrite = true;
+            } else if (value && typeof value === "object" && "model" in value) {
+                normalized[key] = value as { model: string; threadId: number };
+            }
+        }
+        messageModelsCache = normalized;
+        if (needsRewrite) {
+            saveMessageModels(normalized);
+        }
         return messageModelsCache;
     } catch {
-        messageModelsCache = {};
+        messageModelsCache = {} as Record<string, { model: string; threadId: number }>;
         return messageModelsCache;
     }
 }
 
-function saveMessageModels(models: Record<string, string>): void {
+function saveMessageModels(models: Record<string, { model: string; threadId: number }>): void {
     // Prune to last 1000 entries
     const keys = Object.keys(models);
     if (keys.length > 1000) {
@@ -78,13 +95,13 @@ function saveMessageModels(models: Record<string, string>): void {
     messageModelsCache = models;
 }
 
-function storeMessageModel(messageId: number, model: string): void {
+function storeMessageModel(messageId: number, model: string, threadId: number): void {
     const models = loadMessageModels();
-    models[String(messageId)] = model;
+    models[String(messageId)] = { model, threadId };
     saveMessageModels(models);
 }
 
-function lookupMessageModel(messageId: number): string | undefined {
+function lookupMessageModel(messageId: number): { model: string; threadId: number } | undefined {
     const models = loadMessageModels();
     return models[String(messageId)];
 }
@@ -240,10 +257,10 @@ bot.on("message:text").filter(
         const threadId = ctx.msg.message_thread_id ?? 1;
         const isReplyToBot = ctx.msg.reply_to_message?.from?.id === bot.botInfo.id;
         const replyToText = isReplyToBot ? ctx.msg.reply_to_message?.text : undefined;
-        const replyToModel =
-            isReplyToBot && ctx.msg.reply_to_message
-                ? lookupMessageModel(ctx.msg.reply_to_message.message_id)
-                : undefined;
+        const stored = isReplyToBot && ctx.msg.reply_to_message
+            ? lookupMessageModel(ctx.msg.reply_to_message.message_id)
+            : undefined;
+        const replyToModel = stored?.model;
 
         // Restrict to configured chat ID
         if (String(ctx.chat.id) !== settings.telegram_chat_id) return;
@@ -292,7 +309,7 @@ bot.on("message:text").filter(
     },
 );
 
-// ─── Model Reaction Emoji ───
+// ─── Model Reaction Emoji (single source of truth) ───
 
 // ⚡ haiku (fast), ✍ sonnet (writing), 🔥 opus (fire)
 const MODEL_REACTIONS: Record<string, string> = {
@@ -300,6 +317,14 @@ const MODEL_REACTIONS: Record<string, string> = {
     sonnet: "✍",
     opus: "🔥",
 };
+
+// Derived: emoji → model reverse map
+const EMOJI_TO_MODEL: Record<string, string> = Object.fromEntries(
+    Object.entries(MODEL_REACTIONS).map(([model, emoji]) => [emoji, model]),
+);
+
+// Derived: valid model names for validation
+const VALID_MODELS = new Set(Object.keys(MODEL_REACTIONS));
 
 async function reactWithModel(chatId: string | number, messageId: number, model?: string): Promise<void> {
     if (!model) return;
@@ -329,11 +354,12 @@ async function pollOutgoingQueue(): Promise<void> {
             try {
                 const data: OutgoingMessage = JSON.parse(fs.readFileSync(filePath, "utf8"));
 
+                let firstSentId: number | undefined;
+
                 if (data.targetThreadId) {
                     // Cross-thread message: post to the target topic
                     const chatId = settings.telegram_chat_id;
                     const chunks = splitMessage(data.message);
-                    let firstSentId: number | undefined;
 
                     for (const chunk of chunks) {
                         const sent = await bot.api.sendMessage(chatId, chunk, {
@@ -341,7 +367,7 @@ async function pollOutgoingQueue(): Promise<void> {
                         });
                         if (!firstSentId) firstSentId = sent.message_id;
                         if (data.model) {
-                            storeMessageModel(sent.message_id, data.model);
+                            storeMessageModel(sent.message_id, data.model, data.targetThreadId);
                             await reactWithModel(chatId, sent.message_id, data.model);
                         }
                     }
@@ -374,7 +400,6 @@ async function pollOutgoingQueue(): Promise<void> {
                         } catch { /* may not exist */ }
 
                         const chunks = splitMessage(data.message);
-                        let firstSentId: number | undefined;
 
                         if (pending.statusMessageId && chunks.length > 0) {
                             // Edit the status message in-place with the first chunk
@@ -394,22 +419,23 @@ async function pollOutgoingQueue(): Promise<void> {
                         if (firstSentId) {
                             // First chunk was edited in-place — store model and react
                             if (data.model) {
-                                storeMessageModel(firstSentId, data.model);
+                                storeMessageModel(firstSentId, data.model, data.threadId);
                                 await reactWithModel(pending.chatId, firstSentId, data.model);
                             }
                             // Send remaining chunks as new messages
                             for (let i = 1; i < chunks.length; i++) {
                                 const sent = await sendInThread(pending, chunks[i]);
                                 if (data.model) {
-                                    storeMessageModel(sent.message_id, data.model);
+                                    storeMessageModel(sent.message_id, data.model, data.threadId);
                                 }
                             }
                         } else {
                             // No status message or edit failed — send all chunks normally
                             for (const chunk of chunks) {
                                 const sent = await sendInThread(pending, chunk);
+                                if (!firstSentId) firstSentId = sent.message_id;
                                 if (data.model) {
-                                    storeMessageModel(sent.message_id, data.model);
+                                    storeMessageModel(sent.message_id, data.model, data.threadId);
                                     await reactWithModel(pending.chatId, sent.message_id, data.model);
                                 }
                             }
@@ -435,10 +461,23 @@ async function pollOutgoingQueue(): Promise<void> {
 
                         for (const chunk of chunks) {
                             const sent = await bot.api.sendMessage(chatId, chunk, threadOpt);
+                            if (!firstSentId) firstSentId = sent.message_id;
                             if (data.model) {
-                                storeMessageModel(sent.message_id, data.model);
+                                storeMessageModel(sent.message_id, data.model, data.threadId);
                                 await reactWithModel(chatId, sent.message_id, data.model);
                             }
+                        }
+                    }
+                }
+
+                // Log routing decision (only on successful send with routing metadata)
+                if (data.routingMetadata && firstSentId) {
+                    const parsed = RoutingMetadataSchema.safeParse(data.routingMetadata);
+                    if (parsed.success) {
+                        try {
+                            logDecision(parsed.data, firstSentId, data.threadId, ROUTING_LOG);
+                        } catch (err) {
+                            log("ERROR", `Failed to log routing decision: ${err}`);
                         }
                     }
                 }
@@ -560,6 +599,53 @@ async function sendTypingForPending(): Promise<void> {
     }
 }
 
+// ─── Reaction-Based Routing Feedback ───
+
+bot.on("message_reaction", async (ctx) => {
+    // Filter: correct chat
+    if (!ctx.chat || String(ctx.chat.id) !== settings.telegram_chat_id) return;
+
+    // Note: bot self-reactions do NOT trigger this handler (Telegram API guarantee)
+
+    const messageId = ctx.messageReaction.message_id;
+    const reactions = ctx.reactions();
+
+    // Find model emoji in newly added reactions
+    let correctedModel: string | undefined;
+    for (const emoji of reactions.emojiAdded) {
+        if (EMOJI_TO_MODEL[emoji]) {
+            correctedModel = EMOJI_TO_MODEL[emoji];
+            break;
+        }
+    }
+    if (!correctedModel) return; // non-model emoji, ignore
+
+    // Look up original model
+    const stored = lookupMessageModel(messageId);
+    if (!stored) {
+        log("DEBUG", `Reaction on message ${messageId} — model entry not found (pruned or non-bot)`);
+        return;
+    }
+
+    // Filter: must be different model (same model = not a correction)
+    if (correctedModel === stored.model) return;
+
+    // Validate model values before logging
+    if (!VALID_MODELS.has(stored.model)) return;
+
+    // Log correction
+    logCorrection({
+        ts: Date.now(),
+        type: "correction",
+        messageId,
+        threadId: stored.threadId || undefined, // omit if 0 (unknown)
+        originalModel: stored.model,
+        correctedModel,
+    }, ROUTING_LOG);
+
+    log("INFO", `Routing correction: ${stored.model} → ${correctedModel} (msg ${messageId})`);
+});
+
 // ─── Error Handler ───
 
 bot.catch((err) => {
@@ -586,6 +672,7 @@ setInterval(cleanupPendingMessages, 60_000);
 setInterval(pollStatusFiles, 2000);
 
 bot.start({
+    allowed_updates: [...API_CONSTANTS.DEFAULT_UPDATE_TYPES, "message_reaction"],
     onStart: async () => {
         await bot.api.setMyCommands([
             { command: "reset", description: "Reset the current thread session" },

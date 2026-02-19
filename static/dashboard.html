@@ -810,7 +810,7 @@ tr.clickable { cursor: pointer; }
     <div class="tier-summary" id="routing-summary"></div>
     <table id="routing-table">
       <thead>
-        <tr><th>Time</th><th>Tier</th><th>Model</th><th>Confidence</th><th>Tokens</th><th>Signals</th></tr>
+        <tr><th>Time</th><th>Tier</th><th>Model</th><th>Confidence</th><th>Tokens</th><th>Prompt</th><th>Correction</th><th>Signals</th></tr>
       </thead>
       <tbody id="routing-tbody"></tbody>
     </table>
@@ -907,6 +907,10 @@ tr.clickable { cursor: pointer; }
     const div = document.createElement('div');
     div.textContent = str;
     return div.innerHTML;
+  }
+
+  function escapeAttr(str) {
+    return escapeHtml(str).replace(/"/g, '&quot;').replace(/'/g, '&#39;');
   }
 
   function truncate(str, len) {
@@ -1497,16 +1501,31 @@ tr.clickable { cursor: pointer; }
 
   // ─── View 4: Routing Inspector ───
 
-  function initRouting() {
-    fetchRoutingRecent();
-
+  async function initRouting() {
     closeSSE('routing');
+    await fetchRoutingRecent();
+
     state.eventSources.routing = createSSE('/api/routing/feed', function(evt) {
       try {
         var entry = JSON.parse(evt.data);
-        state.routingEntries.unshift(entry);
-        if (state.routingEntries.length > 200) state.routingEntries.pop();
-        renderRoutingTable();
+        if (entry.type === 'correction') {
+          // Patch existing row instead of full re-render
+          for (var i = 0; i < state.routingEntries.length; i++) {
+            if (state.routingEntries[i].messageId === entry.messageId) {
+              state.routingEntries[i].userCorrection = entry.correctedModel;
+              var row = document.querySelector('[data-msg-id="' + entry.messageId + '"]');
+              if (row) {
+                var cell = row.querySelector('.correction-cell');
+                if (cell) cell.innerHTML = modelBadge(entry.correctedModel);
+              }
+              break;
+            }
+          }
+        } else {
+          state.routingEntries.unshift(entry);
+          if (state.routingEntries.length > 200) state.routingEntries.pop();
+          renderRoutingTable();
+        }
       } catch(e) {}
     });
   }
@@ -1538,20 +1557,25 @@ tr.clickable { cursor: pointer; }
     // Table
     var tbody = document.getElementById('routing-tbody');
     if (entries.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="6" class="empty-state">No routing decisions recorded</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="8" class="empty-state">No routing decisions recorded</td></tr>';
       return;
     }
 
     var html = '';
     for (var i = 0; i < entries.length; i++) {
       var e = entries[i];
-      html += '<tr>' +
+      var promptDisplay = e.prompt ? truncate(e.prompt, 80) : (e.promptHash ? '[hashed]' : '\u2014');
+      html += '<tr data-msg-id="' + (e.messageId || '') + '">' +
         '<td>' + formatTimestamp(e.ts) + '</td>' +
         '<td>' + tierBadge(e.tier) + '</td>' +
         '<td>' + modelBadge(e.model) + '</td>' +
         '<td>' + ((e.confidence || 0) * 100).toFixed(0) + '%</td>' +
         '<td>' + (e.tokens || e.estimatedTokens || '?') + '</td>' +
-        '<td style="max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="' + escapeHtml((e.signals || []).join(', ')) + '">' +
+        '<td style="max-width:250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="' + escapeAttr(e.prompt || '') + '">' +
+          escapeHtml(promptDisplay) + '</td>' +
+        '<td class="correction-cell">' +
+          (e.userCorrection ? modelBadge(e.userCorrection) : '') + '</td>' +
+        '<td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="' + escapeAttr((e.signals || []).join(', ')) + '">' +
           escapeHtml((e.signals || []).join(', ')) +
         '</td>' +
       '</tr>';

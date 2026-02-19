@@ -18,6 +18,8 @@ import {
 } from "./docker-client.js";
 import { parseMeminfo, parseCpuPercent, getDiskUsage, countQueueFiles, PROC_BASE } from "./host-metrics.js";
 import { toErrorMessage, isValidSessionId, ValidationError } from "./types.js";
+import { mergeCorrectionsOntoDecisions } from "./routing-logger.js";
+import { readRecentJsonl } from "./jsonl-reader.js";
 
 const SCRIPT_DIR = path.resolve(__dirname, "..");
 const BORG_DIR = path.join(SCRIPT_DIR, ".borg");
@@ -34,37 +36,6 @@ if (!COMPOSE_PROJECT) {
 
 interface TailState {
     offset: number;
-}
-
-// Read the last N entries from a JSONL file (read from end)
-function readRecentJsonl<T = unknown>(filePath: string, n: number): T[] {
-    if (!fs.existsSync(filePath)) return [];
-    const stat = fs.statSync(filePath);
-    if (stat.size === 0) return [];
-
-    const TAIL_BYTES = Math.min(256 * 1024, stat.size); // 256KB max
-    const fd = fs.openSync(filePath, "r");
-    try {
-        const buf = Buffer.alloc(TAIL_BYTES);
-        const readStart = Math.max(0, stat.size - TAIL_BYTES);
-        fs.readSync(fd, buf, 0, TAIL_BYTES, readStart);
-        const content = buf.toString("utf8");
-        const lines = content.split("\n").filter(l => l.trim());
-        // Skip first line if we started mid-file (likely truncated)
-        if (readStart > 0 && lines.length > 0) lines.shift();
-
-        const entries: T[] = [];
-        for (const line of lines) {
-            try {
-                entries.push(JSON.parse(line) as T);
-            } catch {
-                /* skip malformed */
-            }
-        }
-        return entries.slice(-n);
-    } finally {
-        fs.closeSync(fd);
-    }
 }
 
 // ─── Host Metrics (dashboard-local) ───
@@ -261,8 +232,9 @@ app.get("/api/routing/feed", (_req, res) => {
 // GET /api/routing/recent?n=50
 app.get("/api/routing/recent", (req, res) => {
     const n = Math.min(parseInt(String(req.query.n ?? "50"), 10) || 50, 200);
-    const entries = readRecentJsonl(path.join(BORG_DIR, "logs/routing.jsonl"), n);
-    res.json(entries);
+    const raw = readRecentJsonl<Record<string, unknown>>(path.join(BORG_DIR, "logs/routing.jsonl"), n);
+    const decisions = mergeCorrectionsOntoDecisions(raw);
+    res.json(decisions);
 });
 
 // GET /api/prompts/recent?n=20
