@@ -1,0 +1,5 @@
+# Cross-thread pending message registration pattern
+
+Cross-thread messages generate two queue entries: one incoming (messageId = base ID) for queue-processor, one outgoing (messageId = base ID + "_tg" suffix) for telegram-client display. telegram-client strips "_tg" to recover the base ID and registers a PendingMessage so status updates and final responses are tracked. The _tg suffix convention is an implicit contract between mcp-tools.ts and telegram-client.ts — not codified in a shared constant. cleanupPendingMessages cannot parse timestamps from cross_* IDs (parts[0] is "cross" not a timestamp), causing these entries to leak. The outgoing cross-thread message in mcp-tools.ts is written as a plain object and doesn't include the required threadId field from the OutgoingMessage interface.
+
+**Related files:** src/mcp-tools.ts, src/telegram-client.ts, src/types.ts

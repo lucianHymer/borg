@@ -20,7 +20,6 @@ import type {
 } from "@anthropic-ai/claude-agent-sdk";
 import { route, DEFAULT_ROUTING_CONFIG, maxTier } from "./router/index.js";
 import type { Tier, RoutingDecision } from "./router/index.js";
-import { logDecision } from "./routing-logger.js";
 import { toErrorMessage, isValidSessionId } from "./types.js";
 import type { IncomingMessage, OutgoingMessage } from "./types.js";
 import {
@@ -82,7 +81,6 @@ const QUEUE_DEAD_LETTER = path.join(BORG_DIR, "queue/dead-letter");
 const QUEUE_COMMANDS = path.join(BORG_DIR, "queue/commands");
 const QUEUE_STATUS = path.join(BORG_DIR, "status");
 const LOG_FILE = path.join(BORG_DIR, "logs/queue.log");
-const ROUTING_LOG = path.join(BORG_DIR, "logs/routing.jsonl");
 const PROMPTS_LOG = path.join(BORG_DIR, "logs/prompts.jsonl");
 const PROMPTS_LOG_BACKUP = path.join(BORG_DIR, "logs/prompts.1.jsonl");
 const MAX_PROMPTS_LOG_SIZE = 10 * 1024 * 1024; // 10MB
@@ -636,8 +634,6 @@ function routeMessage(
 
     const effectiveModel = tierToModel(effectiveTier);
 
-    logDecision(decision, enrichedPrompt, ROUTING_LOG);
-
     return { effectiveModel, decision };
 }
 
@@ -694,6 +690,7 @@ async function processMessage(messageFile: string): Promise<void> {
 
     let responseText: string;
     let effectiveModel: string;
+    let routingResult: { effectiveModel: string; decision: RoutingDecision } | undefined;
 
     try {
         // ─── Heartbeat: one-shot, skip router and session ───
@@ -716,7 +713,7 @@ async function processMessage(messageFile: string): Promise<void> {
         } else {
             // ─── Route the message ───
             const recentHistory = getRecentHistory({ threadId, limit: 5 });
-            const routingResult = routeMessage(msg, recentHistory);
+            routingResult = routeMessage(msg, recentHistory);
             effectiveModel = routingResult.effectiveModel;
 
             log(
@@ -884,6 +881,16 @@ async function processMessage(messageFile: string): Promise<void> {
             timestamp: Date.now(),
             messageId,
             model: effectiveModel,
+            ...(source !== "heartbeat" && routingResult ? {
+                routingMetadata: {
+                    tier: routingResult.decision.tier,
+                    model: effectiveModel,
+                    confidence: routingResult.decision.confidence,
+                    signals: routingResult.decision.signals,
+                    tokens: routingResult.decision.estimatedTokens,
+                    prompt: message,
+                },
+            } : {}),
         };
 
         const responseFile =

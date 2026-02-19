@@ -4,7 +4,7 @@ Telegram forum-based multi-session Claude agent with SDK v2, smart routing, and 
 
 ## Architecture
 
-- **Telegram Client** (`src/telegram-client.ts`) — grammY bot handling all forum topics, I/O only
+- **Telegram Client** (`src/telegram-client.ts`) — grammY bot handling all forum topics, I/O and routing log finalization
 - **Queue Processor** (`src/queue-processor.ts`) — SDK v2 sessions, routing, history injection
 - **Session Manager** (`src/session-manager.ts`) — threadId → session lifecycle, threads.json
 - **Router** (`src/router/`) — 14-dimension weighted scoring engine, model selection

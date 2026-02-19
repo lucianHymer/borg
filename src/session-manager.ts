@@ -274,6 +274,7 @@ function buildMcpToolsBlock(isMaster: boolean): string {
         "- `get_container_stats` — Get memory usage, CPU, uptime, idle status for all containers (infra + dev) with category tags",
         "- `get_system_status` — Get CPU, RAM, disk, load averages, and message queue depths",
         "- `get_host_memory` — Get host total/available memory, OS reserve, and max allocatable for containers",
+        "- `get_routing_decisions` — Get recent routing decisions with model, confidence, prompt text, and any user corrections",
         "- `get_current_time` — Get the current date and time in any timezone",
         "- `get_elapsed_time` — Calculate how much time has passed since a timestamp",
     ];
@@ -286,6 +287,7 @@ function buildMcpToolsBlock(isMaster: boolean): string {
             "- `stop_dev_container` — Stop a running dev container by name. Reversible.",
             "- `start_dev_container` — Start a stopped dev container by name.",
             "- `delete_dev_container` — Permanently delete a dev container by name. Cannot be undone.",
+            "- `log_routing_correction` — Log a routing correction for a misrouted message. Accepts messageId + correctedModel.",
         );
     }
     return lines.join("\n");

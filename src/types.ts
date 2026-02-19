@@ -2,7 +2,9 @@
  * Shared types and utilities used across Borg modules.
  */
 
+import { z } from "zod/v4";
 import type { MessageSource } from "./message-history.js";
+import type { Tier } from "./router/types.js";
 
 // ─── Queue Message Types ───
 
@@ -32,7 +34,28 @@ export interface OutgoingMessage {
     messageId: string;
     model: string;
     targetThreadId?: number;
+    routingMetadata?: RoutingMetadata;
 }
+
+// ─── Routing Metadata ───
+
+export interface RoutingMetadata {
+    tier: Tier;
+    model: string;
+    confidence: number;
+    signals: string[];
+    tokens: number;
+    prompt: string;
+}
+
+export const RoutingMetadataSchema = z.object({
+    tier: z.enum(["SIMPLE", "MEDIUM", "COMPLEX"]),
+    model: z.string(),
+    confidence: z.number().min(0).max(1),
+    signals: z.array(z.string()).max(50),
+    tokens: z.number().nonnegative(),
+    prompt: z.string().max(8192),
+});
 
 // ─── Validation Utilities ───
 
