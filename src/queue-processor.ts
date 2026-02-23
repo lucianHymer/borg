@@ -853,12 +853,6 @@ async function processMessage(messageFile: string): Promise<void> {
             responseText = "(No response generated)";
         }
 
-        // Truncate very long responses
-        if (responseText.length > 4000) {
-            responseText =
-                responseText.substring(0, 3900) + "\n\n[Response truncated...]";
-        }
-
         // ─── Log outgoing message to history ───
         appendHistory({
             ts: Date.now(),
