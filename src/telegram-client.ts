@@ -361,7 +361,11 @@ async function reactWithModel(chatId: string | number, messageId: number, model?
 
 // ─── Outgoing Queue Polling ───
 
+let outgoingPollActive = false;
+
 async function pollOutgoingQueue(): Promise<void> {
+    if (outgoingPollActive) return;
+    outgoingPollActive = true;
     try {
         if (!fs.existsSync(QUEUE_OUTGOING)) return;
 
@@ -513,6 +517,8 @@ async function pollOutgoingQueue(): Promise<void> {
         }
     } catch (err) {
         log("ERROR", `Outgoing queue poll error: ${toErrorMessage(err)}`);
+    } finally {
+        outgoingPollActive = false;
     }
 }
 
