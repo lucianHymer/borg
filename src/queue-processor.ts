@@ -103,7 +103,24 @@ const SESSIONS_DIR = path.join(BORG_DIR, "sessions");
     }
 });
 
+// ─── Retry Helpers (hoisted above recovery so recovery can use them) ───
+
+const MAX_RETRIES = 3;
+
+function getRetryCount(filename: string): number {
+    const match = filename.match(/_retry(\d+)/);
+    return match ? parseInt(match[1], 10) : 0;
+}
+
+function buildRetryFilename(filename: string, retryNum: number): string {
+    const base = filename.replace(/_retry\d+/, "");
+    const ext = path.extname(base);
+    const stem = base.slice(0, -ext.length);
+    return `${stem}_retry${retryNum}${ext}`;
+}
+
 // ─── Startup Recovery: move stuck processing/ files back to incoming/ ───
+// Increment retry count so crash-loops eventually hit dead-letter.
 
 {
     const stuckFiles = fs
@@ -111,11 +128,24 @@ const SESSIONS_DIR = path.join(BORG_DIR, "sessions");
         .filter((f) => f.endsWith(".json"));
     for (const file of stuckFiles) {
         try {
-            fs.renameSync(
-                path.join(QUEUE_PROCESSING, file),
-                path.join(QUEUE_INCOMING, file),
-            );
-            console.log(`[RECOVERY] Moved stuck file back to incoming: ${file}`);
+            const currentRetry = getRetryCount(file);
+            if (currentRetry >= MAX_RETRIES - 1) {
+                // Exhausted retries — move to dead-letter instead of looping forever
+                const deadLetterPath = path.join(
+                    QUEUE_DEAD_LETTER,
+                    `${Date.now()}_${file}`,
+                );
+                fs.renameSync(path.join(QUEUE_PROCESSING, file), deadLetterPath);
+                console.log(`[RECOVERY] Max retries exceeded, moved to dead-letter: ${file}`);
+            } else {
+                // Bump retry count so the file converges toward dead-letter
+                const retryFilename = buildRetryFilename(file, currentRetry + 1);
+                fs.renameSync(
+                    path.join(QUEUE_PROCESSING, file),
+                    path.join(QUEUE_INCOMING, retryFilename),
+                );
+                console.log(`[RECOVERY] Moved stuck file back to incoming: ${file} -> ${retryFilename}`);
+            }
         } catch {
             // Best effort — file may have been cleaned up already
         }
@@ -381,22 +411,6 @@ const sdkCanUseTool: SDKCanUseTool = async (toolName, input, _options) => {
     }
     return { behavior: "deny", message: result.message };
 };
-
-// ─── Retry Helpers ───
-
-const MAX_RETRIES = 3;
-
-function getRetryCount(filename: string): number {
-    const match = filename.match(/_retry(\d+)/);
-    return match ? parseInt(match[1], 10) : 0;
-}
-
-function buildRetryFilename(filename: string, retryNum: number): string {
-    const base = filename.replace(/_retry\d+/, "");
-    const ext = path.extname(base);
-    const stem = base.slice(0, -ext.length);
-    return `${stem}_retry${retryNum}${ext}`;
-}
 
 // ─── Time Injection ───
 
@@ -835,14 +849,6 @@ async function processMessage(messageFile: string): Promise<void> {
                     `Query error for thread ${threadId}: ${toErrorMessage(queryErr)}` +
                         (stderrOutput ? `\n  stderr: ${stderrOutput.slice(0, 2000)}` : ""),
                 );
-
-                // Clear stale sessionId on error
-                const freshThreads = loadThreads();
-                const freshKey = String(threadId);
-                if (freshThreads[freshKey]) {
-                    delete freshThreads[freshKey].sessionId;
-                    saveThreads(freshThreads);
-                }
 
                 throw queryErr;
             }
