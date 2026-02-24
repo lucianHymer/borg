@@ -850,6 +850,14 @@ async function processMessage(messageFile: string): Promise<void> {
                         (stderrOutput ? `\n  stderr: ${stderrOutput.slice(0, 2000)}` : ""),
                 );
 
+                // Clear stale sessionId on error so retries start a fresh session
+                const freshThreads = loadThreads();
+                const freshKey = String(threadId);
+                if (freshThreads[freshKey]) {
+                    delete freshThreads[freshKey].sessionId;
+                    saveThreads(freshThreads);
+                }
+
                 throw queryErr;
             }
         }
