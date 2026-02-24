@@ -22,7 +22,7 @@ services:
 
   bot:
     build: .
-    restart: always
+    restart: on-failure
     init: true
     stop_grace_period: 30s
     entrypoint: /app/entrypoint.sh
