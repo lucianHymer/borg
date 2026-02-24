@@ -4,16 +4,8 @@ node_modules/
 # TypeScript build output
 dist/
 
-# Borg runtime files
-.borg/logs/
-.borg/queue/
-.borg/threads.json
-.borg/message-history.jsonl
-.borg/message-history.1.jsonl
-.borg/message-models.json
-.borg/routing-log.jsonl
-.borg/settings.json
-.borg/heartbeat-state.json
+# Borg runtime data
+.borg/
 *.log
 
 # Docker / Secrets
