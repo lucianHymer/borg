@@ -162,7 +162,7 @@ function buildRetryFilename(filename: string, retryNum: number): string {
 const TIER_TO_MODEL: Record<Tier, string> = {
     SIMPLE: "haiku",
     MEDIUM: "sonnet",
-    COMPLEX: "opus",
+    COMPLEX: "sonnet",
 };
 
 const MODEL_TO_TIER: Record<string, Tier> = {
