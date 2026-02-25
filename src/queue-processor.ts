@@ -258,10 +258,16 @@ function syncAllActiveSessionLogs(): void {
 
 // ─── Heartbeat State Management ───
 
+interface LastReport {
+    ts: number;
+    summary: string;
+}
+
 interface HeartbeatTimestamps {
     quick: number;
     hourly: number;
     daily: number;
+    lastReport?: LastReport;
 }
 
 type HeartbeatState = Record<string, HeartbeatTimestamps>;
@@ -272,10 +278,15 @@ const DAILY_INTERVAL_MS = 24 * HOURLY_INTERVAL_MS;
 
 const HEARTBEAT_STATE_FILE = path.join(BORG_DIR, "heartbeat-state.json");
 
+const LastReportSchema = z.object({
+    ts: z.number().nonnegative(),
+    summary: z.string(),
+});
 const HeartbeatTimestampsSchema = z.object({
     quick: z.number().nonnegative(),
     hourly: z.number().nonnegative(),
     daily: z.number().nonnegative(),
+    lastReport: LastReportSchema.optional(),
 });
 const HeartbeatStateSchema = z.record(z.string(), HeartbeatTimestampsSchema);
 
@@ -341,6 +352,20 @@ function updateHeartbeatState(threadId: string, tier: HeartbeatTier): void {
     if (tier === "hourly" || tier === "daily") state[threadId].hourly = now;
     if (tier === "daily") state[threadId].daily = now;
 
+    saveHeartbeatState(state);
+}
+
+const LAST_REPORT_MAX_LENGTH = 1000;
+
+function saveLastReport(threadId: string, report: string): void {
+    const state = loadHeartbeatState();
+    if (!state[threadId]) state[threadId] = { ...DEFAULT_TIMESTAMPS };
+    state[threadId].lastReport = {
+        ts: Date.now(),
+        summary: report.length > LAST_REPORT_MAX_LENGTH
+            ? report.slice(0, LAST_REPORT_MAX_LENGTH) + "…"
+            : report,
+    };
     saveHeartbeatState(state);
 }
 
@@ -576,7 +601,9 @@ async function processHeartbeat(msg: IncomingMessage): Promise<string> {
     }
 
     const dueTier = getDueTier(threadKey);
-    const heartbeatPrompt = buildHeartbeatPrompt(threadConfig, dueTier);
+    const state = loadHeartbeatState();
+    const lastReport = state[threadKey]?.lastReport;
+    const heartbeatPrompt = buildHeartbeatPrompt(threadConfig, dueTier, lastReport);
 
     log("INFO", `Heartbeat one-shot for thread ${msg.threadId} (tier: ${dueTier})`);
 
@@ -608,6 +635,11 @@ async function processHeartbeat(msg: IncomingMessage): Promise<string> {
 
         // Always update state on successful response
         updateHeartbeatState(threadKey, dueTier);
+
+        // Save last non-suppressed report so future heartbeats know what was already reported
+        if (!response.includes("[NO_UPDATES]")) {
+            saveLastReport(threadKey, response);
+        }
 
         return response;
     } catch (err) {

@@ -367,6 +367,7 @@ export function buildThreadPrompt(config: ThreadConfig, runtime?: { threadId?: n
 export function buildHeartbeatPrompt(
     config: ThreadConfig,
     dueTier: HeartbeatTier = "quick",
+    lastReport?: { ts: number; summary: string },
 ): string {
     const settings = loadSettings();
     const now = formatHumanTime(settings.timezone);
@@ -391,9 +392,35 @@ export function buildHeartbeatPrompt(
         "After executing your tasks:",
         "- If nothing needs human attention, reply with exactly `[NO_UPDATES]`",
         "- If something is actionable, describe ONLY the actionable items",
+        "- Do NOT narrate your process (no \"Let me check...\", \"I'll read the file...\", \"Time to run heartbeat...\"). Jump straight to findings.",
         "",
         "You may evolve your HEARTBEAT.md over time — add tasks relevant to this repo, remove irrelevant ones, reorder by priority. But do NOT add any timestamp tracking.",
     ];
+
+    // Inject last report to prevent repetitive notifications
+    if (lastReport) {
+        const REPORT_COOLDOWN_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+        const age = Date.now() - lastReport.ts;
+        const agoText = age < 60 * 60 * 1000
+            ? `${Math.round(age / 60000)} minutes ago`
+            : age < 24 * 60 * 60 * 1000
+                ? `${Math.round(age / 3600000)} hours ago`
+                : `${Math.round(age / 86400000)} days ago`;
+
+        if (age < REPORT_COOLDOWN_MS) {
+            parts.push(
+                "",
+                "## Previous Report (dedup context)",
+                `You last reported to the user ${agoText}:`,
+                "---",
+                lastReport.summary,
+                "---",
+                "Do NOT re-report issues that are substantially the same as above.",
+                "Only report if: (1) something materially changed (e.g., a check that was failing now passes, or a new issue appeared), or (2) a previously reported issue has been resolved.",
+                "If the same issues persist unchanged, reply with `[NO_UPDATES]`.",
+            );
+        }
+    }
 
     // Master thread daily extras — preserved from existing implementation
     if (config.isMaster && dueTier === "daily") {
