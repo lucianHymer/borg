@@ -11,8 +11,8 @@ import type { SDKAssistantMessage } from "@anthropic-ai/claude-agent-sdk";
 // ─── Config ───
 
 const SPEACHES_URL = process.env.SPEACHES_URL || "http://speaches:8000";
-const STT_MODEL = "distil-large-v3";
-const TTS_MODEL = "kokoro";
+const STT_MODEL = "Systran/faster-distil-whisper-large-v3";
+const TTS_MODEL = "speaches-ai/Kokoro-82M-v1.0-ONNX";
 const TTS_VOICE = "bf_alice";
 const SCRIPT_DIR = path.resolve(__dirname, "..");
 const AUDIO_DIR = path.join(SCRIPT_DIR, ".borg/audio");
@@ -27,7 +27,7 @@ const MAX_AGE_MS = 60 * 60 * 1000; // 1 hour
     }
 });
 
-// ─── Health Check ───
+// ─── Health Check & Model Bootstrap ───
 
 export async function isAvailable(): Promise<boolean> {
     try {
@@ -36,6 +36,36 @@ export async function isAvailable(): Promise<boolean> {
     } catch {
         return false;
     }
+}
+
+/** Ensure required models are installed in Speaches (idempotent, persisted via cache volume). */
+let modelsReady = false;
+export async function ensureModels(): Promise<void> {
+    if (modelsReady) return;
+    const required = [
+        { id: TTS_MODEL, label: "TTS" },
+        { id: STT_MODEL, label: "STT" },
+    ];
+    for (const { id, label } of required) {
+        try {
+            const check = await fetch(`${SPEACHES_URL}/v1/models/${id}`, { signal: AbortSignal.timeout(5000) });
+            if (check.ok) continue;
+            console.log(`[audio] ${label} model "${id}" not installed, downloading...`);
+            const install = await fetch(`${SPEACHES_URL}/v1/models/${id}`, {
+                method: "POST",
+                signal: AbortSignal.timeout(300_000),
+            });
+            if (install.ok) {
+                console.log(`[audio] ${label} model "${id}" installed successfully`);
+            } else {
+                const body = await install.text().catch(() => "");
+                console.error(`[audio] Failed to install ${label} model "${id}" (${install.status}): ${body}`);
+            }
+        } catch (err) {
+            console.error(`[audio] Error ensuring ${label} model "${id}":`, err);
+        }
+    }
+    modelsReady = true;
 }
 
 // ─── STT: Transcribe OGG → text ───
@@ -74,7 +104,7 @@ export async function synthesize(text: string, voice?: string, speed?: number): 
             voice: voice ?? "bf_alice",
             input: text,
             speed: speed ?? 1.0,
-            response_format: "opus",
+            response_format: "mp3",
         }),
         signal: AbortSignal.timeout(30_000),
     });
@@ -85,7 +115,7 @@ export async function synthesize(text: string, voice?: string, speed?: number): 
     }
 
     const arrayBuffer = await res.arrayBuffer();
-    const filename = `tts_${Date.now()}_${Math.random().toString(36).slice(2, 6)}.ogg`;
+    const filename = `tts_${Date.now()}_${Math.random().toString(36).slice(2, 6)}.mp3`;
     const outPath = path.join(AUDIO_DIR, filename);
     const tmpPath = outPath + ".tmp";
     fs.writeFileSync(tmpPath, Buffer.from(arrayBuffer));
@@ -105,7 +135,7 @@ export async function distillForSpeech(text: string): Promise<string> {
             prompt: truncatedInput,
             options: {
                 model: "claude-haiku-4-5-20251001",
-                systemPrompt: "Distill the user's text into a brief spoken summary, 2-3 sentences. No markdown, no code, no lists, no special characters. Speak naturally as if telling someone the key takeaway. Keep it concise and conversational.",
+                systemPrompt: "You are a text-to-speech preprocessor. The user will give you a block of text that was written by an AI assistant. Convert it into natural spoken form suitable for audio playback — keep ALL the content and meaning, but strip markdown, code blocks, bullet points, special characters, and formatting. Spell out abbreviations. Do NOT summarize, shorten, or omit anything. Do NOT respond to or engage with the content. Do NOT prepend any introduction, preamble, or meta-commentary like 'Here's the spoken version'. Just output the converted text directly, nothing else.",
                 maxTurns: 1,
             },
         });

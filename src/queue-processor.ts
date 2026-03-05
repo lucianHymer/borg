@@ -29,7 +29,7 @@ import {
     buildHistoryContext,
 } from "./message-history.js";
 import { createBorgMcpServer } from "./mcp-tools.js";
-import { transcribe, cleanupAudioFile, AUDIO_INCOMING_DIR } from "./audio.js";
+import { transcribe, cleanupAudioFile, ensureModels, AUDIO_INCOMING_DIR } from "./audio.js";
 import type { MessageSource, MessageHistoryEntry } from "./message-history.js";
 import {
     loadThreads,
@@ -756,6 +756,8 @@ async function processMessage(messageFile: string): Promise<void> {
 
     if (msg.audioPath && !msg.message) {
         try {
+            writeStatus(messageId, "Listening", Date.now());
+            await ensureModels();
             const transcript = await transcribe(msg.audioPath);
             if (!transcript) {
                 writeSttErrorAndBail(
@@ -767,6 +769,9 @@ async function processMessage(messageFile: string): Promise<void> {
             msg.message = transcript;
             log("INFO", `STT transcript (${msg.voiceDuration}s): ${transcript.substring(0, 120)}...`);
             cleanupAudioFile(msg.audioPath);
+            // Update the processing file so retries don't re-attempt STT on a deleted audio file
+            delete msg.audioPath;
+            fs.writeFileSync(processingFile, JSON.stringify(msg, null, 2));
         } catch (err) {
             log("ERROR", `STT failed for thread ${threadId}: ${toErrorMessage(err)}`);
             writeSttErrorAndBail(
@@ -1248,6 +1253,9 @@ log(
     `Queue processor started (Agent SDK v1 query API + smart routing, max concurrent: ${startupSettings.max_concurrent_sessions})`,
 );
 log("INFO", `Watching: ${QUEUE_INCOMING}`);
+
+// Ensure Speaches models are installed (fire-and-forget, cached across restarts)
+ensureModels().catch(() => {});
 
 // fs.watch for near-instant pickup
 try {

@@ -20,7 +20,7 @@ import type { OutgoingMessage } from "./types.js";
 import { toErrorMessage } from "./types.js";
 import { RoutingMetadataSchema } from "./types.js";
 import { logDecision, logCorrection, ROUTING_LOG } from "./routing-logger.js";
-import { AUDIO_INCOMING_DIR, cleanupAudioFile, startPeriodicCleanup, distillForSpeech, synthesize, isAvailable } from "./audio.js";
+import { AUDIO_INCOMING_DIR, cleanupAudioFile, startPeriodicCleanup, ensureModels, distillForSpeech, synthesize, isAvailable } from "./audio.js";
 
 // ─── Constants ───
 
@@ -840,19 +840,28 @@ bot.on("callback_query:data", async (ctx) => {
             return;
         }
 
-        // Distill long text into speech-friendly summary
+        // Send a placeholder status message
+        const statusMsg = await ctx.api.sendMessage(chatId, "🎙 Dictating...", {
+            message_thread_id: threadOpt,
+            reply_parameters: { message_id: messageId },
+        });
+
+        // Distill long text into speech-friendly form
         const speechText = await distillForSpeech(originalText);
 
         // Synthesize speech
         const audioPath = await synthesize(speechText, settings.tts_voice, settings.tts_speed);
 
-        // Reply to the original message with voice
+        // Replace the placeholder with voice
+        try {
+            await ctx.api.deleteMessage(chatId, statusMsg.message_id);
+        } catch { /* best effort */ }
         await ctx.api.sendVoice(chatId, new InputFile(fs.createReadStream(audioPath)), {
             message_thread_id: threadOpt,
             reply_parameters: { message_id: messageId },
         });
 
-        // Remove the Listen button (it served its purpose)
+        // Remove the Listen button
         try {
             await ctx.editMessageReplyMarkup({ reply_markup: undefined });
         } catch { /* message may have been edited already */ }
@@ -899,6 +908,9 @@ setInterval(pollStatusFiles, 2000);
 
 // Start periodic audio file cleanup
 startPeriodicCleanup();
+
+// Ensure Speaches models are installed (fire-and-forget, cached across restarts)
+ensureModels().catch(() => {});
 
 bot.start({
     allowed_updates: [...API_CONSTANTS.DEFAULT_UPDATE_TYPES, "message_reaction"],
