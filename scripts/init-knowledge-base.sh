@@ -6,7 +6,7 @@
 
 set -euo pipefail
 
-KNOWLEDGE_BASE="/home/clawcian/.openclaw/knowledge-base"
+KNOWLEDGE_BASE="${KNOWLEDGE_BASE:-/home/$USER/knowledge-base}"
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"

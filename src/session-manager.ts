@@ -42,7 +42,7 @@ const SCRIPT_DIR = path.resolve(__dirname, "..");
 const BORG_DIR = path.join(SCRIPT_DIR, ".borg");
 const THREADS_FILE = path.join(BORG_DIR, "threads.json");
 const SETTINGS_FILE = path.join(BORG_DIR, "settings.json");
-const DEFAULT_CWD = process.env.DEFAULT_CWD || "/home/clawcian/.openclaw/workspace";
+const DEFAULT_CWD = process.env.DEFAULT_CWD || process.cwd();
 export const MAX_CONCURRENT_SESSIONS = 2;
 
 // ─── In-memory caches ───
@@ -229,7 +229,14 @@ ${buildCommandsBlock()}`;
 function buildKnowledgeBaseBlock(): string {
     return `## Knowledge Base
 
-Your working directory is a local-only git repo for organizational knowledge.
+Your working directory should be a dedicated knowledge-base directory (not the workspace root).
+If your cwd does NOT end with \`/knowledge-base\`, bootstrap it:
+1. \`mkdir -p <cwd>/knowledge-base\`
+2. \`cd <cwd>/knowledge-base && git init\`
+3. Create the seed files below and make an initial commit
+4. Use the setdir command to move yourself: write {"command": "setdir", "threadId": 1, "args": {"cwd": "<cwd>/knowledge-base"}, "timestamp": <epoch_ms>} to .borg/queue/commands/
+
+Once set up, this is a local-only git repo for organizational knowledge.
 
 Files you maintain:
 - context.md — Who we are, what we're building, team members

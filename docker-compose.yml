@@ -37,8 +37,6 @@ services:
       - ${WORKSPACE_ROOT}:${WORKSPACE_ROOT}
       - ./secrets/github-installations.json:/secrets/github-installations.json:ro
       - ${CLAUDE_CREDENTIALS}:/home/node/.claude/.credentials.json
-      # Master thread knowledge base (local-only git repo)
-      - /home/clawcian/.openclaw/knowledge-base:/home/clawcian/.openclaw/knowledge-base
     environment:
       - NODE_ENV=production
       - DEFAULT_CWD=${WORKSPACE_ROOT}

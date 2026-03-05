@@ -830,7 +830,7 @@ async function processMessage(messageFile: string): Promise<void> {
 
             if (!threadConfig) {
                 const defaultCwd =
-                    process.env.DEFAULT_CWD || "/home/clawcian/.openclaw/workspace";
+                    process.env.DEFAULT_CWD || process.cwd();
                 threadConfig = {
                     name: msg.topicName ?? `Thread ${threadId}`,
                     cwd: defaultCwd,
