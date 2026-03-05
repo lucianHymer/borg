@@ -24,8 +24,6 @@ import { toErrorMessage, isValidSessionId } from "./types.js";
 import type { IncomingMessage, OutgoingMessage } from "./types.js";
 import {
     appendHistory,
-    getRecentHistory,
-    buildEnrichedPrompt,
     buildHistoryContext,
 } from "./message-history.js";
 import { createBorgMcpServer } from "./mcp-tools.js";
@@ -660,15 +658,12 @@ async function processHeartbeat(msg: IncomingMessage): Promise<string> {
 
 function routeMessage(
     msg: IncomingMessage,
-    recentHistory: MessageHistoryEntry[],
 ): { effectiveModel: string; decision: RoutingDecision } {
-    const enrichedPrompt = buildEnrichedPrompt(
-        recentHistory,
-        msg.message,
-        msg.replyToText,
-    );
-
-    const decision = route(enrichedPrompt, undefined, {
+    // Route on current message only — history context was inflating scores,
+    // making model selection "sticky" even for simple follow-ups.
+    // Reply-to stickiness (isReply + replyToModel → maxTier below) already
+    // handles "continuing a complex conversation" intentionally.
+    const decision = route(msg.message, undefined, {
         config: DEFAULT_ROUTING_CONFIG,
     });
 
@@ -818,8 +813,7 @@ async function processMessage(messageFile: string): Promise<void> {
             }
         } else {
             // ─── Route the message ───
-            const recentHistory = getRecentHistory({ threadId, limit: 5 });
-            routingResult = routeMessage(msg, recentHistory);
+            routingResult = routeMessage(msg);
             effectiveModel = routingResult.effectiveModel;
 
             log(
