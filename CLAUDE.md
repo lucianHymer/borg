@@ -2,6 +2,10 @@
 
 Telegram forum-based multi-session Claude agent with SDK v2, smart routing, and cross-thread orchestration.
 
+## Philosophy
+
+Compound knowledge into repos. The repo should get smarter over time — workflow definitions, learned patterns, and coordination skills all live here, not in external tools. Borg provides the lightest possible infrastructure layer: MCP tools for thread management (create_thread, send_message) and a queue-based message bus. Everything else — how teams coordinate, what roles exist, when to use which workflow — is described in skills and knowledge files that live in the repo. This means any Claude Code session in this repo knows how things work, even without Borg running. Different repos can have different patterns. Borg = plumbing, repo = intelligence.
+
 ## Architecture
 
 - **Telegram Client** (`src/telegram-client.ts`) — grammY bot handling all forum topics, I/O and routing log finalization

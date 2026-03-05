@@ -1,6 +1,8 @@
 # Knowledge Map (Claude Reference)
 
 ## Architecture
+- @architecture/three-layer-workflow-abstraction-generic-skills-borg-bridge-native-fallback.md
+- @architecture/borg-philosophy-compound-knowledge-into-repos-light-touch-outside.md
 - @architecture/voice-message-feature-tts-stt-architecture-and-configuration.md
 - @architecture/cross-thread-pending-message-registration-pattern.md
 

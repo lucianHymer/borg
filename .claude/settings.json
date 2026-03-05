@@ -24,6 +24,7 @@
     ]
   },
   "enabledPlugins": {
-    "mim-ai@mim-marketplace": true
+    "mim-ai@mim-marketplace": true,
+    "compound-engineering@every-marketplace": true
   }
 }
