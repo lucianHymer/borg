@@ -29,7 +29,7 @@ import {
     buildHistoryContext,
 } from "./message-history.js";
 import { createBorgMcpServer } from "./mcp-tools.js";
-import { transcribe, cleanupAudioFile } from "./audio.js";
+import { transcribe, cleanupAudioFile, AUDIO_INCOMING_DIR } from "./audio.js";
 import type { MessageSource, MessageHistoryEntry } from "./message-history.js";
 import {
     loadThreads,
@@ -719,47 +719,49 @@ async function processMessage(messageFile: string): Promise<void> {
         return;
     }
 
-    const { channel, threadId, sender, message, messageId, source } = msg;
+    const { channel, threadId, sender, messageId, source } = msg;
     log(
         "INFO",
-        `Processing [${channel}] thread=${threadId} from ${sender}: ${message.substring(0, 80)}...`,
+        `Processing [${channel}] thread=${threadId} from ${sender}: ${msg.message.substring(0, 80)}...`,
     );
 
-    // Log incoming message to history
-    appendHistory({
-        ts: Date.now(),
-        threadId,
-        channel,
-        sender,
-        direction: "in",
-        message,
-        source: source ?? "user",
-        sourceThreadId: msg.sourceThreadId,
-    });
+    // ─── Validate audioPath is within the allowed directory ───
+    if (msg.audioPath) {
+        const resolved = path.resolve(msg.audioPath);
+        if (!resolved.startsWith(AUDIO_INCOMING_DIR + "/") && resolved !== AUDIO_INCOMING_DIR) {
+            throw new Error(`audioPath outside allowed directory: ${resolved}`);
+        }
+    }
 
     // ─── Voice Message: STT transcription ───
+    function writeSttErrorAndBail(userMessage: string, originalLabel: string): void {
+        const errorData: OutgoingMessage = {
+            channel,
+            threadId,
+            sender,
+            message: userMessage,
+            originalMessage: originalLabel,
+            timestamp: Date.now(),
+            messageId,
+            model: "haiku",
+        };
+        const errorFile = path.join(QUEUE_OUTGOING, `${channel}_${messageId}_${Date.now()}.json`);
+        const tmpFile = errorFile + ".tmp";
+        fs.writeFileSync(tmpFile, JSON.stringify(errorData, null, 2));
+        fs.renameSync(tmpFile, errorFile);
+        clearStatus(messageId);
+        if (msg.audioPath) cleanupAudioFile(msg.audioPath);
+        if (fs.existsSync(processingFile)) fs.unlinkSync(processingFile);
+    }
+
     if (msg.audioPath && !msg.message) {
         try {
             const transcript = await transcribe(msg.audioPath);
             if (!transcript) {
-                // Empty transcript — notify user and bail
-                const errorData: OutgoingMessage = {
-                    channel,
-                    threadId,
-                    sender,
-                    message: "Couldn't transcribe your voice message — no speech detected. Please try again or send as text.",
-                    originalMessage: "(voice message — empty transcript)",
-                    timestamp: Date.now(),
-                    messageId,
-                    model: "haiku",
-                };
-                const errorFile = path.join(QUEUE_OUTGOING, `${channel}_${messageId}_${Date.now()}.json`);
-                const tmpFile = errorFile + ".tmp";
-                fs.writeFileSync(tmpFile, JSON.stringify(errorData, null, 2));
-                fs.renameSync(tmpFile, errorFile);
-                clearStatus(messageId);
-                cleanupAudioFile(msg.audioPath);
-                if (fs.existsSync(processingFile)) fs.unlinkSync(processingFile);
+                writeSttErrorAndBail(
+                    "Couldn't transcribe your voice message — no speech detected. Please try again or send as text.",
+                    "(voice message — empty transcript)",
+                );
                 return;
             }
             msg.message = transcript;
@@ -767,26 +769,25 @@ async function processMessage(messageFile: string): Promise<void> {
             cleanupAudioFile(msg.audioPath);
         } catch (err) {
             log("ERROR", `STT failed for thread ${threadId}: ${toErrorMessage(err)}`);
-            const errorData: OutgoingMessage = {
-                channel,
-                threadId,
-                sender,
-                message: "Couldn't transcribe your voice message — the transcription service may be unavailable. Please try again or send as text.",
-                originalMessage: "(voice message — STT error)",
-                timestamp: Date.now(),
-                messageId,
-                model: "haiku",
-            };
-            const errorFile = path.join(QUEUE_OUTGOING, `${channel}_${messageId}_${Date.now()}.json`);
-            const tmpFile = errorFile + ".tmp";
-            fs.writeFileSync(tmpFile, JSON.stringify(errorData, null, 2));
-            fs.renameSync(tmpFile, errorFile);
-            clearStatus(messageId);
-            cleanupAudioFile(msg.audioPath);
-            if (fs.existsSync(processingFile)) fs.unlinkSync(processingFile);
+            writeSttErrorAndBail(
+                "Couldn't transcribe your voice message — the transcription service may be unavailable. Please try again or send as text.",
+                "(voice message — STT error)",
+            );
             return;
         }
     }
+
+    // Log incoming message to history (after STT so voice transcripts are captured)
+    appendHistory({
+        ts: Date.now(),
+        threadId,
+        channel,
+        sender,
+        direction: "in",
+        message: msg.message,
+        source: source ?? "user",
+        sourceThreadId: msg.sourceThreadId,
+    });
 
     let responseText: string;
     let effectiveModel: string;
@@ -971,7 +972,7 @@ async function processMessage(messageFile: string): Promise<void> {
             threadId,
             sender,
             message: responseText,
-            originalMessage: message,
+            originalMessage: msg.message,
             timestamp: Date.now(),
             messageId,
             model: effectiveModel,

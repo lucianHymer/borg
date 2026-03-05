@@ -30,7 +30,7 @@ services:
       broker:
         condition: service_healthy
       speaches:
-        condition: service_healthy
+        condition: service_started
     volumes:
       - ./.borg:/app/.borg
       # Mount workspace at the same host path so threads.json cwd values work
@@ -113,11 +113,11 @@ services:
   speaches:
     image: ghcr.io/speaches-ai/speaches:latest-cpu
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     volumes:
       - speaches-cache:/home/ubuntu/.cache/huggingface/hub
     environment:
-      - KOKORO__VOICES=bf_emma
+      - KOKORO__VOICES=bf_alice
     deploy:
       resources:
         limits:

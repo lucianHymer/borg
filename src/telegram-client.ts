@@ -350,14 +350,24 @@ bot.on("message:voice").filter(
             return;
         }
 
-        // Deduplicate using duration as a proxy for content
-        if (isDuplicate(threadId, String(ctx.from.id), `voice_${duration}s`)) {
+        // Fetch file metadata (needed for size check and dedup)
+        const file = await ctx.getFile();
+
+        // Reject oversized voice files (Telegram allows up to 20MB)
+        if (file.file_size && file.file_size > 10 * 1024 * 1024) {
+            await ctx.reply("Voice file too large (max 10MB). Please send a shorter message or use text.", {
+                message_thread_id: ctx.msg.message_thread_id,
+            });
+            return;
+        }
+
+        // Deduplicate using file_unique_id for reliable content identity
+        if (isDuplicate(threadId, String(ctx.from.id), `voice_${file.file_unique_id}`)) {
             log("INFO", `Dedup: skipping duplicate voice from ${ctx.from.first_name} in thread ${threadId}`);
             return;
         }
 
         // Download the voice file
-        const file = await ctx.getFile();
         const fileUrl = `https://api.telegram.org/file/bot${settings.telegram_bot_token}/${file.file_path}`;
         const messageId = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
         const oggPath = path.join(AUDIO_INCOMING_DIR, `${messageId}.ogg`);
@@ -813,6 +823,10 @@ bot.on("callback_query:data", async (ctx) => {
         return;
     }
 
+    // Extract message context before async work
+    const chatId = ctx.callbackQuery.message!.chat.id;  // safe: guarded above
+    const threadOpt = ctx.callbackQuery.message!.message_thread_id;
+
     listenInFlight.add(messageId);
 
     try {
@@ -830,11 +844,7 @@ bot.on("callback_query:data", async (ctx) => {
         const speechText = await distillForSpeech(originalText);
 
         // Synthesize speech
-        const audioPath = await synthesize(speechText);
-
-        // Determine thread for the voice reply
-        const chatId = ctx.callbackQuery.message!.chat.id;
-        const threadOpt = ctx.callbackQuery.message!.message_thread_id;
+        const audioPath = await synthesize(speechText, settings.tts_voice, settings.tts_speed);
 
         // Reply to the original message with voice
         await ctx.api.sendVoice(chatId, new InputFile(fs.createReadStream(audioPath)), {

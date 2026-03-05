@@ -5,13 +5,15 @@
 
 import fs from "fs";
 import path from "path";
+import { query } from "@anthropic-ai/claude-agent-sdk";
+import type { SDKAssistantMessage } from "@anthropic-ai/claude-agent-sdk";
 
 // ─── Config ───
 
 const SPEACHES_URL = process.env.SPEACHES_URL || "http://speaches:8000";
 const STT_MODEL = "distil-large-v3";
 const TTS_MODEL = "kokoro";
-const TTS_VOICE = "bf_emma";
+const TTS_VOICE = "bf_alice";
 const SCRIPT_DIR = path.resolve(__dirname, "..");
 const AUDIO_DIR = path.join(SCRIPT_DIR, ".borg/audio");
 const AUDIO_INCOMING_DIR = path.join(AUDIO_DIR, "incoming");
@@ -63,14 +65,15 @@ export async function transcribe(oggPath: string): Promise<string> {
 
 // ─── TTS: Text → OGG/Opus file ───
 
-export async function synthesize(text: string): Promise<string> {
+export async function synthesize(text: string, voice?: string, speed?: number): Promise<string> {
     const res = await fetch(`${SPEACHES_URL}/v1/audio/speech`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
             model: TTS_MODEL,
-            voice: TTS_VOICE,
+            voice: voice ?? "bf_alice",
             input: text,
+            speed: speed ?? 1.0,
             response_format: "opus",
         }),
         signal: AbortSignal.timeout(30_000),
@@ -94,39 +97,38 @@ export async function synthesize(text: string): Promise<string> {
 // ─── Speech Distillation via Haiku ───
 
 export async function distillForSpeech(text: string): Promise<string> {
-    const apiKey = process.env.ANTHROPIC_API_KEY;
-    if (!apiKey) {
-        // Fallback: truncate to first 200 chars if no API key
+    // Cap input length before sending to distillation
+    const truncatedInput = text.length > 4096 ? text.slice(0, 4096) : text;
+
+    try {
+        const conversation = query({
+            prompt: truncatedInput,
+            options: {
+                model: "claude-haiku-4-5-20251001",
+                systemPrompt: "Distill the user's text into a brief spoken summary, 2-3 sentences. No markdown, no code, no lists, no special characters. Speak naturally as if telling someone the key takeaway. Keep it concise and conversational.",
+                maxTurns: 1,
+            },
+        });
+
+        let result = "";
+        for await (const msg of conversation) {
+            if (msg.type === "assistant") {
+                const content = (msg as SDKAssistantMessage).message?.content;
+                if (Array.isArray(content)) {
+                    for (const block of content) {
+                        if (block.type === "text" && typeof block.text === "string") {
+                            result += block.text;
+                        }
+                    }
+                }
+            }
+        }
+
+        return result.trim() || (text.length > 200 ? text.slice(0, 200) + "..." : text);
+    } catch {
+        // Fallback to truncation on SDK error
         return text.length > 200 ? text.slice(0, 200) + "..." : text;
     }
-
-    const res = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: {
-            "Content-Type": "application/json",
-            "x-api-key": apiKey,
-            "anthropic-version": "2023-06-01",
-        },
-        body: JSON.stringify({
-            model: "claude-haiku-4-5-20251001",
-            max_tokens: 256,
-            system: "Distill the user's text into a brief spoken summary, 2-3 sentences. No markdown, no code, no lists, no special characters. Speak naturally as if telling someone the key takeaway. Keep it concise and conversational.",
-            messages: [{ role: "user", content: text }],
-        }),
-        signal: AbortSignal.timeout(15_000),
-    });
-
-    if (!res.ok) {
-        // Fallback to truncated original on API error
-        return text.length > 200 ? text.slice(0, 200) + "..." : text;
-    }
-
-    const data = await res.json() as {
-        content: Array<{ type: string; text?: string }>;
-    };
-
-    const textBlock = data.content?.find((b) => b.type === "text");
-    return textBlock?.text?.trim() || text.slice(0, 200);
 }
 
 // ─── File Cleanup ───
@@ -146,7 +148,6 @@ function sweepOldAudioFiles(): void {
     for (const dir of [AUDIO_DIR, AUDIO_INCOMING_DIR]) {
         try {
             for (const file of fs.readdirSync(dir)) {
-                if (file.endsWith(".tmp")) continue; // skip in-progress writes
                 const filePath = path.join(dir, file);
                 try {
                     const stat = fs.statSync(filePath);

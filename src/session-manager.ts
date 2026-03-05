@@ -32,6 +32,8 @@ export interface Settings {
     heartbeat_interval: number;
     max_concurrent_sessions: number;
     session_idle_timeout_minutes: number;
+    tts_voice: string;
+    tts_speed: number;
 }
 
 // ─── Constants ───
@@ -87,6 +89,8 @@ export function loadSettings(): Settings {
         heartbeat_interval: 300,
         max_concurrent_sessions: MAX_CONCURRENT_SESSIONS,
         session_idle_timeout_minutes: 30,
+        tts_voice: "bf_alice",
+        tts_speed: 1.0,
     };
 
     try {

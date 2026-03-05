@@ -35,7 +35,6 @@ export interface OutgoingMessage {
     timestamp: number;
     messageId: string;
     model: string;
-    audioPath?: string;         // path to synthesized OGG file for sendVoice
     targetThreadId?: number;
     routingMetadata?: RoutingMetadata;
 }
