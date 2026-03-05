@@ -22,6 +22,8 @@ export interface IncomingMessage {
     topicName?: string;
     timestamp: number;
     messageId: string;
+    audioPath?: string;         // path to downloaded OGG file (voice messages)
+    voiceDuration?: number;     // duration in seconds
 }
 
 export interface OutgoingMessage {
@@ -33,6 +35,7 @@ export interface OutgoingMessage {
     timestamp: number;
     messageId: string;
     model: string;
+    audioPath?: string;         // path to synthesized OGG file for sendVoice
     targetThreadId?: number;
     routingMetadata?: RoutingMetadata;
 }

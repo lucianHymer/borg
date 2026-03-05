@@ -6,7 +6,7 @@
 
 import fs from "fs";
 import path from "path";
-import { Bot, Context, API_CONSTANTS } from "grammy";
+import { Bot, Context, API_CONSTANTS, InlineKeyboard, InputFile } from "grammy";
 import { autoRetry } from "@grammyjs/auto-retry";
 import {
     loadThreads,
@@ -20,6 +20,7 @@ import type { OutgoingMessage } from "./types.js";
 import { toErrorMessage } from "./types.js";
 import { RoutingMetadataSchema } from "./types.js";
 import { logDecision, logCorrection, ROUTING_LOG } from "./routing-logger.js";
+import { AUDIO_INCOMING_DIR, cleanupAudioFile, startPeriodicCleanup, distillForSpeech, synthesize, isAvailable } from "./audio.js";
 
 // ─── Constants ───
 
@@ -139,6 +140,7 @@ interface PendingMessage {
 }
 
 const pendingMessages = new Map<string, PendingMessage>();
+const listenInFlight = new Set<number>(); // track message IDs being processed for TTS
 
 // ─── Message Splitting ───
 
@@ -330,6 +332,101 @@ bot.on("message:text").filter(
     },
 );
 
+// ─── Voice Message Handler ───
+
+bot.on("message:voice").filter(
+    (ctx) => ctx.from.id !== bot.botInfo.id,
+    async (ctx) => {
+        const threadId = ctx.msg.message_thread_id ?? 1;
+        if (String(ctx.chat.id) !== settings.telegram_chat_id) return;
+
+        const duration = ctx.msg.voice.duration;
+
+        // Reject voice messages over 5 minutes
+        if (duration > 300) {
+            await ctx.reply("Voice messages over 5 minutes aren't supported. Please keep it under 5 minutes or send as text.", {
+                message_thread_id: ctx.msg.message_thread_id,
+            });
+            return;
+        }
+
+        // Deduplicate using duration as a proxy for content
+        if (isDuplicate(threadId, String(ctx.from.id), `voice_${duration}s`)) {
+            log("INFO", `Dedup: skipping duplicate voice from ${ctx.from.first_name} in thread ${threadId}`);
+            return;
+        }
+
+        // Download the voice file
+        const file = await ctx.getFile();
+        const fileUrl = `https://api.telegram.org/file/bot${settings.telegram_bot_token}/${file.file_path}`;
+        const messageId = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+        const oggPath = path.join(AUDIO_INCOMING_DIR, `${messageId}.ogg`);
+
+        try {
+            const res = await fetch(fileUrl);
+            if (!res.ok) throw new Error(`Download failed: ${res.status}`);
+            const buffer = Buffer.from(await res.arrayBuffer());
+            const tmpPath = oggPath + ".tmp";
+            fs.writeFileSync(tmpPath, buffer);
+            fs.renameSync(tmpPath, oggPath);
+        } catch (err) {
+            log("ERROR", `Failed to download voice file: ${toErrorMessage(err)}`);
+            await ctx.reply("Couldn't download your voice message. Please try again.", {
+                message_thread_id: ctx.msg.message_thread_id,
+            });
+            return;
+        }
+
+        // Check reply-to-bot context (same as text handler)
+        const isReplyToBot = ctx.msg.reply_to_message?.from?.id === bot.botInfo.id;
+        const stored = isReplyToBot && ctx.msg.reply_to_message
+            ? lookupMessageModel(ctx.msg.reply_to_message.message_id)
+            : undefined;
+        const replyToModel = stored?.model;
+        const replyToText = isReplyToBot ? ctx.msg.reply_to_message?.text : undefined;
+
+        const topicName = topicNames.get(threadId);
+        const queueData = {
+            channel: "telegram",
+            source: "user" as const,
+            threadId,
+            sender: ctx.from.first_name,
+            senderId: String(ctx.from.id),
+            message: "",  // empty — queue-processor fills after STT
+            audioPath: oggPath,
+            voiceDuration: duration,
+            isReply: isReplyToBot,
+            replyToText,
+            replyToModel,
+            topicName,
+            timestamp: Date.now(),
+            messageId,
+        };
+
+        const queueFile = path.join(QUEUE_INCOMING, `telegram_${messageId}.json`);
+        const tmpFile = queueFile + ".tmp";
+        fs.writeFileSync(tmpFile, JSON.stringify(queueData, null, 2));
+        fs.renameSync(tmpFile, queueFile);
+
+        pendingMessages.set(messageId, {
+            ctx,
+            chatId: ctx.chat.id,
+            threadId,
+            telegramMessageId: ctx.msg.message_id,
+        });
+
+        // React with 👀 to acknowledge
+        try {
+            await bot.api.setMessageReaction(ctx.chat.id, ctx.msg.message_id,
+                [{ type: "emoji", emoji: "👀" as any }]);
+        } catch {
+            // Reactions may not be available
+        }
+
+        log("INFO", `Queued voice message (${duration}s) from ${ctx.from.first_name} in thread ${threadId}`);
+    },
+);
+
 // ─── Model Reaction Emoji (single source of truth) ───
 
 // ⚡ haiku (fast), ✍ sonnet (writing), 🔥 opus (fire)
@@ -468,6 +565,15 @@ async function pollOutgoingQueue(): Promise<void> {
                             }
                         }
 
+                        // Add Listen button to the first response message (user-facing only)
+                        if (firstSentId) {
+                            try {
+                                await bot.api.editMessageReplyMarkup(pending.chatId, firstSentId, {
+                                    reply_markup: new InlineKeyboard().text("🔊 Listen", `listen:${firstSentId}`),
+                                });
+                            } catch { /* Listen button is best-effort */ }
+                        }
+
                         pendingMessages.delete(data.messageId);
                         log(
                             "INFO",
@@ -493,6 +599,14 @@ async function pollOutgoingQueue(): Promise<void> {
                                 storeMessageModel(sent.message_id, data.model, data.threadId);
                                 await reactWithModel(chatId, sent.message_id, data.model);
                             }
+                        }
+
+                        if (firstSentId) {
+                            try {
+                                await bot.api.editMessageReplyMarkup(settings.telegram_chat_id, firstSentId, {
+                                    reply_markup: new InlineKeyboard().text("🔊 Listen", `listen:${firstSentId}`),
+                                });
+                            } catch { /* Listen button is best-effort */ }
                         }
                     }
                 }
@@ -675,6 +789,79 @@ bot.on("message_reaction", async (ctx) => {
     log("INFO", `Routing correction: ${stored.model} → ${correctedModel} (msg ${messageId})`);
 });
 
+// ─── On-Demand TTS via Inline Keyboard ───
+
+bot.on("callback_query:data", async (ctx) => {
+    const data = ctx.callbackQuery.data;
+    if (!data.startsWith("listen:")) return;
+
+    const messageId = parseInt(data.replace("listen:", ""), 10);
+    if (!Number.isFinite(messageId)) {
+        await ctx.answerCallbackQuery({ text: "Invalid message reference" });
+        return;
+    }
+
+    // Prevent duplicate processing
+    if (listenInFlight.has(messageId)) {
+        await ctx.answerCallbackQuery({ text: "Already generating voice..." });
+        return;
+    }
+
+    const originalText = ctx.callbackQuery.message?.text;
+    if (!originalText) {
+        await ctx.answerCallbackQuery({ text: "Message text not available" });
+        return;
+    }
+
+    listenInFlight.add(messageId);
+
+    try {
+        // Show loading feedback
+        await ctx.answerCallbackQuery({ text: "Generating voice..." });
+
+        // Check if Speaches is available
+        const available = await isAvailable();
+        if (!available) {
+            await ctx.answerCallbackQuery({ text: "Voice service unavailable", show_alert: true });
+            return;
+        }
+
+        // Distill long text into speech-friendly summary
+        const speechText = await distillForSpeech(originalText);
+
+        // Synthesize speech
+        const audioPath = await synthesize(speechText);
+
+        // Determine thread for the voice reply
+        const chatId = ctx.callbackQuery.message!.chat.id;
+        const threadOpt = ctx.callbackQuery.message!.message_thread_id;
+
+        // Reply to the original message with voice
+        await ctx.api.sendVoice(chatId, new InputFile(fs.createReadStream(audioPath)), {
+            message_thread_id: threadOpt,
+            reply_parameters: { message_id: messageId },
+        });
+
+        // Remove the Listen button (it served its purpose)
+        try {
+            await ctx.editMessageReplyMarkup({ reply_markup: undefined });
+        } catch { /* message may have been edited already */ }
+
+        // Clean up audio file
+        cleanupAudioFile(audioPath);
+
+        log("INFO", `TTS voice reply sent for message ${messageId}`);
+    } catch (err) {
+        log("ERROR", `TTS callback failed for message ${messageId}: ${toErrorMessage(err)}`);
+        // Try to notify user of the error
+        try {
+            await ctx.answerCallbackQuery({ text: "Couldn't generate voice. Try again later.", show_alert: true });
+        } catch { /* callback may have already been answered */ }
+    } finally {
+        listenInFlight.delete(messageId);
+    }
+});
+
 // ─── Error Handler ───
 
 bot.catch((err) => {
@@ -699,6 +886,9 @@ setInterval(cleanupPendingMessages, 60_000);
 
 // Poll status files every 2 seconds for tool use visibility
 setInterval(pollStatusFiles, 2000);
+
+// Start periodic audio file cleanup
+startPeriodicCleanup();
 
 bot.start({
     allowed_updates: [...API_CONSTANTS.DEFAULT_UPDATE_TYPES, "message_reaction"],

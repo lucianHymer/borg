@@ -29,6 +29,7 @@ import {
     buildHistoryContext,
 } from "./message-history.js";
 import { createBorgMcpServer } from "./mcp-tools.js";
+import { transcribe, cleanupAudioFile } from "./audio.js";
 import type { MessageSource, MessageHistoryEntry } from "./message-history.js";
 import {
     loadThreads,
@@ -61,6 +62,8 @@ const IncomingMessageSchema = z.object({
     topicName: z.string().optional(),
     timestamp: z.number(),
     messageId: z.string(),
+    audioPath: z.string().optional(),
+    voiceDuration: z.number().optional(),
 });
 
 const CommandMessageSchema = z.object({
@@ -734,6 +737,57 @@ async function processMessage(messageFile: string): Promise<void> {
         sourceThreadId: msg.sourceThreadId,
     });
 
+    // ─── Voice Message: STT transcription ───
+    if (msg.audioPath && !msg.message) {
+        try {
+            const transcript = await transcribe(msg.audioPath);
+            if (!transcript) {
+                // Empty transcript — notify user and bail
+                const errorData: OutgoingMessage = {
+                    channel,
+                    threadId,
+                    sender,
+                    message: "Couldn't transcribe your voice message — no speech detected. Please try again or send as text.",
+                    originalMessage: "(voice message — empty transcript)",
+                    timestamp: Date.now(),
+                    messageId,
+                    model: "haiku",
+                };
+                const errorFile = path.join(QUEUE_OUTGOING, `${channel}_${messageId}_${Date.now()}.json`);
+                const tmpFile = errorFile + ".tmp";
+                fs.writeFileSync(tmpFile, JSON.stringify(errorData, null, 2));
+                fs.renameSync(tmpFile, errorFile);
+                clearStatus(messageId);
+                cleanupAudioFile(msg.audioPath);
+                if (fs.existsSync(processingFile)) fs.unlinkSync(processingFile);
+                return;
+            }
+            msg.message = transcript;
+            log("INFO", `STT transcript (${msg.voiceDuration}s): ${transcript.substring(0, 120)}...`);
+            cleanupAudioFile(msg.audioPath);
+        } catch (err) {
+            log("ERROR", `STT failed for thread ${threadId}: ${toErrorMessage(err)}`);
+            const errorData: OutgoingMessage = {
+                channel,
+                threadId,
+                sender,
+                message: "Couldn't transcribe your voice message — the transcription service may be unavailable. Please try again or send as text.",
+                originalMessage: "(voice message — STT error)",
+                timestamp: Date.now(),
+                messageId,
+                model: "haiku",
+            };
+            const errorFile = path.join(QUEUE_OUTGOING, `${channel}_${messageId}_${Date.now()}.json`);
+            const tmpFile = errorFile + ".tmp";
+            fs.writeFileSync(tmpFile, JSON.stringify(errorData, null, 2));
+            fs.renameSync(tmpFile, errorFile);
+            clearStatus(messageId);
+            cleanupAudioFile(msg.audioPath);
+            if (fs.existsSync(processingFile)) fs.unlinkSync(processingFile);
+            return;
+        }
+    }
+
     let responseText: string;
     let effectiveModel: string;
     let routingResult: { effectiveModel: string; decision: RoutingDecision } | undefined;
@@ -807,9 +861,9 @@ async function processMessage(messageFile: string): Promise<void> {
                 const contextBlock = historyContext
                     ? `\n\n${historyContext}\n\n`
                     : "\n\n";
-                fullPrompt = `[${now}]${contextBlock}${prefix} ${message}`;
+                fullPrompt = `[${now}]${contextBlock}${prefix} ${msg.message}`;
             } else {
-                fullPrompt = `[${now}] ${prefix} ${message}`;
+                fullPrompt = `[${now}] ${prefix} ${msg.message}`;
             }
 
             // ─── Log assembled prompt ───
@@ -818,7 +872,7 @@ async function processMessage(messageFile: string): Promise<void> {
                 messageId,
                 model: effectiveModel,
                 systemPromptAppend: threadPrompt,
-                userMessage: `${prefix} ${message}`,
+                userMessage: `${prefix} ${msg.message}`,
                 historyInjected: isNewSession,
                 historyLines: isNewSession ? historyContext.split("\n").length - 1 : 0,
                 promptLength: fullPrompt.length,
@@ -928,7 +982,7 @@ async function processMessage(messageFile: string): Promise<void> {
                     confidence: routingResult.decision.confidence,
                     signals: routingResult.decision.signals,
                     tokens: routingResult.decision.estimatedTokens,
-                    prompt: message,
+                    prompt: msg.message,
                 },
             } : {}),
         };

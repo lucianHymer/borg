@@ -29,6 +29,8 @@ services:
     depends_on:
       broker:
         condition: service_healthy
+      speaches:
+        condition: service_healthy
     volumes:
       - ./.borg:/app/.borg
       # Mount workspace at the same host path so threads.json cwd values work
@@ -108,6 +110,27 @@ services:
         limits:
           memory: 256M
 
+  speaches:
+    image: ghcr.io/speaches-ai/speaches:latest-cpu
+    ports:
+      - "8000:8000"
+    volumes:
+      - speaches-cache:/home/ubuntu/.cache/huggingface/hub
+    environment:
+      - KOKORO__VOICES=bf_emma
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - internal
+
   cloudflared:
     image: cloudflare/cloudflared:latest
     restart: always
@@ -124,3 +147,6 @@ networks:
     driver: bridge
   dev:
     driver: bridge
+
+volumes:
+  speaches-cache:
