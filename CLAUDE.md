@@ -47,6 +47,7 @@ Smart routing uses 14 weighted dimensions to classify messages as SIMPLE (haiku)
 - Relative imports use `.js` extensions per nodenext rules
 - Atomic file writes: write to .tmp then rename
 - JSONL appends: use appendFileSync (O_APPEND safe on ext4)
+- Message history deduplication: appendHistory() deduplicates by messageId (strips `_tg` and `_retry\d+` suffixes), checks last ~50 entries, falls back to timestamp matching (5s window) for outgoing messages without messageId
 
 ## Build
 
