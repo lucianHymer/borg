@@ -404,12 +404,12 @@ export async function validateAndUpdateMemory(
         warning = `New limit (${formatBytes(snappedLimit)}) is close to current usage (${formatBytes(currentUsage)}). The container may be OOM-killed under load.`;
     }
 
-    // Apply the update: set both Memory and MemorySwap to match (no swap)
+    // Apply the update: MemorySwap at 1.25x Memory gives swap headroom for kernel overhead
     await fetchDockerJson(
         baseUrl,
         `/containers/${containerId}/update`,
         "POST",
-        { Memory: snappedLimit, MemorySwap: snappedLimit },
+        { Memory: snappedLimit, MemorySwap: Math.round(snappedLimit * 1.25) },
     );
 
     return {
@@ -543,7 +543,7 @@ export async function createDevContainer(
         },
         HostConfig: {
             Memory: 2 * 1024 * 1024 * 1024,
-            MemorySwap: 2 * 1024 * 1024 * 1024,
+            MemorySwap: Math.round(2 * 1024 * 1024 * 1024 * 1.25),
             NanoCPUs: 2_000_000_000,
             PidsLimit: 256,
             CapDrop: ["NET_RAW"],

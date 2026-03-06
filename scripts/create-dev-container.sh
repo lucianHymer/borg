@@ -22,6 +22,15 @@ SSH_PORT="$2"
 SSH_KEY_FILE="$3"
 MEMORY_LIMIT="${4:-2g}"  # Default 2GB (not 3GB — supports 10+ containers on 32GB)
 
+# Compute swap limit at 1.25x memory for kernel overhead headroom
+compute_swap_limit() {
+    local mem="$1"
+    local num="${mem%[gGmM]*}"
+    local unit="${mem##*[0-9.]}"
+    echo "$(awk "BEGIN {printf \"%.0f\", $num * 1.25}")${unit}"
+}
+SWAP_LIMIT="$(compute_swap_limit "$MEMORY_LIMIT")"
+
 if [ ! -f "$SSH_KEY_FILE" ]; then
     log "ERROR: SSH public key file not found: $SSH_KEY_FILE"
     exit 1
@@ -63,7 +72,7 @@ docker run -d \
     --label "borg.type=dev-container" \
     -p "${SSH_PORT}:22" \
     --memory "${MEMORY_LIMIT}" \
-    --memory-swap "${MEMORY_LIMIT}" \
+    --memory-swap "${SWAP_LIMIT}" \
     --cpus 2 \
     --cap-drop NET_RAW \
     -e CREDENTIAL_BROKER_URL=http://broker:3000 \

@@ -295,6 +295,7 @@ function buildMasterCrossThreadBlock(): string {
 - Read any thread's history from ${BORG_DIR}/message-history.jsonl
 - Message any thread by writing to ${BORG_DIR}/queue/outgoing/ with targetThreadId
 - Broadcast to all threads by writing multiple outgoing messages
+- Clear the dead letter queue: \`rm ${BORG_DIR}/queue/dead-letter/*\` (failed messages after 3 retries)
 ${buildCommandsBlock()}`;
 }
 
