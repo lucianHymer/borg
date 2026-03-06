@@ -631,7 +631,7 @@ export function createBorgMcpServer(sourceThreadId: number) {
 
     const createThread = tool(
         "create_thread",
-        "Create a new Telegram forum topic and register it as a Borg thread. Available to all threads.",
+        "Create a new Telegram forum topic and register it as a Borg thread. Available to all threads. For team threads, you MUST first create a git worktree and pass its absolute path as the cwd parameter — see borg-teams skill for worktree setup instructions.",
         {
             name: z.string().min(1).max(128).regex(/^[a-zA-Z0-9\-_\s]+$/)
                 .describe("Topic name (alphanumeric, hyphens, underscores, spaces)"),
