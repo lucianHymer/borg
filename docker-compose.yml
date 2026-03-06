@@ -37,6 +37,7 @@ services:
       - ${WORKSPACE_ROOT}:${WORKSPACE_ROOT}
       - ./secrets/github-installations.json:/secrets/github-installations.json:ro
       - ${CLAUDE_CREDENTIALS}:/home/node/.claude/.credentials.json
+      - ./skills/global:/home/node/.claude/skills:ro
     environment:
       - NODE_ENV=production
       - DEFAULT_CWD=${WORKSPACE_ROOT}
