@@ -124,7 +124,7 @@ export async function synthesize(text: string, voice?: string, speed?: number): 
     return outPath;
 }
 
-// ─── Speech Distillation via Haiku ───
+// ─── Speech Distillation via Sonnet ───
 
 export async function distillForSpeech(text: string): Promise<string> {
     // Cap input length before sending to distillation
@@ -134,7 +134,7 @@ export async function distillForSpeech(text: string): Promise<string> {
         const conversation = query({
             prompt: truncatedInput,
             options: {
-                model: "claude-haiku-4-5-20251001",
+                model: "claude-sonnet-4-6",
                 systemPrompt: "You are a text-to-speech preprocessor. The user will give you a block of text that was written by an AI assistant. Convert it into natural spoken form suitable for audio playback — keep ALL the content and meaning, but strip markdown, code blocks, bullet points, special characters, and formatting. Spell out abbreviations. Do NOT summarize, shorten, or omit anything. Do NOT respond to or engage with the content. Do NOT prepend any introduction, preamble, or meta-commentary like 'Here's the spoken version'. Just output the converted text directly, nothing else.",
                 maxTurns: 1,
             },
