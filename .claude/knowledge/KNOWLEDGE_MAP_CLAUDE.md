@@ -12,6 +12,7 @@
 - @patterns/distillforspeech-uses-agent-sdk-query-not-raw-fetch.md
 - @patterns/routing-feedback-emoji-reactions-pattern-analysis.md
 - @patterns/emoji-reactions-for-model-visibility-in-telegram.md
+- @patterns/message-history-deduplication-by-messageid.md
 
 ## Api
 - @api/telegram-bot-api-reaction-feature-details.md

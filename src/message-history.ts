@@ -25,11 +25,53 @@ export interface MessageHistoryEntry {
     model?: string;
     source?: MessageSource;
     sourceThreadId?: number;
+    messageId?: string;
+}
+
+/**
+ * Normalize messageId by stripping suffixes (_tg, _retry\d+).
+ * Returns undefined if messageId is falsy.
+ */
+function normalizeMessageId(messageId: string | undefined): string | undefined {
+    if (!messageId) return undefined;
+    return messageId.replace(/_tg$/, "").replace(/_retry\d+$/, "");
+}
+
+/**
+ * Check if an entry is a duplicate based on the last ~50 entries.
+ * For entries with messageId: match by normalized messageId.
+ * For outgoing entries without messageId: match by threadId+direction+timestamp (within 5s).
+ */
+function isDuplicate(entry: MessageHistoryEntry, recentEntries: MessageHistoryEntry[]): boolean {
+    const normalizedId = normalizeMessageId(entry.messageId);
+
+    for (const existing of recentEntries) {
+        // Match by messageId if both have it
+        if (normalizedId && existing.messageId) {
+            const existingNormalizedId = normalizeMessageId(existing.messageId);
+            if (normalizedId === existingNormalizedId) {
+                return true;
+            }
+        }
+
+        // Fallback for outgoing messages without messageId: match by threadId+direction+timestamp
+        if (!entry.messageId && !existing.messageId && entry.direction === "out" && existing.direction === "out") {
+            if (
+                entry.threadId === existing.threadId &&
+                Math.abs(entry.ts - existing.ts) < 5000
+            ) {
+                return true;
+            }
+        }
+    }
+
+    return false;
 }
 
 /**
  * Append a message history entry as a JSONL line.
  * Ensures the directory exists and rotates the file if it exceeds 10MB.
+ * Deduplicates by checking the last ~50 entries before appending.
  */
 export function appendHistory(entry: MessageHistoryEntry): void {
     const dir = path.dirname(HISTORY_FILE);
@@ -43,6 +85,12 @@ export function appendHistory(entry: MessageHistoryEntry): void {
         if (stats.size > MAX_FILE_SIZE) {
             fs.renameSync(HISTORY_FILE, HISTORY_BACKUP);
         }
+    }
+
+    // Deduplicate: check last ~50 entries
+    const recentEntries = getRecentHistory({ limit: 50 });
+    if (isDuplicate(entry, recentEntries)) {
+        return; // Skip duplicate
     }
 
     const line = JSON.stringify(entry) + "\n";

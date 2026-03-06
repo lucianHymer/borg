@@ -857,6 +857,7 @@ async function processMessage(messageFile: string): Promise<void> {
         message: msg.message,
         source: source ?? "user",
         sourceThreadId: msg.sourceThreadId,
+        messageId,
     });
 
     let responseText: string;
@@ -1044,6 +1045,7 @@ async function processMessage(messageFile: string): Promise<void> {
             message: responseText,
             model: effectiveModel,
             source: source ?? "user",
+            messageId,
         });
 
         // ─── Write response to outgoing queue ───
