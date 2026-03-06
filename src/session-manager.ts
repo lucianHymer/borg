@@ -444,12 +444,12 @@ function buildTeamBlock(config: ThreadConfig, threadId: number): string {
     return lines.join("\n");
 }
 
-function buildRuntimeBlock(config: ThreadConfig, runtime?: { threadId?: number; model?: string }): string {
+function buildRuntimeBlock(config: ThreadConfig, runtime: { threadId: number; model: string }): string {
     return `
 
 Your runtime context:
-- Thread ID: ${runtime?.threadId ?? "unknown"}
-- Model: ${runtime?.model ?? config.model}
+- Thread ID: ${runtime.threadId}
+- Model: ${runtime.model}
 - Outgoing message format: {"channel": "...", "threadId": N, "message": "...", "targetThreadId": N, ...}
 - Message history log: ${BORG_DIR}/message-history.jsonl
 - Routing log: ${BORG_DIR}/logs/routing.jsonl
@@ -458,7 +458,7 @@ Your runtime context:
 
 // ─── System Prompts ───
 
-export function buildThreadPrompt(config: ThreadConfig, runtime?: { threadId?: number; model?: string }): string {
+export function buildThreadPrompt(config: ThreadConfig, runtime: { threadId: number; model: string }): string {
     const runtimeBlock = buildRuntimeBlock(config, runtime);
 
     if (config.isMaster) {
@@ -472,7 +472,7 @@ export function buildThreadPrompt(config: ThreadConfig, runtime?: { threadId?: n
             buildMcpToolsBlock(true),
         ];
         if (config.team) {
-            parts.push(buildTeamBlock(config, runtime?.threadId ?? 0));
+            parts.push(buildTeamBlock(config, runtime.threadId));
         } else {
             parts.push(buildHeartbeatBlock());
         }
@@ -488,7 +488,7 @@ export function buildThreadPrompt(config: ThreadConfig, runtime?: { threadId?: n
         buildMcpToolsBlock(false),
     ];
     if (config.team) {
-        parts.push(buildTeamBlock(config, runtime?.threadId ?? 0));
+        parts.push(buildTeamBlock(config, runtime.threadId));
     } else {
         parts.push(buildHeartbeatBlock());
     }

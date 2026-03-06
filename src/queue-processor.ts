@@ -550,7 +550,7 @@ function buildQueryOptions(
         systemPrompt: {
             type: "preset",
             preset: "claude_code",
-            append: buildThreadPrompt(threadConfig),
+            append: buildThreadPrompt(threadConfig, { threadId, model: effectiveModel }),
         },
         mcpServers: {
             borg: createBorgMcpServer(threadId),
@@ -689,7 +689,7 @@ async function processHeartbeat(msg: IncomingMessage): Promise<string> {
             systemPrompt: {
                 type: "preset",
                 preset: "claude_code",
-                append: buildThreadPrompt(threadConfig),
+                append: buildThreadPrompt(threadConfig, { threadId: msg.threadId, model: "haiku" }),
             },
             mcpServers: {
                 borg: createBorgMcpServer(msg.threadId),
@@ -933,7 +933,7 @@ async function processMessage(messageFile: string): Promise<void> {
             const now = formatCurrentTime();
             const prefix = buildSourcePrefix(msg);
             const isNewSession = !threadConfig.sessionId;
-            const threadPrompt = buildThreadPrompt(threadConfig);
+            const threadPrompt = buildThreadPrompt(threadConfig, { threadId, model: effectiveModel });
             const historyContext = isNewSession
                 ? buildHistoryContext(threadId, threadConfig.isMaster)
                 : "";
