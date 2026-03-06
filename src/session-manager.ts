@@ -185,14 +185,14 @@ Multiple team members may message you. Each message is prefixed with the sender'
 
 ## Your Persistent Memory
 
-Your conversation memory is stored in \`.borg/message-history.jsonl\` — a JSONL file containing all messages across all threads, tagged by threadId. This is your ground truth for what has been said.
+Your conversation memory is stored in \`${BORG_DIR}/message-history.jsonl\` — a JSONL file containing all messages across all threads, tagged by threadId. This is your ground truth for what has been said.
 
 **Use it proactively:**
 - When you start a new session or feel you're missing context, grep this file for your threadId to catch up
 - When a user references something you don't remember, check the file before saying you don't know
 - When your context gets compacted (long conversations), earlier messages are summarized — the JSONL file has the originals
 - Format: each line is JSON with \`threadId\`, \`sender\`, \`message\`, \`channel\`, \`timestamp\` fields
-- Read it with: \`grep '"threadId":YOUR_ID' .borg/message-history.jsonl | tail -50\`
+- Read it with: \`grep '"threadId":YOUR_ID' ${BORG_DIR}/message-history.jsonl | tail -50\`
 
 This file is always available and always up-to-date. Prefer checking it over telling a user you lack context.`;
 }
@@ -205,24 +205,24 @@ function buildGithubBlock(): string {
 }
 
 function buildCommandsBlock(): string {
-    return `- Reset a thread: Write {"command": "reset", "threadId": N, "timestamp": <epoch_ms>} to .borg/queue/commands/
-- Change working directory: Write {"command": "setdir", "threadId": N, "args": {"cwd": "/path"}, "timestamp": <epoch_ms>} to .borg/queue/commands/`;
+    return `- Reset a thread: Write {"command": "reset", "threadId": N, "timestamp": <epoch_ms>} to ${BORG_DIR}/queue/commands/
+- Change working directory: Write {"command": "setdir", "threadId": N, "args": {"cwd": "/path"}, "timestamp": <epoch_ms>} to ${BORG_DIR}/queue/commands/`;
 }
 
 function buildMasterCrossThreadBlock(): string {
     return `You can:
-- See all active threads and their status in .borg/threads.json
-- Read any thread's history from .borg/message-history.jsonl
-- Message any thread by writing to .borg/queue/outgoing/ with targetThreadId
+- See all active threads and their status in ${BORG_DIR}/threads.json
+- Read any thread's history from ${BORG_DIR}/message-history.jsonl
+- Message any thread by writing to ${BORG_DIR}/queue/outgoing/ with targetThreadId
 - Broadcast to all threads by writing multiple outgoing messages
 ${buildCommandsBlock()}`;
 }
 
 function buildWorkerCrossThreadBlock(): string {
     return `Cross-thread communication:
-- Active threads: Read .borg/threads.json
-- Other threads' history: Grep .borg/message-history.jsonl for their threadId
-- Message another thread: Write JSON to .borg/queue/outgoing/ with targetThreadId field
+- Active threads: Read ${BORG_DIR}/threads.json
+- Other threads' history: Grep ${BORG_DIR}/message-history.jsonl for their threadId
+- Message another thread: Write JSON to ${BORG_DIR}/queue/outgoing/ with targetThreadId field
 ${buildCommandsBlock()}`;
 }
 
@@ -234,7 +234,7 @@ If your cwd does NOT end with \`/knowledge-base\`, bootstrap it:
 1. \`mkdir -p <cwd>/knowledge-base\`
 2. \`cd <cwd>/knowledge-base && git init\`
 3. Create the seed files below and make an initial commit
-4. Use the setdir command to move yourself: write {"command": "setdir", "threadId": 1, "args": {"cwd": "<cwd>/knowledge-base"}, "timestamp": <epoch_ms>} to .borg/queue/commands/
+4. Use the setdir command to move yourself: write {"command": "setdir", "threadId": 1, "args": {"cwd": "<cwd>/knowledge-base"}, "timestamp": <epoch_ms>} to ${BORG_DIR}/queue/commands/
 
 Once set up, this is a local-only git repo for organizational knowledge.
 
@@ -340,8 +340,8 @@ Your runtime context:
 - Thread ID: ${runtime?.threadId ?? "unknown"}
 - Model: ${runtime?.model ?? config.model}
 - Outgoing message format: {"channel": "...", "threadId": N, "message": "...", "targetThreadId": N, ...}
-- Message history log: .borg/message-history.jsonl
-- Routing log: .borg/logs/routing.jsonl
+- Message history log: ${BORG_DIR}/message-history.jsonl
+- Routing log: ${BORG_DIR}/logs/routing.jsonl
 - Response truncation limit: 4000 characters`;
 }
 
@@ -397,7 +397,7 @@ export function buildHeartbeatPrompt(
         `Read HEARTBEAT.md from your working directory (${config.cwd}).`,
         `If it doesn't exist, create it with sections: Quick Tasks, Hourly Tasks, Daily Tasks, Urgent Flags, Notes.`,
         "",
-        "Your heartbeat timing state is in `.borg/heartbeat-state.json` (read-only — timing is managed automatically).",
+        `Your heartbeat timing state is in \`${BORG_DIR}/heartbeat-state.json\` (read-only — timing is managed automatically).`,
         "If your HEARTBEAT.md has a `## Timestamps` section, remove it — timing is now managed automatically.",
         "",
         "After executing your tasks:",
