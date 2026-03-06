@@ -640,7 +640,7 @@ export function createBorgMcpServer(sourceThreadId: number) {
             role: z.string().min(1).max(64).regex(/^[a-z][a-z0-9-]*$/).optional()
                 .describe("Agent role (lowercase alphanumeric + hyphens)"),
             cwd: z.string().optional()
-                .describe("Working directory for the thread"),
+                .describe("Working directory for the thread. REQUIRED for team threads — set this to the absolute path of the team's git worktree (e.g., /absolute/path/.borg/worktrees/{team-name}). All team members must share the same cwd for proper isolation."),
             initialMessage: z.string().optional()
                 .describe("First message to send to the new thread"),
         },

@@ -59,9 +59,9 @@ suggest creating a dev team. Ask first — this is a big operation.
 
 ## Workspace Isolation
 
-Before any team member writes code, you MUST create a git worktree:
-```
-git worktree add .borg/worktrees/{team-name} -b team/{team-name}
-```
-Set all team members' working directory to the worktree path. This is not
-optional — teams must work in isolation from the main branch.
+Before any team member writes code, create a git worktree for the team:
+- Create a worktree in a team-specific directory
+- Create a new branch for the team's work
+- Set all team members' working directory to the worktree path
+
+This is not optional — teams must work in isolation from the main branch to avoid conflicts.
