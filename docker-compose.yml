@@ -116,6 +116,7 @@ services:
       - speaches-cache:/home/ubuntu/.cache/huggingface/hub
     environment:
       - KOKORO__VOICES=bf_alice
+      - WHISPER__COMPUTE_TYPE=int8
     deploy:
       resources:
         limits:
