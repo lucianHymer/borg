@@ -31,6 +31,15 @@ const LOG_FILE = path.join(SCRIPT_DIR, ".borg/logs/telegram.log");
 const MESSAGE_MODELS_FILE = path.join(SCRIPT_DIR, ".borg/message-models.json");
 const QUEUE_STATUS = path.join(SCRIPT_DIR, ".borg/status");
 const DEDUP_WINDOW_MS = 10_000; // 10 seconds
+const TASK_LISTS_FILE = path.join(SCRIPT_DIR, ".borg/task-lists.json");
+const TASK_PINS_FILE = path.join(SCRIPT_DIR, ".borg/task-pins.json");
+const CLAUDE_TASKS_DIR = path.join(process.env.HOME || "/root", ".claude/tasks");
+const TASK_POLL_INTERVAL = 2000; // 2 seconds
+
+// Track directory mtimes to avoid re-reading unchanged directories
+const taskDirMtimes = new Map<string, number>();
+// Track last pinned content hash per thread to avoid unnecessary updates
+const lastPinnedContent = new Map<number, string>();
 
 // ─── Message Deduplication ───
 
@@ -168,6 +177,70 @@ function splitMessage(text: string, maxLength = 4096): string[] {
     return chunks;
 }
 
+// ─── Task Watcher ───
+
+type TaskPins = Record<string, number>; // threadId string → telegram messageId
+
+function loadTaskPins(): TaskPins {
+    try {
+        return JSON.parse(fs.readFileSync(TASK_PINS_FILE, "utf8"));
+    } catch {
+        return {};
+    }
+}
+
+function saveTaskPins(pins: TaskPins): void {
+    const tmp = TASK_PINS_FILE + ".tmp";
+    fs.writeFileSync(tmp, JSON.stringify(pins, null, 2));
+    fs.renameSync(tmp, TASK_PINS_FILE);
+}
+
+interface TaskFile {
+    id: string;
+    subject: string;
+    status: string; // "pending" | "in_progress" | "completed"
+    owner?: string;
+}
+
+function readTasksFromDir(dirPath: string): TaskFile[] {
+    try {
+        if (!fs.existsSync(dirPath)) return [];
+        const files = fs.readdirSync(dirPath).filter(f => f.endsWith(".json"));
+        const tasks: TaskFile[] = [];
+        for (const file of files) {
+            try {
+                const data = JSON.parse(fs.readFileSync(path.join(dirPath, file), "utf8"));
+                if (data.id && data.subject && data.status) {
+                    tasks.push({ id: data.id, subject: data.subject, status: data.status, owner: data.owner });
+                }
+            } catch { /* skip unparseable */ }
+        }
+        return tasks.sort((a, b) => String(a.id).localeCompare(String(b.id)));
+    } catch {
+        return [];
+    }
+}
+
+function formatTaskMessage(tasks: TaskFile[], timezone: string): string {
+    const pending = tasks.filter(t => t.status === "pending");
+    const inProgress = tasks.filter(t => t.status === "in_progress");
+    const completed = tasks.filter(t => t.status === "completed");
+
+    const lines: string[] = ["Open Tasks", "──────────"];
+    for (const t of inProgress) {
+        lines.push(`🔄 ${t.subject}`);
+    }
+    for (const t of pending) {
+        lines.push(`⬚ ${t.subject}`);
+    }
+    lines.push("──────────");
+    lines.push(`✅ ${completed.length} done · 🔄 ${inProgress.length} in progress · ⬚ ${pending.length} pending`);
+    const now = new Date();
+    const timeStr = now.toLocaleTimeString("en-US", { timeZone: timezone, hour: "2-digit", minute: "2-digit", hour12: false });
+    lines.push(`Updated: ${timeStr}`);
+    return lines.join("\n");
+}
+
 // ─── Bot Setup ───
 
 const settings = loadSettings();
@@ -245,6 +318,64 @@ bot.command("setdir", async (ctx) => {
         message_thread_id: ctx.msg.message_thread_id,
     });
     log("INFO", `Thread ${threadId} cwd set to ${dir} by ${ctx.from?.first_name ?? "unknown"}`);
+});
+
+bot.command("clear_team", async (ctx) => {
+    if (String(ctx.chat?.id) !== settings.telegram_chat_id) return;
+    const threadId = ctx.msg.message_thread_id ?? 1;
+    const threads = loadThreads();
+    const config = threads[String(threadId)];
+    if (!config?.team) {
+        await ctx.reply("This thread isn't part of a team.");
+        return;
+    }
+    const teamThreads = Object.entries(threads).filter(([, t]) => t.team === config.team);
+    for (const [id] of teamThreads) {
+        const msgId = `clear_${id}_${Date.now()}`;
+        const queueData = {
+            channel: "telegram",
+            source: "system",
+            threadId: Number(id),
+            sender: ctx.from?.first_name ?? "system",
+            message: "/clear",
+            timestamp: Date.now(),
+            messageId: msgId,
+        };
+        const tmpFile = path.join(QUEUE_INCOMING, `${msgId}.json.tmp`);
+        fs.writeFileSync(tmpFile, JSON.stringify(queueData));
+        fs.renameSync(tmpFile, path.join(QUEUE_INCOMING, `${msgId}.json`));
+    }
+    await ctx.reply(`Queued /clear to ${teamThreads.length} thread(s) in team **${config.team}**`, { parse_mode: "Markdown" });
+    log("INFO", `Team ${config.team} clear queued by ${ctx.from?.first_name ?? "unknown"} (${teamThreads.length} threads)`);
+});
+
+bot.command("compact_team", async (ctx) => {
+    if (String(ctx.chat?.id) !== settings.telegram_chat_id) return;
+    const threadId = ctx.msg.message_thread_id ?? 1;
+    const threads = loadThreads();
+    const config = threads[String(threadId)];
+    if (!config?.team) {
+        await ctx.reply("This thread isn't part of a team.");
+        return;
+    }
+    const teamThreads = Object.entries(threads).filter(([, t]) => t.team === config.team);
+    for (const [id] of teamThreads) {
+        const msgId = `compact_${id}_${Date.now()}`;
+        const queueData = {
+            channel: "telegram",
+            source: "system",
+            threadId: Number(id),
+            sender: ctx.from?.first_name ?? "system",
+            message: "/compact",
+            timestamp: Date.now(),
+            messageId: msgId,
+        };
+        const tmpFile = path.join(QUEUE_INCOMING, `${msgId}.json.tmp`);
+        fs.writeFileSync(tmpFile, JSON.stringify(queueData));
+        fs.renameSync(tmpFile, path.join(QUEUE_INCOMING, `${msgId}.json`));
+    }
+    await ctx.reply(`Queued /compact to ${teamThreads.length} thread(s) in team **${config.team}**`, { parse_mode: "Markdown" });
+    log("INFO", `Team ${config.team} compact queued by ${ctx.from?.first_name ?? "unknown"} (${teamThreads.length} threads)`);
 });
 
 bot.command("status", async (ctx) => {
@@ -881,6 +1012,88 @@ bot.on("callback_query:data", async (ctx) => {
     }
 });
 
+// ─── Task Pin Polling ───
+
+async function pollTaskUpdates(): Promise<void> {
+    try {
+        // Read the mapping file written by queue-processor
+        let mapping: Record<string, { threadIds: number[]; team?: string }> = {};
+        try {
+            mapping = JSON.parse(fs.readFileSync(TASK_LISTS_FILE, "utf8"));
+        } catch {
+            return; // No mapping yet
+        }
+
+        const pins = loadTaskPins();
+        let pinsChanged = false;
+
+        for (const [taskListId, info] of Object.entries(mapping)) {
+            const taskDir = path.join(CLAUDE_TASKS_DIR, taskListId);
+
+            // Check mtime to avoid re-reading unchanged directories
+            try {
+                const mtime = fs.statSync(taskDir).mtimeMs;
+                if (taskDirMtimes.get(taskListId) === mtime) continue;
+                taskDirMtimes.set(taskListId, mtime);
+            } catch {
+                continue; // Directory doesn't exist yet
+            }
+
+            const tasks = readTasksFromDir(taskDir);
+            if (tasks.length === 0) continue;
+
+            const content = formatTaskMessage(tasks, settings.timezone);
+
+            // Update pinned message in each thread that uses this task list
+            for (const threadId of info.threadIds) {
+                // Skip if content hasn't changed for this thread
+                if (lastPinnedContent.get(threadId) === content) continue;
+
+                const pinKey = String(threadId);
+
+                try {
+                    if (pins[pinKey]) {
+                        // Update existing pinned message
+                        await bot.api.editMessageText(
+                            settings.telegram_chat_id,
+                            pins[pinKey],
+                            content,
+                        );
+                    } else {
+                        // Create new pinned message
+                        const msg = await bot.api.sendMessage(
+                            settings.telegram_chat_id,
+                            content,
+                            { message_thread_id: threadId },
+                        );
+                        await bot.api.pinChatMessage(
+                            settings.telegram_chat_id,
+                            msg.message_id,
+                            { disable_notification: true },
+                        );
+                        pins[pinKey] = msg.message_id;
+                        pinsChanged = true;
+                    }
+                    lastPinnedContent.set(threadId, content);
+                } catch (err) {
+                    // "message is not modified" is expected when content is the same
+                    const errMsg = err instanceof Error ? err.message : String(err);
+                    if (!errMsg.includes("message is not modified")) {
+                        log("WARN", `Task pin update failed for thread ${threadId}: ${errMsg}`);
+                    }
+                }
+            }
+        }
+
+        if (pinsChanged) {
+            saveTaskPins(pins);
+        }
+    } catch (err) {
+        // Task polling is best-effort
+        log("WARN", `Task poll error: ${err instanceof Error ? err.message : String(err)}`);
+    }
+}
+
 // ─── Error Handler ───
 
 bot.catch((err) => {
@@ -919,7 +1132,13 @@ bot.start({
             { command: "reset", description: "Reset the current thread session" },
             { command: "setdir", description: "Set working directory for this thread" },
             { command: "status", description: "Show all active threads and their status" },
+            { command: "clear_team", description: "Clear all team member sessions" },
+            { command: "compact_team", description: "Compact all team member sessions" },
         ]);
+        // Start task watcher
+        setInterval(() => { pollTaskUpdates().catch(() => {}); }, TASK_POLL_INTERVAL);
+        log("INFO", "Task watcher started");
+
         log("INFO", "Borg Telegram bot started");
     },
 });

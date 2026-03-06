@@ -6,6 +6,7 @@ dist/
 
 # Borg runtime data
 .borg/
+!.borg/worktrees/
 *.log
 
 # Docker / Secrets

@@ -25,7 +25,7 @@ import {
     formatSSHConfig,
 } from "./docker-client.js";
 import { parseMeminfo, parseCpuPercent, getDiskUsage, countQueueFiles } from "./host-metrics.js";
-import { loadThreads, loadSettings, formatHumanTime } from "./session-manager.js";
+import { loadThreads, loadSettings, formatHumanTime, configureThread, saveThreads } from "./session-manager.js";
 import { toErrorMessage, parseSSHPublicKey, parseDevEmail } from "./types.js";
 import { logCorrection, ROUTING_LOG, mergeCorrectionsOntoDecisions } from "./routing-logger.js";
 import { readRecentJsonl } from "./jsonl-reader.js";
@@ -149,6 +149,8 @@ export function createBorgMcpServer(sourceThreadId: number) {
                 const lines = Object.entries(threads).map(([id, t]) => {
                     const parts = [`Thread ${id}: ${t.name}`];
                     if (t.isMaster) parts.push("(master)");
+                    if (t.team) parts.push(`team=${t.team}`);
+                    if (t.role) parts.push(`role=${t.role}`);
                     if (t.cwd) parts.push(`cwd=${t.cwd}`);
                     if (Number(id) === sourceThreadId) parts.push("(you)");
                     return parts.join(" ");
@@ -627,6 +629,182 @@ export function createBorgMcpServer(sourceThreadId: number) {
         },
     );
 
+    const createThread = tool(
+        "create_thread",
+        "Create a new Telegram forum topic and register it as a Borg thread. Available to all threads.",
+        {
+            name: z.string().min(1).max(128).regex(/^[a-zA-Z0-9\-_\s]+$/)
+                .describe("Topic name (alphanumeric, hyphens, underscores, spaces)"),
+            team: z.string().min(1).max(64).regex(/^[a-z][a-z0-9-]*$/).optional()
+                .describe("Team identifier (lowercase alphanumeric + hyphens)"),
+            role: z.string().min(1).max(64).regex(/^[a-z][a-z0-9-]*$/).optional()
+                .describe("Agent role (lowercase alphanumeric + hyphens)"),
+            cwd: z.string().optional()
+                .describe("Working directory for the thread"),
+            initialMessage: z.string().optional()
+                .describe("First message to send to the new thread"),
+        },
+        async ({ name, team, role, cwd, initialMessage }) => {
+            try {
+                const settings = loadSettings();
+                const threads = loadThreads();
+
+                // Check for duplicate thread names
+                const existing = Object.entries(threads).find(([, t]) => t.name === name);
+                if (existing) {
+                    return {
+                        content: [textContent(`Thread "${name}" already exists (ID: ${existing[0]}). Use a different name.`)],
+                        isError: true,
+                    };
+                }
+
+                // Resource limits
+                const totalThreads = Object.keys(threads).length;
+                if (totalThreads >= 50) {
+                    return {
+                        content: [textContent("Maximum of 50 threads reached. Remove some threads first.")],
+                        isError: true,
+                    };
+                }
+                if (team) {
+                    const teamCount = Object.values(threads).filter(t => t.team === team).length;
+                    if (teamCount >= 10) {
+                        return {
+                            content: [textContent(`Team "${team}" already has 10 threads (maximum). Remove some first.`)],
+                            isError: true,
+                        };
+                    }
+                }
+
+                // Create forum topic via direct Telegram HTTP API
+                const response = await fetch(
+                    `https://api.telegram.org/bot${settings.telegram_bot_token}/createForumTopic`,
+                    {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({
+                            chat_id: settings.telegram_chat_id,
+                            name,
+                        }),
+                    }
+                );
+
+                if (!response.ok) {
+                    const errBody = await response.text();
+                    return {
+                        content: [textContent(`Telegram API error creating topic: ${errBody}`)],
+                        isError: true,
+                    };
+                }
+
+                const result = await response.json() as { ok: boolean; result?: { message_thread_id: number } };
+                if (!result.ok || !result.result) {
+                    return {
+                        content: [textContent("Telegram API returned unexpected response")],
+                        isError: true,
+                    };
+                }
+
+                const threadId = result.result.message_thread_id;
+
+                // Register in threads.json
+                configureThread(threadId, {
+                    name,
+                    cwd: cwd || (process.env.DEFAULT_CWD || process.cwd()),
+                    model: "sonnet",
+                    isMaster: false,
+                    lastActive: Date.now(),
+                    ...(team ? { team } : {}),
+                    ...(role ? { role } : {}),
+                });
+
+                // Send initial message if provided
+                if (initialMessage) {
+                    const ts = Date.now();
+                    const msgId = `init_${threadId}_${ts}`;
+                    const incoming = {
+                        channel: "telegram",
+                        source: "cross-thread",
+                        threadId,
+                        sourceThreadId,
+                        sender: threads[String(sourceThreadId)]?.name ?? `Thread ${sourceThreadId}`,
+                        message: initialMessage,
+                        timestamp: ts,
+                        messageId: msgId,
+                    };
+                    fs.mkdirSync(QUEUE_INCOMING, { recursive: true });
+                    const tmpPath = path.join(QUEUE_INCOMING, `${msgId}.json.tmp`);
+                    const finalPath = path.join(QUEUE_INCOMING, `${msgId}.json`);
+                    fs.writeFileSync(tmpPath, JSON.stringify(incoming));
+                    fs.renameSync(tmpPath, finalPath);
+                }
+
+                const parts = [`Created thread "${name}" (ID: ${threadId})`];
+                if (team) parts.push(`team=${team}`);
+                if (role) parts.push(`role=${role}`);
+                return { content: [textContent(parts.join(", "))] };
+            } catch (err) {
+                return {
+                    content: [textContent(`Failed to create thread: ${toErrorMessage(err)}`)],
+                    isError: true,
+                };
+            }
+        },
+    );
+
+    // ─── Thread & Team Management Tools ───
+
+    const configureThreadTool = tool(
+        "configure_thread",
+        "Update team metadata for an existing thread.",
+        {
+            threadId: z.number().describe("Thread ID to configure"),
+            team: z.string().min(1).max(64).regex(/^[a-z][a-z0-9-]*$/).optional()
+                .describe("Team identifier"),
+            role: z.string().min(1).max(64).regex(/^[a-z][a-z0-9-]*$/).optional()
+                .describe("Agent role"),
+        },
+        async ({ threadId, team, role }) => {
+            try {
+                const threads = loadThreads();
+                if (!threads[String(threadId)]) {
+                    return { content: [textContent(`Thread ${threadId} not found`)], isError: true };
+                }
+                configureThread(threadId, {
+                    ...(team !== undefined ? { team } : {}),
+                    ...(role !== undefined ? { role } : {}),
+                });
+                return { content: [textContent(`Updated thread ${threadId}: team=${team ?? "(unchanged)"}, role=${role ?? "(unchanged)"}`)] };
+            } catch (err) {
+                return { content: [textContent(`Failed: ${toErrorMessage(err)}`)], isError: true };
+            }
+        },
+    );
+
+    const disbandTeam = tool(
+        "disband_team",
+        "Remove team metadata from all threads in a team. Topics remain but lose team association.",
+        { team: z.string().describe("Team name to disband") },
+        async ({ team }) => {
+            try {
+                const threads = loadThreads();
+                const teamThreads = Object.entries(threads).filter(([, t]) => t.team === team);
+                if (teamThreads.length === 0) {
+                    return { content: [textContent(`No threads found in team "${team}"`)], isError: true };
+                }
+                // Batch update — single read/write cycle
+                for (const [id] of teamThreads) {
+                    delete threads[id].team;
+                    delete threads[id].role;
+                }
+                saveThreads(threads);
+                return { content: [textContent(`Disbanded team "${team}": removed team metadata from ${teamThreads.length} thread(s)`)] };
+            } catch (err) {
+                return { content: [textContent(`Failed: ${toErrorMessage(err)}`)], isError: true };
+            }
+        },
+    );
+
     // Build tool list: base tools + read-only monitoring for all threads, mutating tools for master only
     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- heterogeneous tool schemas require type erasure
     const tools: Array<ReturnType<typeof tool<any>>> = [
@@ -634,6 +812,7 @@ export function createBorgMcpServer(sourceThreadId: number) {
         getContainerStats, getSystemStatus, getHostMemory,
         getRoutingDecisions,
         getCurrentTime, getElapsedTime,
+        createThread, configureThreadTool, disbandTeam,
     ];
     if (sourceThreadId === 1) {
         tools.push(

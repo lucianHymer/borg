@@ -78,6 +78,14 @@ cmd_start() {
     sudo ln -sf "$installations" /secrets/github-installations.json
 
     log "Starting Borg stack..."
+
+    # Install global skills
+    if [ -d "$SCRIPT_DIR/skills/global" ]; then
+        mkdir -p "$HOME/.claude/skills"
+        cp "$SCRIPT_DIR/skills/global/"* "$HOME/.claude/skills/" 2>/dev/null || true
+        log "Installed global skills to ~/.claude/skills/"
+    fi
+
     dc up -d
     echo -e "${GREEN}Borg stack started${NC}"
     echo "  Services: bot, broker, dashboard, cloudflared"

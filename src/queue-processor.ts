@@ -38,6 +38,7 @@ import {
     buildThreadPrompt,
     buildHeartbeatPrompt,
     formatHumanTime,
+    getTimedTasks,
 } from "./session-manager.js";
 import type { ThreadConfig, HeartbeatTier } from "./session-manager.js";
 import { z } from "zod/v4";
@@ -86,6 +87,7 @@ const PROMPTS_LOG = path.join(BORG_DIR, "logs/prompts.jsonl");
 const PROMPTS_LOG_BACKUP = path.join(BORG_DIR, "logs/prompts.1.jsonl");
 const MAX_PROMPTS_LOG_SIZE = 10 * 1024 * 1024; // 10MB
 const SESSIONS_DIR = path.join(BORG_DIR, "sessions");
+const TASK_LISTS_FILE = path.join(BORG_DIR, "task-lists.json");
 
 // ─── Ensure queue directories exist ───
 
@@ -487,12 +489,59 @@ function clearStatus(messageId: string): void {
 
 // ─── Build v1 query options ───
 
+// ─── Task List Tracking ───
+
+function getTaskListId(threadId: number, threadConfig: ThreadConfig): string {
+    if (threadConfig.team) {
+        return `borg-team-${threadConfig.team}`;
+    }
+    return `borg-${threadId}`;
+}
+
+interface TaskListMapping {
+    [taskListId: string]: {
+        threadIds: number[];
+        team?: string;
+    };
+}
+
+function updateTaskListMapping(threadId: number, taskListId: string, team?: string): void {
+    try {
+        let mapping: TaskListMapping = {};
+        try {
+            mapping = JSON.parse(fs.readFileSync(TASK_LISTS_FILE, "utf8"));
+        } catch { /* file doesn't exist yet */ }
+
+        if (!mapping[taskListId]) {
+            mapping[taskListId] = { threadIds: [], team };
+        }
+        if (!mapping[taskListId].threadIds.includes(threadId)) {
+            mapping[taskListId].threadIds.push(threadId);
+        }
+        mapping[taskListId].team = team;
+
+        const tmp = TASK_LISTS_FILE + ".tmp";
+        fs.writeFileSync(tmp, JSON.stringify(mapping, null, 2));
+        fs.renameSync(tmp, TASK_LISTS_FILE);
+    } catch {
+        // Best effort — task visibility is not critical
+    }
+}
+
 function buildQueryOptions(
     threadId: number,
     threadConfig: ThreadConfig,
     effectiveModel: string,
     stderrLines?: string[],
 ): Options {
+    // Enable SDK task tracking
+    const taskListId = getTaskListId(threadId, threadConfig);
+    process.env.CLAUDE_CODE_TASK_LIST_ID = taskListId;
+    process.env.CLAUDE_CODE_ENABLE_TASKS = "true";
+
+    // Update task-lists mapping so telegram-client can find which threads use which task list
+    updateTaskListMapping(threadId, taskListId, threadConfig.team);
+
     const opts: Options = {
         model: effectiveModel,
         cwd: threadConfig.cwd,
@@ -604,7 +653,30 @@ async function processHeartbeat(msg: IncomingMessage): Promise<string> {
     const dueTier = getDueTier(threadKey);
     const state = loadHeartbeatState();
     const lastReport = state[threadKey]?.lastReport;
-    const heartbeatPrompt = buildHeartbeatPrompt(threadConfig, dueTier, lastReport);
+    let heartbeatPrompt = buildHeartbeatPrompt(threadConfig, dueTier, lastReport);
+
+    // Inject timed tasks if any are due
+    try {
+        const heartbeatPath = path.join(threadConfig.cwd, "HEARTBEAT.md");
+        if (fs.existsSync(heartbeatPath)) {
+            const heartbeatContent = fs.readFileSync(heartbeatPath, "utf8");
+            const threadState = state[threadKey] || { quick: 0, hourly: 0, daily: 0 };
+            const lastRun = new Date(Math.max(threadState.quick, threadState.hourly, threadState.daily) || 0);
+            const now = new Date();
+            const settings = loadSettings();
+            const timedTasks = getTimedTasks(heartbeatContent, lastRun, now, settings.timezone);
+            if (timedTasks.length > 0) {
+                const timedSection = [
+                    "",
+                    "## Timed Tasks Due Now",
+                    ...timedTasks.map(t => `- ${t}`),
+                ].join("\n");
+                heartbeatPrompt += timedSection;
+            }
+        }
+    } catch {
+        // Timed task parsing is best-effort
+    }
 
     log("INFO", `Heartbeat one-shot for thread ${msg.threadId} (tier: ${dueTier})`);
 
@@ -796,6 +868,17 @@ async function processMessage(messageFile: string): Promise<void> {
     try {
         // ─── Heartbeat: one-shot, skip router and session ───
         if (source === "heartbeat") {
+            // Defense-in-depth: skip heartbeat for team threads
+            const teamCheckThreads = loadThreads();
+            const teamCheckConfig = teamCheckThreads[String(threadId)];
+            if (teamCheckConfig?.team) {
+                log("INFO", `Skipping heartbeat for team thread ${threadId} (team: ${teamCheckConfig.team})`);
+                clearStatus(messageId);
+                if (fs.existsSync(processingFile)) {
+                    fs.unlinkSync(processingFile);
+                }
+                return;
+            }
             effectiveModel = "haiku";
             responseText = await processHeartbeat(msg);
 

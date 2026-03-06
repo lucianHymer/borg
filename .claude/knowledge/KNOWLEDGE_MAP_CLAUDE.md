@@ -1,6 +1,8 @@
 # Knowledge Map (Claude Reference)
 
 ## Architecture
+- @architecture/team-mcp-tools-only-create-thread-configure-thread-disband-team.md
+- @architecture/team-commands-use-simple-queue-messages-not-custom-command-handlers.md
 - @architecture/three-layer-workflow-abstraction-generic-skills-borg-bridge-native-fallback.md
 - @architecture/borg-philosophy-compound-knowledge-into-repos-light-touch-outside.md
 - @architecture/voice-message-feature-tts-stt-architecture-and-configuration.md

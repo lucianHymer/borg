@@ -44,7 +44,7 @@ while true; do
     fi
 
     # Iterate all active threads from threads.json
-    THREAD_IDS=$(jq -r 'keys[]' "$THREADS_FILE" 2>/dev/null)
+    THREAD_IDS=$(jq -r 'to_entries[] | select(.value.team == null) | .key' "$THREADS_FILE" 2>/dev/null)
 
     if [ -z "$THREAD_IDS" ]; then
         log "No active threads found, skipping cycle"

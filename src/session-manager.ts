@@ -15,9 +15,19 @@ export interface ThreadConfig {
     model: string;
     isMaster: boolean;
     lastActive: number;
+    team?: string;          // Team identifier (e.g., "auth-feature")
+    role?: string;          // Agent role (e.g., "planner", "reviewer")
 }
 
 export type ThreadsMap = Record<string, ThreadConfig>;
+
+export function getTeammates(threadId: string, threads: ThreadsMap): Array<{id: number, name: string, role?: string}> {
+    const myTeam = threads[threadId]?.team;
+    if (!myTeam) return [];
+    return Object.entries(threads)
+        .filter(([id, t]) => t.team === myTeam && id !== threadId)
+        .map(([id, t]) => ({ id: Number(id), name: t.name, role: t.role }));
+}
 
 export type CanUseToolResult =
     | { behavior: "allow"; updatedInput: unknown }
@@ -163,6 +173,76 @@ export function sanitizeHeartbeatContent(raw: string): string {
 
 export type HeartbeatTier = "quick" | "hourly" | "daily";
 
+// ─── Timed Tasks ───
+
+/**
+ * Check if a specific HH:MM time fell between lastRun and now in the given timezone.
+ */
+function isTimeDue(hour: number, minute: number, lastRun: Date, now: Date, timezone: string): boolean {
+    // Get today's date in the configured timezone
+    const formatter = new Intl.DateTimeFormat("en-US", {
+        timeZone: timezone,
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+    });
+    const parts = formatter.formatToParts(now);
+    const year = Number(parts.find(p => p.type === "year")!.value);
+    const month = Number(parts.find(p => p.type === "month")!.value) - 1;
+    const day = Number(parts.find(p => p.type === "day")!.value);
+
+    // Create a Date for the scheduled time today in local terms
+    const scheduledLocal = new Date(year, month, day, hour, minute, 0, 0);
+
+    // Get the timezone offset by comparing local representation
+    const utcStr = scheduledLocal.toLocaleString("en-US", { timeZone: "UTC" });
+    const tzStr = scheduledLocal.toLocaleString("en-US", { timeZone: timezone });
+    const utcDate = new Date(utcStr);
+    const tzDate = new Date(tzStr);
+    const offsetMs = utcDate.getTime() - tzDate.getTime();
+
+    // The actual UTC time when HH:MM occurs in the user's timezone
+    const scheduledUtc = new Date(scheduledLocal.getTime() + offsetMs);
+
+    // Check if this scheduled time falls between lastRun and now
+    return scheduledUtc.getTime() > lastRun.getTime() && scheduledUtc.getTime() <= now.getTime();
+}
+
+/**
+ * Extract timed tasks that are due from HEARTBEAT.md content.
+ * Parses @HH:MM annotations and checks if they fell between lastRun and now.
+ */
+export function getTimedTasks(heartbeatMd: string, lastRun: Date, now: Date, timezone: string): string[] {
+    // Extract "## Timed Tasks" section
+    const sectionMatch = heartbeatMd.match(/^## Timed Tasks\s*\n([\s\S]*?)(?=^## |\Z)/m);
+    if (!sectionMatch) return [];
+    const section = sectionMatch[1];
+
+    const dueTasks: string[] = [];
+    for (const line of section.split("\n")) {
+        const trimmed = line.trim();
+        if (!trimmed || !trimmed.startsWith("-")) continue;
+
+        const times = [...trimmed.matchAll(/@(\d{2}:\d{2})/g)].map(m => m[1]);
+        if (times.length === 0) continue;
+
+        for (const time of times) {
+            const [h, m] = time.split(":").map(Number);
+            if (isTimeDue(h, m, lastRun, now, timezone)) {
+                // Strip @HH:MM annotations and formatting, keep plain task text
+                const taskText = trimmed
+                    .replace(/@\d{2}:\d{2}\s*/g, "")
+                    .replace(/^-\s*/, "")
+                    .replace(/—\s*/, "")
+                    .trim();
+                dueTasks.push(taskText);
+                break; // Don't add same task twice if multiple times matched
+            }
+        }
+    }
+    return dueTasks;
+}
+
 // ─── System Prompt Building Blocks ───
 
 export function formatHumanTime(timezone: string, date: Date = new Date()): string {
@@ -288,6 +368,11 @@ function buildMcpToolsBlock(isMaster: boolean): string {
         "- `get_routing_decisions` — Get recent routing decisions with model, confidence, prompt text, and any user corrections",
         "- `get_current_time` — Get the current date and time in any timezone",
         "- `get_elapsed_time` — Calculate how much time has passed since a timestamp",
+        "",
+        "Team management tools:",
+        "- `create_thread` — Create a new Telegram forum topic and register it as a Borg thread (with optional team/role)",
+        "- `configure_thread` — Update team metadata (team, role) for an existing thread",
+        "- `disband_team` — Remove team association from all threads in a team",
     ];
     if (isMaster) {
         lines.push(
@@ -333,6 +418,30 @@ Container defaults: 2GB RAM, 2 CPUs, SSH port from 2201-2299 range.
 Check capacity with get_container_stats (count) and get_host_memory (RAM).`;
 }
 
+function buildTeamBlock(config: ThreadConfig, threadId: number): string {
+    const threads = loadThreads();
+    const teammates = getTeammates(String(threadId), threads);
+    const lines = [
+        `## Team: ${config.team}`,
+        `You are the **${config.role || "member"}** on this team.`,
+        "",
+        "### Teammates",
+    ];
+    for (const t of teammates) {
+        lines.push(`- ${t.name} (${t.role || "member"}) — use send_message with threadId ${t.id} to reach them`);
+    }
+    if (teammates.length === 0) {
+        lines.push("- No other teammates found yet");
+    }
+    lines.push("");
+    lines.push("### Note");
+    lines.push("You do not have heartbeats. If periodic scheduled work is needed,");
+    lines.push("suggest that a main thread's HEARTBEAT.md be updated.");
+    lines.push("");
+    lines.push("Your workflow is described in `.claude/skills/workflows/`. Read the relevant workflow skill when you need to understand coordination patterns.");
+    return lines.join("\n");
+}
+
 function buildRuntimeBlock(config: ThreadConfig, runtime?: { threadId?: number; model?: string }): string {
     return `
 
@@ -351,28 +460,38 @@ export function buildThreadPrompt(config: ThreadConfig, runtime?: { threadId?: n
     const runtimeBlock = buildRuntimeBlock(config, runtime);
 
     if (config.isMaster) {
-        return [
+        const parts = [
             buildPreamble(),
             "You are the Master thread, coordinating across all project threads. Each Telegram forum topic is a separate Claude Code session running in a different repo. You have visibility across all of them.",
             buildGithubBlock(),
             buildMasterCrossThreadBlock(),
             buildKnowledgeBaseBlock(),
             buildOnboardingBlock(),
-            buildHeartbeatBlock(),
             buildMcpToolsBlock(true),
-            `Keep responses concise — Telegram messages over 4000 characters get split.${runtimeBlock}`,
-        ].join("\n\n");
+        ];
+        if (config.team) {
+            parts.push(buildTeamBlock(config, runtime?.threadId ?? 0));
+        } else {
+            parts.push(buildHeartbeatBlock());
+        }
+        parts.push(`Keep responses concise — Telegram messages over 4000 characters get split.${runtimeBlock}`);
+        return parts.join("\n\n");
     }
 
-    return [
+    const parts = [
         buildPreamble(),
         `You are operating in thread "${config.name}", working in ${config.cwd}. This is your primary project directory.`,
         buildGithubBlock(),
         buildWorkerCrossThreadBlock(),
         buildMcpToolsBlock(false),
-        buildHeartbeatBlock(),
-        `Keep responses concise — Telegram messages over 4000 characters get split.${runtimeBlock}`,
-    ].join("\n\n");
+    ];
+    if (config.team) {
+        parts.push(buildTeamBlock(config, runtime?.threadId ?? 0));
+    } else {
+        parts.push(buildHeartbeatBlock());
+    }
+    parts.push(`Keep responses concise — Telegram messages over 4000 characters get split.${runtimeBlock}`);
+    return parts.join("\n\n");
 }
 
 export function buildHeartbeatPrompt(
@@ -498,6 +617,8 @@ export function configureThread(threadId: number, updates: Partial<ThreadConfig>
             model: filtered.model ?? "sonnet",
             isMaster: filtered.isMaster ?? false,
             lastActive: filtered.lastActive ?? Date.now(),
+            ...(filtered.team ? { team: filtered.team } : {}),
+            ...(filtered.role ? { role: filtered.role } : {}),
         };
     }
     saveThreads(threads);
