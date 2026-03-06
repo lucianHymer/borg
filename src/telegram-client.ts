@@ -16,8 +16,8 @@ import {
     configureThread,
 } from "./session-manager.js";
 import type { ThreadConfig, ThreadsMap, Settings } from "./session-manager.js";
-import type { OutgoingMessage } from "./types.js";
-import { toErrorMessage } from "./types.js";
+import type { OutgoingMessage, TaskListMapping } from "./types.js";
+import { toErrorMessage, TASK_LISTS_FILENAME } from "./types.js";
 import { RoutingMetadataSchema } from "./types.js";
 import { logDecision, logCorrection, ROUTING_LOG } from "./routing-logger.js";
 import { AUDIO_INCOMING_DIR, cleanupAudioFile, startPeriodicCleanup, ensureModels, distillForSpeech, synthesize, isAvailable } from "./audio.js";
@@ -31,7 +31,7 @@ const LOG_FILE = path.join(SCRIPT_DIR, ".borg/logs/telegram.log");
 const MESSAGE_MODELS_FILE = path.join(SCRIPT_DIR, ".borg/message-models.json");
 const QUEUE_STATUS = path.join(SCRIPT_DIR, ".borg/status");
 const DEDUP_WINDOW_MS = 10_000; // 10 seconds
-const TASK_LISTS_FILE = path.join(SCRIPT_DIR, ".borg/task-lists.json");
+const TASK_LISTS_FILE = path.join(SCRIPT_DIR, ".borg", TASK_LISTS_FILENAME);
 const TASK_PINS_FILE = path.join(SCRIPT_DIR, ".borg/task-pins.json");
 const CLAUDE_TASKS_DIR = path.join(process.env.HOME || "/root", ".claude/tasks");
 const TASK_POLL_INTERVAL = 2000; // 2 seconds
@@ -320,24 +320,26 @@ bot.command("setdir", async (ctx) => {
     log("INFO", `Thread ${threadId} cwd set to ${dir} by ${ctx.from?.first_name ?? "unknown"}`);
 });
 
-bot.command("clear_team", async (ctx) => {
+async function queueTeamCommand(ctx: Context, command: string): Promise<void> {
     if (String(ctx.chat?.id) !== settings.telegram_chat_id) return;
-    const threadId = ctx.msg.message_thread_id ?? 1;
+    const threadId = ctx.msg?.message_thread_id ?? 1;
     const threads = loadThreads();
     const config = threads[String(threadId)];
     if (!config?.team) {
-        await ctx.reply("This thread isn't part of a team.");
+        await ctx.reply("This thread isn't part of a team.", {
+            message_thread_id: ctx.msg?.message_thread_id,
+        });
         return;
     }
     const teamThreads = Object.entries(threads).filter(([, t]) => t.team === config.team);
     for (const [id] of teamThreads) {
-        const msgId = `clear_${id}_${Date.now()}`;
+        const msgId = `${command}_${id}_${Date.now()}`;
         const queueData = {
             channel: "telegram",
             source: "system",
             threadId: Number(id),
             sender: ctx.from?.first_name ?? "system",
-            message: "/clear",
+            message: `/${command}`,
             timestamp: Date.now(),
             messageId: msgId,
         };
@@ -345,38 +347,15 @@ bot.command("clear_team", async (ctx) => {
         fs.writeFileSync(tmpFile, JSON.stringify(queueData));
         fs.renameSync(tmpFile, path.join(QUEUE_INCOMING, `${msgId}.json`));
     }
-    await ctx.reply(`Queued /clear to ${teamThreads.length} thread(s) in team **${config.team}**`, { parse_mode: "Markdown" });
-    log("INFO", `Team ${config.team} clear queued by ${ctx.from?.first_name ?? "unknown"} (${teamThreads.length} threads)`);
-});
+    await ctx.reply(`Queued /${command} to ${teamThreads.length} thread(s) in team **${config.team}**`, {
+        message_thread_id: ctx.msg?.message_thread_id,
+        parse_mode: "Markdown",
+    });
+    log("INFO", `Team ${config.team} ${command} queued by ${ctx.from?.first_name ?? "unknown"} (${teamThreads.length} threads)`);
+}
 
-bot.command("compact_team", async (ctx) => {
-    if (String(ctx.chat?.id) !== settings.telegram_chat_id) return;
-    const threadId = ctx.msg.message_thread_id ?? 1;
-    const threads = loadThreads();
-    const config = threads[String(threadId)];
-    if (!config?.team) {
-        await ctx.reply("This thread isn't part of a team.");
-        return;
-    }
-    const teamThreads = Object.entries(threads).filter(([, t]) => t.team === config.team);
-    for (const [id] of teamThreads) {
-        const msgId = `compact_${id}_${Date.now()}`;
-        const queueData = {
-            channel: "telegram",
-            source: "system",
-            threadId: Number(id),
-            sender: ctx.from?.first_name ?? "system",
-            message: "/compact",
-            timestamp: Date.now(),
-            messageId: msgId,
-        };
-        const tmpFile = path.join(QUEUE_INCOMING, `${msgId}.json.tmp`);
-        fs.writeFileSync(tmpFile, JSON.stringify(queueData));
-        fs.renameSync(tmpFile, path.join(QUEUE_INCOMING, `${msgId}.json`));
-    }
-    await ctx.reply(`Queued /compact to ${teamThreads.length} thread(s) in team **${config.team}**`, { parse_mode: "Markdown" });
-    log("INFO", `Team ${config.team} compact queued by ${ctx.from?.first_name ?? "unknown"} (${teamThreads.length} threads)`);
-});
+bot.command("clear_team", (ctx) => queueTeamCommand(ctx, "clear"));
+bot.command("compact_team", (ctx) => queueTeamCommand(ctx, "compact"));
 
 bot.command("status", async (ctx) => {
     if (String(ctx.chat?.id) !== settings.telegram_chat_id) return;
@@ -1017,7 +996,7 @@ bot.on("callback_query:data", async (ctx) => {
 async function pollTaskUpdates(): Promise<void> {
     try {
         // Read the mapping file written by queue-processor
-        let mapping: Record<string, { threadIds: number[]; team?: string }> = {};
+        let mapping: TaskListMapping = {};
         try {
             mapping = JSON.parse(fs.readFileSync(TASK_LISTS_FILE, "utf8"));
         } catch {

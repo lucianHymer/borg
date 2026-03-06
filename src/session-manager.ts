@@ -214,7 +214,7 @@ function isTimeDue(hour: number, minute: number, lastRun: Date, now: Date, timez
  */
 export function getTimedTasks(heartbeatMd: string, lastRun: Date, now: Date, timezone: string): string[] {
     // Extract "## Timed Tasks" section
-    const sectionMatch = heartbeatMd.match(/^## Timed Tasks\s*\n([\s\S]*?)(?=^## |\Z)/m);
+    const sectionMatch = heartbeatMd.match(/^## Timed Tasks\s*\n([\s\S]*?)(?=\n## |\s*$)/m);
     if (!sectionMatch) return [];
     const section = sectionMatch[1];
 
@@ -347,6 +347,7 @@ You own this file. Evolve it as you learn about this repo:
   - Quick Tasks: fast checks (< 10 seconds) — git status, file existence, flag checks
   - Hourly Tasks: moderate checks — git fetch, CI status, upstream changes
   - Daily Tasks: thorough checks — PR reviews, stale branch cleanup, daily summaries
+  - Timed Tasks: tasks with \`@HH:MM\` annotations that fire at specific times (e.g., \`- @09:00 — Check overnight alerts\`)
 - Use "Urgent Flags" for anything needing human attention (blockers, broken CI, security)
 - Keep "Notes" as scratch space for context between heartbeats
 

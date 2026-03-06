@@ -784,7 +784,7 @@ export function createBorgMcpServer(sourceThreadId: number) {
     const disbandTeam = tool(
         "disband_team",
         "Remove team metadata from all threads in a team. Topics remain but lose team association.",
-        { team: z.string().describe("Team name to disband") },
+        { team: z.string().min(1).max(64).regex(/^[a-z][a-z0-9-]*$/).describe("Team name to disband") },
         async ({ team }) => {
             try {
                 const threads = loadThreads();

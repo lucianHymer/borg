@@ -20,8 +20,8 @@ import type {
 } from "@anthropic-ai/claude-agent-sdk";
 import { route, DEFAULT_ROUTING_CONFIG, maxTier } from "./router/index.js";
 import type { Tier, RoutingDecision } from "./router/index.js";
-import { toErrorMessage, isValidSessionId } from "./types.js";
-import type { IncomingMessage, OutgoingMessage } from "./types.js";
+import { toErrorMessage, isValidSessionId, TASK_LISTS_FILENAME } from "./types.js";
+import type { IncomingMessage, OutgoingMessage, TaskListMapping } from "./types.js";
 import {
     appendHistory,
     buildHistoryContext,
@@ -87,7 +87,7 @@ const PROMPTS_LOG = path.join(BORG_DIR, "logs/prompts.jsonl");
 const PROMPTS_LOG_BACKUP = path.join(BORG_DIR, "logs/prompts.1.jsonl");
 const MAX_PROMPTS_LOG_SIZE = 10 * 1024 * 1024; // 10MB
 const SESSIONS_DIR = path.join(BORG_DIR, "sessions");
-const TASK_LISTS_FILE = path.join(BORG_DIR, "task-lists.json");
+const TASK_LISTS_FILE = path.join(BORG_DIR, TASK_LISTS_FILENAME);
 
 // ─── Ensure queue directories exist ───
 
@@ -496,13 +496,6 @@ function getTaskListId(threadId: number, threadConfig: ThreadConfig): string {
         return `borg-team-${threadConfig.team}`;
     }
     return `borg-${threadId}`;
-}
-
-interface TaskListMapping {
-    [taskListId: string]: {
-        threadIds: number[];
-        team?: string;
-    };
 }
 
 function updateTaskListMapping(threadId: number, taskListId: string, team?: string): void {

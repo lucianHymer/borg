@@ -59,6 +59,17 @@ export const RoutingMetadataSchema = z.object({
     prompt: z.string().max(8192),
 });
 
+// ─── Task List Mapping (shared between queue-processor and telegram-client) ───
+
+export interface TaskListMapping {
+    [taskListId: string]: {
+        threadIds: number[];
+        team?: string;
+    };
+}
+
+export const TASK_LISTS_FILENAME = "task-lists.json";
+
 // ─── Validation Utilities ───
 
 /**
