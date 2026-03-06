@@ -162,11 +162,8 @@ function buildRetryFilename(filename: string, retryNum: number): string {
 
 // ─── Tier / Model Mapping ───
 
-const TIER_TO_MODEL: Record<Tier, string> = {
-    SIMPLE: "haiku",
-    MEDIUM: "sonnet",
-    COMPLEX: "sonnet",
-};
+// Use router config as single source of truth for tier → model mapping
+const TIER_TO_MODEL = DEFAULT_ROUTING_CONFIG.tiers;
 
 const MODEL_TO_TIER: Record<string, Tier> = {
     haiku: "SIMPLE",
