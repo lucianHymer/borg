@@ -181,11 +181,18 @@ function splitMessage(text: string, maxLength = 4096): string[] {
 
 type TaskPins = Record<string, number>; // threadId string → telegram messageId
 
+let cachedTaskPins: TaskPins | null = null;
+let taskPinsMtime = 0;
+
 function loadTaskPins(): TaskPins {
     try {
-        return JSON.parse(fs.readFileSync(TASK_PINS_FILE, "utf8"));
+        const mtime = fs.statSync(TASK_PINS_FILE).mtimeMs;
+        if (cachedTaskPins && mtime === taskPinsMtime) return cachedTaskPins;
+        cachedTaskPins = JSON.parse(fs.readFileSync(TASK_PINS_FILE, "utf8"));
+        taskPinsMtime = mtime;
+        return cachedTaskPins!;
     } catch {
-        return {};
+        return cachedTaskPins ?? {};
     }
 }
 
@@ -193,6 +200,8 @@ function saveTaskPins(pins: TaskPins): void {
     const tmp = TASK_PINS_FILE + ".tmp";
     fs.writeFileSync(tmp, JSON.stringify(pins, null, 2));
     fs.renameSync(tmp, TASK_PINS_FILE);
+    cachedTaskPins = pins;
+    taskPinsMtime = Date.now();
 }
 
 interface TaskFile {
@@ -204,7 +213,6 @@ interface TaskFile {
 
 function readTasksFromDir(dirPath: string): TaskFile[] {
     try {
-        if (!fs.existsSync(dirPath)) return [];
         const files = fs.readdirSync(dirPath).filter(f => f.endsWith(".json"));
         const tasks: TaskFile[] = [];
         for (const file of files) {

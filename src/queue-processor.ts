@@ -498,7 +498,13 @@ function getTaskListId(threadId: number, threadConfig: ThreadConfig): string {
     return `borg-${threadId}`;
 }
 
+// Track which (taskListId, threadId) pairs are already registered to avoid redundant file I/O
+const registeredTaskPairs = new Set<string>();
+
 function updateTaskListMapping(threadId: number, taskListId: string, team?: string): void {
+    const key = `${taskListId}:${threadId}`;
+    if (registeredTaskPairs.has(key)) return;
+
     try {
         let mapping: TaskListMapping = {};
         try {
@@ -516,6 +522,7 @@ function updateTaskListMapping(threadId: number, taskListId: string, team?: stri
         const tmp = TASK_LISTS_FILE + ".tmp";
         fs.writeFileSync(tmp, JSON.stringify(mapping, null, 2));
         fs.renameSync(tmp, TASK_LISTS_FILE);
+        registeredTaskPairs.add(key);
     } catch {
         // Best effort — task visibility is not critical
     }
@@ -651,24 +658,22 @@ async function processHeartbeat(msg: IncomingMessage): Promise<string> {
     // Inject timed tasks if any are due
     try {
         const heartbeatPath = path.join(threadConfig.cwd, "HEARTBEAT.md");
-        if (fs.existsSync(heartbeatPath)) {
-            const heartbeatContent = fs.readFileSync(heartbeatPath, "utf8");
-            const threadState = state[threadKey] || { quick: 0, hourly: 0, daily: 0 };
-            const lastRun = new Date(Math.max(threadState.quick, threadState.hourly, threadState.daily) || 0);
-            const now = new Date();
-            const settings = loadSettings();
-            const timedTasks = getTimedTasks(heartbeatContent, lastRun, now, settings.timezone);
-            if (timedTasks.length > 0) {
-                const timedSection = [
-                    "",
-                    "## Timed Tasks Due Now",
-                    ...timedTasks.map(t => `- ${t}`),
-                ].join("\n");
-                heartbeatPrompt += timedSection;
-            }
+        const heartbeatContent = fs.readFileSync(heartbeatPath, "utf8");
+        const threadState = state[threadKey] || { quick: 0, hourly: 0, daily: 0 };
+        const lastRun = new Date(Math.max(threadState.quick, threadState.hourly, threadState.daily) || 0);
+        const now = new Date();
+        const settings = loadSettings();
+        const timedTasks = getTimedTasks(heartbeatContent, lastRun, now, settings.timezone);
+        if (timedTasks.length > 0) {
+            const timedSection = [
+                "",
+                "## Timed Tasks Due Now",
+                ...timedTasks.map(t => `- ${t}`),
+            ].join("\n");
+            heartbeatPrompt += timedSection;
         }
     } catch {
-        // Timed task parsing is best-effort
+        // Timed task parsing is best-effort (ENOENT when no HEARTBEAT.md)
     }
 
     log("INFO", `Heartbeat one-shot for thread ${msg.threadId} (tier: ${dueTier})`);
