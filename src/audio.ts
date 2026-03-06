@@ -106,7 +106,7 @@ export async function synthesize(text: string, voice?: string, speed?: number): 
             speed: speed ?? 1.0,
             response_format: "mp3",
         }),
-        signal: AbortSignal.timeout(30_000),
+        signal: AbortSignal.timeout(60_000),
     });
 
     if (!res.ok) {

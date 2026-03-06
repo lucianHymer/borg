@@ -89,6 +89,56 @@ export function saveThreads(threads: ThreadsMap): void {
     threadsMtime = fs.statSync(THREADS_FILE).mtimeMs;
 }
 
+/**
+ * Atomically update specific fields on a thread config.
+ * Always reads fresh from disk (not cache) to avoid clobbering
+ * fields set by concurrent saves (e.g. team/role).
+ */
+export function updateThread(threadId: number, updates: Partial<ThreadConfig>): void {
+    const key = String(threadId);
+    let threads: ThreadsMap;
+    try {
+        threads = JSON.parse(fs.readFileSync(THREADS_FILE, "utf8")) as ThreadsMap;
+    } catch {
+        return; // File doesn't exist or is corrupt
+    }
+    if (!threads[key]) return;
+
+    const filtered = Object.fromEntries(
+        Object.entries(updates).filter(([, v]) => v !== undefined)
+    ) as Partial<ThreadConfig>;
+    Object.assign(threads[key], filtered);
+
+    const tmp = THREADS_FILE + ".tmp";
+    fs.writeFileSync(tmp, JSON.stringify(threads, null, 2));
+    fs.renameSync(tmp, THREADS_FILE);
+    threadsCache = threads;
+    threadsMtime = fs.statSync(THREADS_FILE).mtimeMs;
+}
+
+/**
+ * Atomically delete a field from a thread config.
+ * Always reads fresh from disk to avoid race conditions.
+ */
+export function deleteThreadField(threadId: number, field: keyof ThreadConfig): void {
+    const key = String(threadId);
+    let threads: ThreadsMap;
+    try {
+        threads = JSON.parse(fs.readFileSync(THREADS_FILE, "utf8")) as ThreadsMap;
+    } catch {
+        return;
+    }
+    if (!threads[key]) return;
+
+    delete threads[key][field];
+
+    const tmp = THREADS_FILE + ".tmp";
+    fs.writeFileSync(tmp, JSON.stringify(threads, null, 2));
+    fs.renameSync(tmp, THREADS_FILE);
+    threadsCache = threads;
+    threadsMtime = fs.statSync(THREADS_FILE).mtimeMs;
+}
+
 // ─── Settings ───
 
 export function loadSettings(): Settings {

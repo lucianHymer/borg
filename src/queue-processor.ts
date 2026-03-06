@@ -35,6 +35,8 @@ import {
     loadSettings,
     resetThread,
     configureThread,
+    updateThread,
+    deleteThreadField,
     buildThreadPrompt,
     buildHeartbeatPrompt,
     formatHumanTime,
@@ -994,17 +996,15 @@ async function processMessage(messageFile: string): Promise<void> {
                 clearInterval(statusInterval);
                 responseText = text.trim();
 
-                // Persist session ID for future resume
+                // Persist session ID for future resume (atomic to avoid clobbering team/role)
                 if (newSessionId) {
-                    const freshThreads = loadThreads();
-                    const freshKey = String(threadId);
-                    if (freshThreads[freshKey]) {
-                        freshThreads[freshKey].sessionId = newSessionId;
-                        freshThreads[freshKey].model = effectiveModel;
-                        freshThreads[freshKey].lastActive = Date.now();
-                        saveThreads(freshThreads);
-                        syncSessionLog(newSessionId, freshThreads[freshKey].cwd);
-                    }
+                    updateThread(threadId, {
+                        sessionId: newSessionId,
+                        model: effectiveModel,
+                        lastActive: Date.now(),
+                    });
+                    const cwd = loadThreads()[String(threadId)]?.cwd;
+                    if (cwd) syncSessionLog(newSessionId, cwd);
                 }
             } catch (queryErr) {
                 clearInterval(statusInterval);
@@ -1015,13 +1015,8 @@ async function processMessage(messageFile: string): Promise<void> {
                         (stderrOutput ? `\n  stderr: ${stderrOutput.slice(0, 2000)}` : ""),
                 );
 
-                // Clear stale sessionId on error so retries start a fresh session
-                const freshThreads = loadThreads();
-                const freshKey = String(threadId);
-                if (freshThreads[freshKey]) {
-                    delete freshThreads[freshKey].sessionId;
-                    saveThreads(freshThreads);
-                }
+                // Clear stale sessionId on error so retries start a fresh session (atomic)
+                deleteThreadField(threadId, "sessionId");
 
                 throw queryErr;
             }
