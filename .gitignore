@@ -24,3 +24,6 @@ secrets/
 # Mim - Transient/local state files
 .claude/knowledge/unresolved.md
 .claude/knowledge/mim.log
+
+# Heartbeat - instance-specific
+HEARTBEAT.md
