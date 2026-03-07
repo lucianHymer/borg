@@ -609,7 +609,17 @@ async function pollOutgoingQueue(): Promise<void> {
                 if (data.targetThreadId) {
                     // Cross-thread message: post to the target topic
                     const chatId = settings.telegram_chat_id;
-                    const chunks = splitMessage(data.message);
+
+                    // Prepend visible indicator if this is a cross-thread message (has sourceThreadId)
+                    let messageText = data.message;
+                    if (data.sourceThreadId) {
+                        const threads = loadThreads();
+                        const sourceThread = threads[String(data.sourceThreadId)];
+                        const sourceThreadName = sourceThread?.name || `thread ${data.sourceThreadId}`;
+                        messageText = `📨 _From ${data.sender} in ${sourceThreadName}_\n\n${data.message}`;
+                    }
+
+                    const chunks = splitMessage(messageText);
 
                     const threadOpt = data.targetThreadId !== 1
                         ? { message_thread_id: data.targetThreadId }
@@ -629,7 +639,7 @@ async function pollOutgoingQueue(): Promise<void> {
                     }
 
                     for (const chunk of chunks) {
-                        const sent = await bot.api.sendMessage(chatId, chunk, threadOpt);
+                        const sent = await bot.api.sendMessage(chatId, chunk, { ...threadOpt, parse_mode: "Markdown" });
                         if (!firstSentId) {
                             firstSentId = sent.message_id;
                             // Store full text ONLY for multi-segment messages, on the first segment
