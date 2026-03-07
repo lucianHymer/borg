@@ -15,7 +15,9 @@ with the teammate's threadId.
 Use `list_threads` to see all threads and their team/role assignments.
 
 ## Team Cleanup
-Use `disband_team` to remove team associations.
+Use `disband_team` to remove team associations (soft cleanup — keeps threads).
+Use `delete_thread` to permanently delete a Telegram forum topic and unregister it
+from Borg (hard cleanup — makes teams ephemeral). This is irreversible.
 `/clear_team` and `/compact_team` Telegram commands operate on all members
 of the current thread's team.
 
