@@ -96,9 +96,21 @@ git clone https://github.com/lucianHymer/borg.git
 cd borg
 npm install && npm run build
 
-# First run triggers the setup wizard (bot token, chat ID, timezone)
 ./borg.sh start
 ```
+
+### Initial Setup
+
+Before running `./borg.sh start`, you need to configure Borg:
+
+**Recommended**: Use the interactive setup skill in Claude Code:
+- Open Claude Code in this repo
+- Say "run the setup wizard" or "help me set up borg"
+- The skill will validate configuration, auto-generate secrets, and guide you through missing steps
+
+**Manual setup**: Copy `.env.example` to `.env` and fill in required values. See `.env.example` for detailed comments.
+
+**⚠️ CRITICAL**: The `BROKER_SECRET` in `.env` is **immutable** once dev containers are created. Generate it once with `openssl rand -hex 32` and never change it. Changing it requires regenerating ALL dev container credentials.
 
 ### Telegram Setup
 
