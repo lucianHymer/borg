@@ -204,3 +204,12 @@ export function parseDevName(raw: string): DevName {
     }
     return trimmed as DevName;
 }
+
+// ─── Message Model Cache Entry ───
+
+/** Message model cache entry (for routing feedback and TTS) */
+export interface MessageModelEntry {
+    model: string;
+    threadId: number;
+    fullText?: string;  // only stored for multi-segment messages (for TTS)
+}
