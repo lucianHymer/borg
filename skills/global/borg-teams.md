@@ -7,6 +7,18 @@ When a workflow says "create a thread for each role", use the `create_thread`
 MCP tool for each role. Set the team, role, and initialMessage fields.
 Teammates are derived automatically from the shared `team` field — no manual setup needed.
 
+## Workspace Isolation (Worktrees)
+When a workflow says "create a git worktree for the team":
+1. Use Bash to run: `git worktree add /absolute/path/to/borg/.borg/worktrees/{team-name} -b team/{team-name}`
+2. When calling `create_thread`, set the `cwd` parameter to the absolute worktree path
+3. All team members share the same `cwd` — they all work in the same worktree
+
+Example:
+```bash
+git worktree add /home/lucian/workspace/borg/.borg/worktrees/my-team -b team/my-team
+```
+Then use `cwd: "/home/lucian/workspace/borg/.borg/worktrees/my-team"` when creating threads.
+
 ## Messaging Teammates
 When a workflow says "send to [teammate]", use the `send_message` MCP tool
 with the teammate's threadId.
