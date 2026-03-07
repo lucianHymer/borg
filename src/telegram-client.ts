@@ -615,6 +615,19 @@ async function pollOutgoingQueue(): Promise<void> {
                         ? { message_thread_id: data.targetThreadId }
                         : {};
 
+                    // Register pending message BEFORE sending to ensure typing indicator
+                    // and status updates work immediately when queue-processor starts work.
+                    // We'll update with the actual Telegram message ID after sending.
+                    const chatIdNum = Number(chatId);
+                    const incomingId = data.messageId.replace(/_tg$/, "");
+                    if (Number.isFinite(chatIdNum)) {
+                        pendingMessages.set(incomingId, {
+                            chatId: chatIdNum,
+                            threadId: data.targetThreadId,
+                            telegramMessageId: -1, // Temporary - will be updated below
+                        });
+                    }
+
                     for (const chunk of chunks) {
                         const sent = await bot.api.sendMessage(chatId, chunk, threadOpt);
                         if (!firstSentId) firstSentId = sent.message_id;
@@ -624,16 +637,12 @@ async function pollOutgoingQueue(): Promise<void> {
                         }
                     }
 
-                    // Register pending message so status updates and final response are tracked.
-                    // The incoming queue message uses the base ID (without _tg suffix).
-                    const chatIdNum = Number(chatId);
+                    // Update pending message with actual Telegram message ID
                     if (firstSentId && Number.isFinite(chatIdNum)) {
-                        const incomingId = data.messageId.replace(/_tg$/, "");
-                        pendingMessages.set(incomingId, {
-                            chatId: chatIdNum,
-                            threadId: data.targetThreadId,
-                            telegramMessageId: firstSentId,
-                        });
+                        const pending = pendingMessages.get(incomingId);
+                        if (pending) {
+                            pending.telegramMessageId = firstSentId;
+                        }
                     }
 
                     log(
@@ -835,12 +844,15 @@ async function pollStatusFiles(): Promise<void> {
                 );
             } else {
                 // Send new status message as reply to original
+                const replyOpts = pending.telegramMessageId > 0
+                    ? { reply_parameters: { message_id: pending.telegramMessageId } }
+                    : {};
                 const sent = await bot.api.sendMessage(
                     pending.chatId,
                     displayText,
                     {
                         message_thread_id: getThreadOpt(pending),
-                        reply_parameters: { message_id: pending.telegramMessageId },
+                        ...replyOpts,
                     },
                 );
                 pending.statusMessageId = sent.message_id;
