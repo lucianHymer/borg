@@ -2,6 +2,15 @@
 
 Use this workflow when a task requires planning, implementation, review, and knowledge capture.
 
+## Workspace Isolation
+
+Before creating team members, you MUST create a git worktree:
+```
+git worktree add .borg/worktrees/{team-name} -b team/{team-name}
+```
+Set all team members' working directory to the worktree path. This is not
+optional — teams must work in isolation from the main branch.
+
 ## Roles
 
 ### Planner
@@ -85,21 +94,7 @@ If no, don't send it. Just continue your own work silently.
 - The master thread handles PR creation and team cleanup
 - If an agent receives a message after completing its role, it responds briefly but does not initiate new cross-thread messages
 
-## Coordination Guidelines
-- If a teammate hasn't responded in 10 minutes, resend your message
-- After 3 unanswered attempts, escalate to the master thread
-- If the master thread reports a teammate is stuck, you may absorb their role
-
 ## When to Use
 
 When the user describes a task that would benefit from structured development:
 suggest creating a dev team. Ask first — this is a big operation.
-
-## Workspace Isolation
-
-Before any team member writes code, create a git worktree for the team:
-- Create a worktree in a team-specific directory
-- Create a new branch for the team's work
-- Set all team members' working directory to the worktree path
-
-This is not optional — teams must work in isolation from the main branch to avoid conflicts.
