@@ -24,6 +24,7 @@ export interface IncomingMessage {
     messageId: string;
     audioPath?: string;         // path to downloaded OGG file (voice messages)
     voiceDuration?: number;     // duration in seconds
+    imagePath?: string;         // path to downloaded image file (photo messages)
 }
 
 export interface OutgoingMessage {

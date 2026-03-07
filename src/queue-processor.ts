@@ -28,6 +28,7 @@ import {
 } from "./message-history.js";
 import { createBorgMcpServer } from "./mcp-tools.js";
 import { transcribe, cleanupAudioFile, ensureModels, AUDIO_INCOMING_DIR } from "./audio.js";
+import { cleanupImageFile, IMAGES_INCOMING_DIR } from "./images.js";
 import type { MessageSource, MessageHistoryEntry } from "./message-history.js";
 import {
     loadThreads,
@@ -65,6 +66,7 @@ const IncomingMessageSchema = z.object({
     messageId: z.string(),
     audioPath: z.string().optional(),
     voiceDuration: z.number().optional(),
+    imagePath: z.string().optional(),
 });
 
 const CommandMessageSchema = z.object({
@@ -797,6 +799,14 @@ async function processMessage(messageFile: string): Promise<void> {
         }
     }
 
+    // ─── Validate imagePath is within the allowed directory ───
+    if (msg.imagePath) {
+        const resolved = path.resolve(msg.imagePath);
+        if (!resolved.startsWith(IMAGES_INCOMING_DIR + "/") && resolved !== IMAGES_INCOMING_DIR) {
+            throw new Error(`imagePath outside allowed directory: ${resolved}`);
+        }
+    }
+
     // ─── Voice Message: STT transcription ───
     function writeSttErrorAndBail(userMessage: string, originalLabel: string): void {
         const errorData: OutgoingMessage = {
@@ -815,6 +825,7 @@ async function processMessage(messageFile: string): Promise<void> {
         fs.renameSync(tmpFile, errorFile);
         clearStatus(messageId);
         if (msg.audioPath) cleanupAudioFile(msg.audioPath);
+        if (msg.imagePath) cleanupImageFile(msg.imagePath);
         if (fs.existsSync(processingFile)) fs.unlinkSync(processingFile);
     }
 
@@ -846,7 +857,19 @@ async function processMessage(messageFile: string): Promise<void> {
         }
     }
 
-    // Log incoming message to history (after STT so voice transcripts are captured)
+    // ─── Photo Message: Add Read tool instruction ───
+    if (msg.imagePath) {
+        const imageInstruction = `[Image received: ${msg.imagePath}]\n\nPlease analyze this image using the Read tool.`;
+        if (msg.message) {
+            // If there's a caption, prepend the instruction
+            msg.message = `${imageInstruction}\n\nCaption: ${msg.message}`;
+        } else {
+            msg.message = imageInstruction;
+        }
+        log("INFO", `Image message: ${msg.imagePath}`);
+    }
+
+    // Log incoming message to history (after STT and image instruction so they're captured)
     appendHistory({
         ts: Date.now(),
         threadId,
@@ -1076,6 +1099,11 @@ async function processMessage(messageFile: string): Promise<void> {
 
         clearStatus(messageId);
 
+        // Clean up image file after processing
+        if (msg.imagePath) {
+            cleanupImageFile(msg.imagePath);
+        }
+
         log(
             "INFO",
             `Response ready [${channel}] thread=${threadId} model=${effectiveModel} (${responseText.length} chars)`,
@@ -1088,6 +1116,10 @@ async function processMessage(messageFile: string): Promise<void> {
     } catch (error) {
         log("ERROR", `Processing error for ${filename}: ${toErrorMessage(error)}`);
         clearStatus(messageId);
+        // Clean up image file on error
+        if (msg.imagePath) {
+            cleanupImageFile(msg.imagePath);
+        }
         handleRetry(processingFile, filename, retryCount);
     }
 }

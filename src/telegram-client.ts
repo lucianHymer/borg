@@ -21,6 +21,7 @@ import { toErrorMessage, TASK_LISTS_FILENAME } from "./types.js";
 import { RoutingMetadataSchema } from "./types.js";
 import { logDecision, logCorrection, ROUTING_LOG } from "./routing-logger.js";
 import { AUDIO_INCOMING_DIR, cleanupAudioFile, startPeriodicCleanup, ensureModels, distillForSpeech, synthesize, isAvailable } from "./audio.js";
+import { IMAGES_INCOMING_DIR, cleanupImageFile, startPeriodicCleanup as startImageCleanup } from "./images.js";
 
 // ─── Constants ───
 
@@ -552,6 +553,109 @@ bot.on("message:voice").filter(
         }
 
         log("INFO", `Queued voice message (${duration}s) from ${ctx.from.first_name} in thread ${threadId}`);
+    },
+);
+
+// ─── Photo Message Handler ───
+
+bot.on("message:photo").filter(
+    (ctx) => ctx.from.id !== bot.botInfo.id,
+    async (ctx) => {
+        const threadId = ctx.msg.message_thread_id ?? 1;
+        if (String(ctx.chat.id) !== settings.telegram_chat_id) return;
+
+        // Get the largest photo (last in array)
+        const photo = ctx.msg.photo[ctx.msg.photo.length - 1];
+
+        // Fetch file metadata
+        const file = await ctx.getFile();
+
+        // Reject oversized images (Claude Read tool limit)
+        if (file.file_size && file.file_size > 5 * 1024 * 1024) {
+            await ctx.reply("Image too large (max 5MB). Please send a smaller image.", {
+                message_thread_id: ctx.msg.message_thread_id,
+            });
+            return;
+        }
+
+        // Deduplicate using file_unique_id
+        if (isDuplicate(threadId, String(ctx.from.id), `photo_${file.file_unique_id}`)) {
+            log("INFO", `Dedup: skipping duplicate photo from ${ctx.from.first_name} in thread ${threadId}`);
+            return;
+        }
+
+        // Download the image file
+        const fileUrl = `https://api.telegram.org/file/bot${settings.telegram_bot_token}/${file.file_path}`;
+        const messageId = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+
+        // Determine file extension from path (e.g., "photos/file_123.jpg")
+        const ext = path.extname(file.file_path || ".jpg") || ".jpg";
+        const imagePath = path.join(IMAGES_INCOMING_DIR, `${messageId}${ext}`);
+
+        try {
+            const res = await fetch(fileUrl);
+            if (!res.ok) throw new Error(`Download failed: ${res.status}`);
+            const buffer = Buffer.from(await res.arrayBuffer());
+            const tmpPath = imagePath + ".tmp";
+            fs.writeFileSync(tmpPath, buffer);
+            fs.renameSync(tmpPath, imagePath);
+        } catch (err) {
+            log("ERROR", `Failed to download image file: ${toErrorMessage(err)}`);
+            await ctx.reply("Couldn't download your image. Please try again.", {
+                message_thread_id: ctx.msg.message_thread_id,
+            });
+            return;
+        }
+
+        // Check reply-to-bot context (same as text/voice handler)
+        const isReplyToBot = ctx.msg.reply_to_message?.from?.id === bot.botInfo.id;
+        const stored = isReplyToBot && ctx.msg.reply_to_message
+            ? lookupMessageModel(ctx.msg.reply_to_message.message_id)
+            : undefined;
+        const replyToModel = stored?.model;
+        const replyToText = isReplyToBot ? ctx.msg.reply_to_message?.text : undefined;
+
+        // Use caption if provided, otherwise empty (queue-processor will add instruction)
+        const caption = ctx.msg.caption || "";
+
+        const topicName = topicNames.get(threadId);
+        const queueData = {
+            channel: "telegram",
+            source: "user" as const,
+            threadId,
+            sender: ctx.from.first_name,
+            senderId: String(ctx.from.id),
+            message: caption,
+            imagePath,
+            isReply: isReplyToBot,
+            replyToText,
+            replyToModel,
+            topicName,
+            timestamp: Date.now(),
+            messageId,
+        };
+
+        const queueFile = path.join(QUEUE_INCOMING, `telegram_${messageId}.json`);
+        const tmpFile = queueFile + ".tmp";
+        fs.writeFileSync(tmpFile, JSON.stringify(queueData, null, 2));
+        fs.renameSync(tmpFile, queueFile);
+
+        pendingMessages.set(messageId, {
+            ctx,
+            chatId: ctx.chat.id,
+            threadId,
+            telegramMessageId: ctx.msg.message_id,
+        });
+
+        // React with 👀 to acknowledge
+        try {
+            await bot.api.setMessageReaction(ctx.chat.id, ctx.msg.message_id,
+                [{ type: "emoji", emoji: "👀" as any }]);
+        } catch {
+            // Reactions may not be available
+        }
+
+        log("INFO", `Queued photo message from ${ctx.from.first_name} in thread ${threadId} (${file.file_size} bytes)`);
     },
 );
 
@@ -1171,6 +1275,9 @@ setInterval(pollStatusFiles, 2000);
 
 // Start periodic audio file cleanup
 startPeriodicCleanup();
+
+// Start periodic image file cleanup
+startImageCleanup();
 
 // Ensure Speaches models are installed (fire-and-forget, cached across restarts)
 ensureModels().catch(() => {});
