@@ -67,6 +67,7 @@ const IncomingMessageSchema = z.object({
     audioPath: z.string().optional(),
     voiceDuration: z.number().optional(),
     imagePath: z.string().optional(),
+    telegramMessageId: z.number().optional(),
 });
 
 const CommandMessageSchema = z.object({
@@ -843,6 +844,14 @@ async function processMessage(messageFile: string): Promise<void> {
             }
             msg.message = transcript;
             log("INFO", `STT transcript (${msg.voiceDuration}s): ${transcript.substring(0, 120)}...`);
+
+            // Store transcript in voice cache for "Your Text"/"Your Summary" buttons
+            if (msg.telegramMessageId) {
+                const { storeVoiceTranscript } = await import("./voice-cache.js");
+                storeVoiceTranscript(String(msg.telegramMessageId), transcript);
+                log("INFO", `Stored voice transcript for message ${msg.telegramMessageId}`);
+            }
+
             cleanupAudioFile(msg.audioPath);
             // Update the processing file so retries don't re-attempt STT on a deleted audio file
             delete msg.audioPath;
@@ -1082,6 +1091,10 @@ async function processMessage(messageFile: string): Promise<void> {
                     tokens: routingResult.decision.estimatedTokens,
                     prompt: msg.message,
                 },
+            } : {}),
+            ...(msg.telegramMessageId && msg.voiceDuration ? {
+                replyToMessageId: msg.telegramMessageId,
+                replyToVoice: true,
             } : {}),
         };
 

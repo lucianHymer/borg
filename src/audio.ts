@@ -161,6 +161,43 @@ export async function distillForSpeech(text: string): Promise<string> {
     }
 }
 
+// ─── Text Distillation for Reading via Sonnet ───
+
+export async function distillForReading(text: string): Promise<string> {
+    // Cap input length before sending to distillation
+    const truncatedInput = text.length > 2048 ? text.slice(0, 2048) : text;
+
+    try {
+        const conversation = query({
+            prompt: truncatedInput,
+            options: {
+                model: "claude-sonnet-4-5-20250929",
+                systemPrompt: "Summarize this voice message transcript in 2-3 concise sentences. Preserve key points and action items. Be precise and avoid confusion.",
+                maxTurns: 1,
+            },
+        });
+
+        let result = "";
+        for await (const msg of conversation) {
+            if (msg.type === "assistant") {
+                const content = (msg as SDKAssistantMessage).message?.content;
+                if (Array.isArray(content)) {
+                    for (const block of content) {
+                        if (block.type === "text" && typeof block.text === "string") {
+                            result += block.text;
+                        }
+                    }
+                }
+            }
+        }
+
+        return result.trim() || (text.length > 200 ? text.slice(0, 200) + "..." : text);
+    } catch {
+        // Fallback to truncation on SDK error
+        return text.length > 200 ? text.slice(0, 200) + "..." : text;
+    }
+}
+
 // ─── File Cleanup ───
 
 export function cleanupAudioFile(filePath: string): void {

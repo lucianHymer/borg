@@ -25,6 +25,7 @@ export interface IncomingMessage {
     audioPath?: string;         // path to downloaded OGG file (voice messages)
     voiceDuration?: number;     // duration in seconds
     imagePath?: string;         // path to downloaded image file (photo messages)
+    telegramMessageId?: number; // Telegram message_id (for voice transcript cache)
 }
 
 export interface OutgoingMessage {
@@ -39,6 +40,8 @@ export interface OutgoingMessage {
     targetThreadId?: number;
     sourceThreadId?: number;  // threadId of the sender (for cross-thread messages)
     routingMetadata?: RoutingMetadata;
+    replyToMessageId?: number; // Telegram message_id being replied to
+    replyToVoice?: boolean;    // true if replying to a voice message
 }
 
 // ─── Routing Metadata ───
