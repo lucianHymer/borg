@@ -805,6 +805,76 @@ export function createBorgMcpServer(sourceThreadId: number) {
         },
     );
 
+    const deleteThread = tool(
+        "delete_thread",
+        "Permanently delete a Telegram forum topic and unregister it from Borg. This is IRREVERSIBLE — the topic and its message history will be deleted from Telegram. IMPORTANT: Always confirm with the user before calling this tool.",
+        { threadId: z.number().describe("Thread ID to delete") },
+        async ({ threadId }) => {
+            try {
+                // Prevent deleting the master thread
+                if (threadId === 1) {
+                    return {
+                        content: [textContent("Cannot delete the master thread (thread 1)")],
+                        isError: true,
+                    };
+                }
+
+                const threads = loadThreads();
+                if (!threads[String(threadId)]) {
+                    return {
+                        content: [textContent(`Thread ${threadId} not found in threads.json`)],
+                        isError: true,
+                    };
+                }
+
+                const settings = loadSettings();
+
+                // Delete the forum topic via Telegram API
+                const response = await fetch(
+                    `https://api.telegram.org/bot${settings.telegram_bot_token}/deleteForumTopic`,
+                    {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({
+                            chat_id: settings.telegram_chat_id,
+                            message_thread_id: threadId,
+                        }),
+                    }
+                );
+
+                if (!response.ok) {
+                    const errBody = await response.text();
+                    return {
+                        content: [textContent(`Telegram API error deleting topic: ${errBody}`)],
+                        isError: true,
+                    };
+                }
+
+                const result = await response.json() as { ok: boolean };
+                if (!result.ok) {
+                    return {
+                        content: [textContent("Telegram API returned unexpected response")],
+                        isError: true,
+                    };
+                }
+
+                // Remove from threads.json
+                const threadName = threads[String(threadId)].name;
+                delete threads[String(threadId)];
+                saveThreads(threads);
+
+                return {
+                    content: [textContent(`Deleted thread ${threadId} ("${threadName}") from Telegram and unregistered from Borg`)],
+                };
+            } catch (err) {
+                return {
+                    content: [textContent(`Failed to delete thread: ${toErrorMessage(err)}`)],
+                    isError: true,
+                };
+            }
+        },
+    );
+
     // Build tool list: base tools + read-only monitoring for all threads, mutating tools for master only
     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- heterogeneous tool schemas require type erasure
     const tools: Array<ReturnType<typeof tool<any>>> = [
@@ -812,7 +882,7 @@ export function createBorgMcpServer(sourceThreadId: number) {
         getContainerStats, getSystemStatus, getHostMemory,
         getRoutingDecisions,
         getCurrentTime, getElapsedTime,
-        createThread, configureThreadTool, disbandTeam,
+        createThread, configureThreadTool, disbandTeam, deleteThread,
     ];
     if (sourceThreadId === 1) {
         tools.push(
