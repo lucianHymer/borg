@@ -7,8 +7,9 @@ How to manage HEARTBEAT.md files for Borg threads.
 HEARTBEAT.md has these sections:
 
 ### Quick Tasks
-Fast checks (< 10 seconds) — git status, file existence, flag checks.
+Fast checks (< 10 seconds) — correlate git status with GitHub PR status, verify local commits have PRs or are pushed, file existence, flag checks.
 Runs every heartbeat cycle (~8 min).
+Always synthesize GitHub remote state with local git state to understand the full picture.
 
 ### Hourly Tasks
 Moderate checks — git fetch, CI status, upstream changes.
