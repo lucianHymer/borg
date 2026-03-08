@@ -28,6 +28,7 @@ import { IMAGES_INCOMING_DIR, startPeriodicCleanup as startImageCleanup } from "
 const SCRIPT_DIR = path.resolve(__dirname, "..");
 const QUEUE_INCOMING = path.join(SCRIPT_DIR, ".borg/queue/incoming");
 const QUEUE_OUTGOING = path.join(SCRIPT_DIR, ".borg/queue/outgoing");
+const QUEUE_DEAD_LETTER = path.join(SCRIPT_DIR, ".borg/queue/dead-letter");
 const LOG_FILE = path.join(SCRIPT_DIR, ".borg/logs/telegram.log");
 const MESSAGE_MODELS_FILE = path.join(SCRIPT_DIR, ".borg/message-models.json");
 const QUEUE_STATUS = path.join(SCRIPT_DIR, ".borg/status");
@@ -58,7 +59,7 @@ function isDuplicate(threadId: number, senderId: string, text: string): boolean 
 
 // ─── Ensure Directories Exist ───
 
-[QUEUE_INCOMING, QUEUE_OUTGOING, QUEUE_STATUS, path.dirname(LOG_FILE), path.dirname(MESSAGE_MODELS_FILE)].forEach(
+[QUEUE_INCOMING, QUEUE_OUTGOING, QUEUE_DEAD_LETTER, QUEUE_STATUS, path.dirname(LOG_FILE), path.dirname(MESSAGE_MODELS_FILE)].forEach(
     (dir) => {
         if (!fs.existsSync(dir)) {
             fs.mkdirSync(dir, { recursive: true });
@@ -948,13 +949,81 @@ async function pollOutgoingQueue(): Promise<void> {
                 // Delete the queue file after processing
                 fs.unlinkSync(filePath);
             } catch (err) {
-                log("ERROR", `Failed to process outgoing file ${file}: ${toErrorMessage(err)}`);
+                const errMsg = toErrorMessage(err);
+                log("ERROR", `Failed to process outgoing file ${file}: ${errMsg}`);
+
+                // Classify the error and handle accordingly
+                if (errMsg.includes("can't parse entities")) {
+                    // Bad markdown — retry without parse_mode (plain text fallback)
+                    log("INFO", `Retrying ${file} as plain text (stripping markdown)...`);
+                    try {
+                        const data: OutgoingMessage = JSON.parse(fs.readFileSync(filePath, "utf8"));
+                        const chatId = settings.telegram_chat_id;
+                        const threadId = data.targetThreadId || data.threadId;
+                        const threadOpt = threadId && threadId !== 1
+                            ? { message_thread_id: threadId }
+                            : {};
+
+                        let messageText = data.message;
+                        if (data.sourceThreadId) {
+                            const threads = loadThreads();
+                            const sourceThread = threads[String(data.sourceThreadId)];
+                            const sourceThreadName = sourceThread?.name || `thread ${data.sourceThreadId}`;
+                            messageText = `📨 From ${data.sender} in ${sourceThreadName}\n\n${data.message}`;
+                        }
+
+                        const chunks = splitMessage(messageText);
+                        for (const chunk of chunks) {
+                            await bot.api.sendMessage(chatId, chunk, threadOpt);
+                        }
+
+                        fs.unlinkSync(filePath);
+                        log("INFO", `Plain text fallback succeeded for ${file}`);
+                    } catch (retryErr) {
+                        log("ERROR", `Plain text retry also failed for ${file}: ${toErrorMessage(retryErr)}`);
+                        moveToDeadLetter(filePath, file);
+                    }
+                } else if (
+                    errMsg.includes("message thread not found") ||
+                    errMsg.includes("chat not found") ||
+                    errMsg.includes("bot was blocked") ||
+                    errMsg.includes("400:")
+                ) {
+                    // Permanent failure — dead-letter immediately
+                    moveToDeadLetter(filePath, file);
+                } else {
+                    // Transient failure — track retries via a simple counter file
+                    const retryFile = `${filePath}.retries`;
+                    let retries = 0;
+                    try {
+                        retries = parseInt(fs.readFileSync(retryFile, "utf8"), 10) || 0;
+                    } catch { /* no retry file yet */ }
+                    retries++;
+                    if (retries >= 3) {
+                        moveToDeadLetter(filePath, file);
+                        try { fs.unlinkSync(retryFile); } catch { /* ignore */ }
+                    } else {
+                        fs.writeFileSync(retryFile, String(retries));
+                        log("WARN", `Transient failure for ${file}, retry ${retries}/3`);
+                    }
+                }
             }
         }
     } catch (err) {
         log("ERROR", `Outgoing queue poll error: ${toErrorMessage(err)}`);
     } finally {
         outgoingPollActive = false;
+    }
+}
+
+function moveToDeadLetter(filePath: string, filename: string): void {
+    try {
+        const deadLetterPath = path.join(QUEUE_DEAD_LETTER, `${Date.now()}_${filename}`);
+        fs.renameSync(filePath, deadLetterPath);
+        log("WARN", `Moved to dead-letter: ${filename}`);
+    } catch (moveErr) {
+        log("ERROR", `Failed to move ${filename} to dead-letter: ${toErrorMessage(moveErr)}`);
+        try { fs.unlinkSync(filePath); } catch { /* last resort */ }
     }
 }
 
