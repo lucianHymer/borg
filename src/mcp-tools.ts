@@ -154,24 +154,26 @@ export function createBorgMcpServer(sourceThreadId: number) {
             fs.writeFileSync(inTmp, JSON.stringify(incoming));
             fs.renameSync(inTmp, inFinal);
 
-            // Write to local outgoing queue so it appears in the Telegram topic
-            const outgoing = {
-                channel: "telegram",
-                targetThreadId,
-                sourceThreadId,
-                sender: sourceName,
-                message,
-                originalMessage: "",
-                timestamp: ts,
-                messageId: `${id}_tg`,
-                model: "",
-            };
-
-            fs.mkdirSync(QUEUE_OUTGOING, { recursive: true });
-            const outTmp = path.join(QUEUE_OUTGOING, `${id}_tg.json.tmp`);
-            const outFinal = path.join(QUEUE_OUTGOING, `${id}_tg.json`);
-            fs.writeFileSync(outTmp, JSON.stringify(outgoing));
-            fs.renameSync(outTmp, outFinal);
+            // For local threads, write to outgoing queue so telegram-client displays it in the target topic.
+            // For peer threads, skip this — the peer's telegram-client owns those topics and handles display.
+            if (!peerLabel) {
+                const outgoing = {
+                    channel: "telegram",
+                    targetThreadId,
+                    sourceThreadId,
+                    sender: sourceName,
+                    message,
+                    originalMessage: "",
+                    timestamp: ts,
+                    messageId: `${id}_tg`,
+                    model: "",
+                };
+                fs.mkdirSync(QUEUE_OUTGOING, { recursive: true });
+                const outTmp = path.join(QUEUE_OUTGOING, `${id}_tg.json.tmp`);
+                const outFinal = path.join(QUEUE_OUTGOING, `${id}_tg.json`);
+                fs.writeFileSync(outTmp, JSON.stringify(outgoing));
+                fs.renameSync(outTmp, outFinal);
+            }
 
             const label = peerLabel ? ` via peer ${peerLabel}` : "";
             return { content: [textContent(`Message sent to thread ${targetThreadId} (${targetName})${label}`)] };
