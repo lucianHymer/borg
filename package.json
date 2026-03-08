@@ -7,18 +7,24 @@
     "build": "tsc",
     "telegram": "node dist/telegram-client.js",
     "queue": "node dist/queue-processor.js",
-    "dashboard": "node dist/dashboard.js"
+    "dashboard": "node dist/dashboard.js",
+    "test": "vitest",
+    "test:ui": "vitest --ui",
+    "test:coverage": "vitest --coverage"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.2.38",
-    "express": "^5.1.0",
     "@grammyjs/auto-retry": "^2.0.2",
+    "express": "^5.1.0",
     "grammy": "^1.37.1",
     "zod": "^4.0.0"
   },
   "devDependencies": {
     "@types/express": "^5.0.0",
     "@types/node": "^22.15.0",
-    "typescript": "^5.9.3"
+    "@vitest/coverage-v8": "^4.0.18",
+    "@vitest/ui": "^4.0.18",
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.18"
   }
 }
