@@ -210,6 +210,14 @@ export function parseDevName(raw: string): DevName {
     return trimmed as DevName;
 }
 
+// ─── Peer Instance ───
+
+export interface Peer {
+    name: string;            // human-readable label for logging
+    queueDir: string;        // absolute path to peer's .borg/queue directory
+    threadsJsonPath: string; // absolute path to peer's .borg/threads.json
+}
+
 // ─── Message Model Cache Entry ───
 
 /** Message model cache entry (for routing feedback and TTS) */
