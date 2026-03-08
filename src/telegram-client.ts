@@ -16,7 +16,7 @@ import {
     configureThread,
 } from "./session-manager.js";
 import type { ThreadConfig, ThreadsMap, Settings } from "./session-manager.js";
-import type { OutgoingMessage, TaskListMapping } from "./types.js";
+import type { OutgoingMessage, TaskListMapping, MessageModelEntry } from "./types.js";
 import { toErrorMessage, TASK_LISTS_FILENAME } from "./types.js";
 import { RoutingMetadataSchema } from "./types.js";
 import { logDecision, logCorrection, ROUTING_LOG } from "./routing-logger.js";
@@ -76,22 +76,22 @@ function log(level: string, message: string): void {
 
 // ─── Message Model Tracking ───
 
-let messageModelsCache: Record<string, { model: string; threadId: number }> | null = null;
+let messageModelsCache: Record<string, MessageModelEntry> | null = null;
 
-function loadMessageModels(): Record<string, { model: string; threadId: number }> {
+function loadMessageModels(): Record<string, MessageModelEntry> {
     if (messageModelsCache) return messageModelsCache;
     try {
         const data = fs.readFileSync(MESSAGE_MODELS_FILE, "utf8");
         const raw = JSON.parse(data) as Record<string, unknown>;
         // Normalize on load: old string values → {model, threadId: 0}
         let needsRewrite = false;
-        const normalized: Record<string, { model: string; threadId: number }> = {};
+        const normalized: Record<string, MessageModelEntry> = {};
         for (const [key, value] of Object.entries(raw)) {
             if (typeof value === "string") {
                 normalized[key] = { model: value, threadId: 0 };
                 needsRewrite = true;
             } else if (value && typeof value === "object" && "model" in value) {
-                normalized[key] = value as { model: string; threadId: number };
+                normalized[key] = value as MessageModelEntry;
             }
         }
         messageModelsCache = normalized;
@@ -100,16 +100,16 @@ function loadMessageModels(): Record<string, { model: string; threadId: number }
         }
         return messageModelsCache;
     } catch {
-        messageModelsCache = {} as Record<string, { model: string; threadId: number }>;
+        messageModelsCache = {} as Record<string, MessageModelEntry>;
         return messageModelsCache;
     }
 }
 
-function saveMessageModels(models: Record<string, { model: string; threadId: number }>): void {
-    // Prune to last 1000 entries
+function saveMessageModels(models: Record<string, MessageModelEntry>): void {
+    // Prune to last 200 entries (reduced from 1000 since fullText can be large)
     const keys = Object.keys(models);
-    if (keys.length > 1000) {
-        const toRemove = keys.slice(0, keys.length - 1000);
+    if (keys.length > 200) {
+        const toRemove = keys.slice(0, keys.length - 200);
         for (const key of toRemove) {
             delete models[key];
         }
@@ -120,13 +120,13 @@ function saveMessageModels(models: Record<string, { model: string; threadId: num
     messageModelsCache = models;
 }
 
-function storeMessageModel(messageId: number, model: string, threadId: number): void {
+function storeMessageModel(messageId: number, model: string, threadId: number, fullText?: string): void {
     const models = loadMessageModels();
-    models[String(messageId)] = { model, threadId };
+    models[String(messageId)] = { model, threadId, fullText };
     saveMessageModels(models);
 }
 
-function lookupMessageModel(messageId: number): { model: string; threadId: number } | undefined {
+function lookupMessageModel(messageId: number): MessageModelEntry | undefined {
     const models = loadMessageModels();
     return models[String(messageId)];
 }
@@ -630,8 +630,17 @@ async function pollOutgoingQueue(): Promise<void> {
 
                     for (const chunk of chunks) {
                         const sent = await bot.api.sendMessage(chatId, chunk, threadOpt);
-                        if (!firstSentId) firstSentId = sent.message_id;
-                        if (data.model) {
+                        if (!firstSentId) {
+                            firstSentId = sent.message_id;
+                            // Store full text ONLY for multi-segment messages, on the first segment
+                            if (data.model && chunks.length > 1) {
+                                storeMessageModel(sent.message_id, data.model, data.targetThreadId, data.message);
+                                await reactWithModel(chatId, sent.message_id, data.model);
+                            } else if (data.model) {
+                                storeMessageModel(sent.message_id, data.model, data.targetThreadId);
+                                await reactWithModel(chatId, sent.message_id, data.model);
+                            }
+                        } else if (data.model) {
                             storeMessageModel(sent.message_id, data.model, data.targetThreadId);
                             await reactWithModel(chatId, sent.message_id, data.model);
                         }
@@ -680,7 +689,9 @@ async function pollOutgoingQueue(): Promise<void> {
                         if (firstSentId) {
                             // First chunk was edited in-place — store model and react
                             if (data.model) {
-                                storeMessageModel(firstSentId, data.model, data.threadId);
+                                // Store full text ONLY for multi-segment messages
+                                const fullText = chunks.length > 1 ? data.message : undefined;
+                                storeMessageModel(firstSentId, data.model, data.threadId, fullText);
                                 await reactWithModel(pending.chatId, firstSentId, data.model);
                             }
                             // Send remaining chunks as new messages
@@ -694,8 +705,17 @@ async function pollOutgoingQueue(): Promise<void> {
                             // No status message or edit failed — send all chunks normally
                             for (const chunk of chunks) {
                                 const sent = await sendInThread(pending, chunk);
-                                if (!firstSentId) firstSentId = sent.message_id;
-                                if (data.model) {
+                                if (!firstSentId) {
+                                    firstSentId = sent.message_id;
+                                    // Store full text ONLY for multi-segment messages, on the first segment
+                                    if (data.model && chunks.length > 1) {
+                                        storeMessageModel(sent.message_id, data.model, data.threadId, data.message);
+                                        await reactWithModel(pending.chatId, sent.message_id, data.model);
+                                    } else if (data.model) {
+                                        storeMessageModel(sent.message_id, data.model, data.threadId);
+                                        await reactWithModel(pending.chatId, sent.message_id, data.model);
+                                    }
+                                } else if (data.model) {
                                     storeMessageModel(sent.message_id, data.model, data.threadId);
                                     await reactWithModel(pending.chatId, sent.message_id, data.model);
                                 }
@@ -731,8 +751,17 @@ async function pollOutgoingQueue(): Promise<void> {
 
                         for (const chunk of chunks) {
                             const sent = await bot.api.sendMessage(chatId, chunk, threadOpt);
-                            if (!firstSentId) firstSentId = sent.message_id;
-                            if (data.model) {
+                            if (!firstSentId) {
+                                firstSentId = sent.message_id;
+                                // Store full text ONLY for multi-segment messages, on the first segment
+                                if (data.model && chunks.length > 1) {
+                                    storeMessageModel(sent.message_id, data.model, data.threadId, data.message);
+                                    await reactWithModel(chatId, sent.message_id, data.model);
+                                } else if (data.model) {
+                                    storeMessageModel(sent.message_id, data.model, data.threadId);
+                                    await reactWithModel(chatId, sent.message_id, data.model);
+                                }
+                            } else if (data.model) {
                                 storeMessageModel(sent.message_id, data.model, data.threadId);
                                 await reactWithModel(chatId, sent.message_id, data.model);
                             }
@@ -947,21 +976,33 @@ bot.on("callback_query:data", async (ctx) => {
         return;
     }
 
-    const originalText = ctx.callbackQuery.message?.text;
-    if (!originalText) {
-        await ctx.answerCallbackQuery({ text: "Message text not available" });
+    // Try to get full text from cache first (for multi-segment messages)
+    const messageModel = lookupMessageModel(messageId);
+    const fullText = messageModel?.fullText || ctx.callbackQuery.message?.text;
+
+    if (!fullText) {
+        await ctx.answerCallbackQuery({ text: "❌ Message text not found" });
         return;
     }
 
     // Extract message context before async work
-    const chatId = ctx.callbackQuery.message!.chat.id;  // safe: guarded above
+    const chatId = ctx.callbackQuery.message!.chat.id;  // safe: message exists (we got text from it or cache)
     const threadOpt = ctx.callbackQuery.message!.message_thread_id;
 
     listenInFlight.add(messageId);
 
     try {
         // Show loading feedback
-        await ctx.answerCallbackQuery({ text: "Generating voice..." });
+        // If we're falling back to first segment (cache miss on multi-segment), warn user
+        const isFirstSegmentOnly = !messageModel?.fullText && ctx.callbackQuery.message?.text;
+        if (isFirstSegmentOnly) {
+            await ctx.answerCallbackQuery({
+                text: "⚠️ Full text not available (message too old), playing first segment only",
+                show_alert: true
+            });
+        } else {
+            await ctx.answerCallbackQuery({ text: "Generating voice..." });
+        }
 
         // Check if Speaches is available
         const available = await isAvailable();
@@ -977,7 +1018,7 @@ bot.on("callback_query:data", async (ctx) => {
         });
 
         // Distill long text into speech-friendly form
-        const speechText = await distillForSpeech(originalText);
+        const speechText = await distillForSpeech(fullText);
 
         // Synthesize speech
         const audioPath = await synthesize(speechText, settings.tts_voice, settings.tts_speed);
