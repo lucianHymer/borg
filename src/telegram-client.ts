@@ -151,6 +151,7 @@ interface PendingMessage {
 
 const pendingMessages = new Map<string, PendingMessage>();
 const listenInFlight = new Set<number>(); // track message IDs being processed for TTS
+const voiceButtonsInFlight = new Set<string>(); // track voice button callbacks being processed
 
 // ─── Message Splitting ───
 
@@ -176,6 +177,23 @@ function splitMessage(text: string, maxLength = 4096): string[] {
     }
 
     return chunks;
+}
+
+// ─── Reply Keyboard Builder ───
+
+function buildReplyKeyboard(botMessageId: number, replyToMessageId?: number, replyToVoice?: boolean): InlineKeyboard {
+    const keyboard = new InlineKeyboard();
+
+    // Add voice transcript buttons if replying to a voice message
+    if (replyToVoice && replyToMessageId) {
+        keyboard.text("📝 Your Text", `voice_full:${replyToMessageId}`);
+        keyboard.text("📋 Your Summary", `voice_summary:${replyToMessageId}`);
+    }
+
+    // Always add Listen button for bot response
+    keyboard.text("🔊 Listen", `listen:${botMessageId}`);
+
+    return keyboard;
 }
 
 // ─── Task Watcher ───
@@ -530,6 +548,7 @@ bot.on("message:voice").filter(
             topicName,
             timestamp: Date.now(),
             messageId,
+            telegramMessageId: ctx.msg.message_id,
         };
 
         const queueFile = path.join(QUEUE_INCOMING, `telegram_${messageId}.json`);
@@ -836,13 +855,14 @@ async function pollOutgoingQueue(): Promise<void> {
                             }
                         }
 
-                        // Add Listen button to the first response message (user-facing only)
+                        // Add buttons to the first response message (user-facing only)
                         if (firstSentId) {
                             try {
+                                const keyboard = buildReplyKeyboard(firstSentId, data.replyToMessageId, data.replyToVoice);
                                 await bot.api.editMessageReplyMarkup(pending.chatId, firstSentId, {
-                                    reply_markup: new InlineKeyboard().text("🔊 Listen", `listen:${firstSentId}`),
+                                    reply_markup: keyboard,
                                 });
-                            } catch { /* Listen button is best-effort */ }
+                            } catch { /* Buttons are best-effort */ }
                         }
 
                         pendingMessages.delete(data.messageId);
@@ -883,10 +903,11 @@ async function pollOutgoingQueue(): Promise<void> {
 
                         if (firstSentId) {
                             try {
+                                const keyboard = buildReplyKeyboard(firstSentId, data.replyToMessageId, data.replyToVoice);
                                 await bot.api.editMessageReplyMarkup(settings.telegram_chat_id, firstSentId, {
-                                    reply_markup: new InlineKeyboard().text("🔊 Listen", `listen:${firstSentId}`),
+                                    reply_markup: keyboard,
                                 });
-                            } catch { /* Listen button is best-effort */ }
+                            } catch { /* Buttons are best-effort */ }
                         }
                     }
                 }
@@ -1076,93 +1097,197 @@ bot.on("message_reaction", async (ctx) => {
 
 bot.on("callback_query:data", async (ctx) => {
     const data = ctx.callbackQuery.data;
-    if (!data.startsWith("listen:")) return;
 
-    const messageId = parseInt(data.replace("listen:", ""), 10);
-    if (!Number.isFinite(messageId)) {
-        await ctx.answerCallbackQuery({ text: "Invalid message reference" });
-        return;
-    }
-
-    // Prevent duplicate processing
-    if (listenInFlight.has(messageId)) {
-        await ctx.answerCallbackQuery({ text: "Already generating voice..." });
-        return;
-    }
-
-    // Try to get full text from cache first (for multi-segment messages)
-    const messageModel = lookupMessageModel(messageId);
-    const fullText = messageModel?.fullText || ctx.callbackQuery.message?.text;
-
-    if (!fullText) {
-        await ctx.answerCallbackQuery({ text: "❌ Message text not found" });
-        return;
-    }
-
-    // Extract message context before async work
-    const chatId = ctx.callbackQuery.message!.chat.id;  // safe: message exists (we got text from it or cache)
-    const threadOpt = ctx.callbackQuery.message!.message_thread_id;
-
-    listenInFlight.add(messageId);
-
-    try {
-        // Show loading feedback
-        // If we're falling back to first segment (cache miss on multi-segment), warn user
-        const isFirstSegmentOnly = !messageModel?.fullText && ctx.callbackQuery.message?.text;
-        if (isFirstSegmentOnly) {
-            await ctx.answerCallbackQuery({
-                text: "⚠️ Full text not available (message too old), playing first segment only",
-                show_alert: true
-            });
-        } else {
-            await ctx.answerCallbackQuery({ text: "Generating voice..." });
-        }
-
-        // Check if Speaches is available
-        const available = await isAvailable();
-        if (!available) {
-            await ctx.answerCallbackQuery({ text: "Voice service unavailable", show_alert: true });
+    // ─── Listen Button (TTS of bot response) ───
+    if (data.startsWith("listen:")) {
+        const messageId = parseInt(data.replace("listen:", ""), 10);
+        if (!Number.isFinite(messageId)) {
+            await ctx.answerCallbackQuery({ text: "Invalid message reference" });
             return;
         }
 
-        // Send a placeholder status message
-        const statusMsg = await ctx.api.sendMessage(chatId, "🎙 Dictating...", {
-            message_thread_id: threadOpt,
-            reply_parameters: { message_id: messageId },
-        });
+        // Prevent duplicate processing
+        if (listenInFlight.has(messageId)) {
+            await ctx.answerCallbackQuery({ text: "Already generating voice..." });
+            return;
+        }
 
-        // Distill long text into speech-friendly form
-        const speechText = await distillForSpeech(fullText);
+        // Try to get full text from cache first (for multi-segment messages)
+        const messageModel = lookupMessageModel(messageId);
+        const fullText = messageModel?.fullText || ctx.callbackQuery.message?.text;
 
-        // Synthesize speech
-        const audioPath = await synthesize(speechText, settings.tts_voice, settings.tts_speed);
+        if (!fullText) {
+            await ctx.answerCallbackQuery({ text: "❌ Message text not found" });
+            return;
+        }
 
-        // Replace the placeholder with voice
+        // Extract message context before async work
+        const chatId = ctx.callbackQuery.message!.chat.id;  // safe: message exists (we got text from it or cache)
+        const threadOpt = ctx.callbackQuery.message!.message_thread_id;
+
+        listenInFlight.add(messageId);
+
         try {
-            await ctx.api.deleteMessage(chatId, statusMsg.message_id);
-        } catch { /* best effort */ }
-        await ctx.api.sendVoice(chatId, new InputFile(fs.createReadStream(audioPath)), {
-            message_thread_id: threadOpt,
-            reply_parameters: { message_id: messageId },
-        });
+            // Show loading feedback
+            // If we're falling back to first segment (cache miss on multi-segment), warn user
+            const isFirstSegmentOnly = !messageModel?.fullText && ctx.callbackQuery.message?.text;
+            if (isFirstSegmentOnly) {
+                await ctx.answerCallbackQuery({
+                    text: "⚠️ Full text not available (message too old), playing first segment only",
+                    show_alert: true
+                });
+            } else {
+                await ctx.answerCallbackQuery({ text: "Generating voice..." });
+            }
 
-        // Remove the Listen button
+            // Check if Speaches is available
+            const available = await isAvailable();
+            if (!available) {
+                await ctx.answerCallbackQuery({ text: "Voice service unavailable", show_alert: true });
+                return;
+            }
+
+            // Send a placeholder status message
+            const statusMsg = await ctx.api.sendMessage(chatId, "🎙 Dictating...", {
+                message_thread_id: threadOpt,
+                reply_parameters: { message_id: messageId },
+            });
+
+            // Distill long text into speech-friendly form
+            const speechText = await distillForSpeech(fullText);
+
+            // Synthesize speech
+            const audioPath = await synthesize(speechText, settings.tts_voice, settings.tts_speed);
+
+            // Replace the placeholder with voice
+            try {
+                await ctx.api.deleteMessage(chatId, statusMsg.message_id);
+            } catch { /* best effort */ }
+            await ctx.api.sendVoice(chatId, new InputFile(fs.createReadStream(audioPath)), {
+                message_thread_id: threadOpt,
+                reply_parameters: { message_id: messageId },
+            });
+
+            // Remove the Listen button
+            try {
+                await ctx.editMessageReplyMarkup({ reply_markup: undefined });
+            } catch { /* message may have been edited already */ }
+
+            // Clean up audio file
+            cleanupAudioFile(audioPath);
+
+            log("INFO", `TTS voice reply sent for message ${messageId}`);
+        } catch (err) {
+            log("ERROR", `TTS callback failed for message ${messageId}: ${toErrorMessage(err)}`);
+            // Try to notify user of the error
+            try {
+                await ctx.answerCallbackQuery({ text: "Couldn't generate voice. Try again later.", show_alert: true });
+            } catch { /* callback may have already been answered */ }
+        } finally {
+            listenInFlight.delete(messageId);
+        }
+        return;
+    }
+
+    // ─── Voice Full Button (full transcript of user's voice message) ───
+    if (data.startsWith("voice_full:")) {
+        const voiceMessageId = data.replace("voice_full:", "");
+
+        // Prevent duplicate processing
+        if (voiceButtonsInFlight.has(voiceMessageId)) {
+            await ctx.answerCallbackQuery({ text: "Processing..." });
+            return;
+        }
+
+        voiceButtonsInFlight.add(voiceMessageId);
+
         try {
-            await ctx.editMessageReplyMarkup({ reply_markup: undefined });
-        } catch { /* message may have been edited already */ }
+            const { getVoiceTranscript } = await import("./voice-cache.js");
+            const transcript = getVoiceTranscript(voiceMessageId);
 
-        // Clean up audio file
-        cleanupAudioFile(audioPath);
+            if (!transcript) {
+                await ctx.answerCallbackQuery({
+                    text: "Transcript not available (may have been pruned after 1000 messages)",
+                    show_alert: true
+                });
+                return;
+            }
 
-        log("INFO", `TTS voice reply sent for message ${messageId}`);
-    } catch (err) {
-        log("ERROR", `TTS callback failed for message ${messageId}: ${toErrorMessage(err)}`);
-        // Try to notify user of the error
+            // Answer the callback query first
+            await ctx.answerCallbackQuery({ text: "Sending transcript..." });
+
+            // Send transcript as a reply
+            const chatId = ctx.callbackQuery.message!.chat.id;
+            const threadOpt = ctx.callbackQuery.message!.message_thread_id;
+            const chunks = splitMessage(transcript);
+
+            for (const chunk of chunks) {
+                await ctx.api.sendMessage(chatId, chunk, {
+                    message_thread_id: threadOpt,
+                });
+            }
+
+            log("INFO", `Sent full transcript for voice message ${voiceMessageId}`);
+        } catch (err) {
+            log("ERROR", `Voice full callback failed for message ${voiceMessageId}: ${toErrorMessage(err)}`);
+            try {
+                await ctx.answerCallbackQuery({ text: "Error retrieving transcript", show_alert: true });
+            } catch { /* callback may have already been answered */ }
+        } finally {
+            voiceButtonsInFlight.delete(voiceMessageId);
+        }
+        return;
+    }
+
+    // ─── Voice Summary Button (sonnet-summarized user transcript) ───
+    if (data.startsWith("voice_summary:")) {
+        const voiceMessageId = data.replace("voice_summary:", "");
+
+        // Prevent duplicate processing
+        if (voiceButtonsInFlight.has(voiceMessageId)) {
+            await ctx.answerCallbackQuery({ text: "Processing..." });
+            return;
+        }
+
+        voiceButtonsInFlight.add(voiceMessageId);
+
         try {
-            await ctx.answerCallbackQuery({ text: "Couldn't generate voice. Try again later.", show_alert: true });
-        } catch { /* callback may have already been answered */ }
-    } finally {
-        listenInFlight.delete(messageId);
+            const { getVoiceTranscript } = await import("./voice-cache.js");
+            const transcript = getVoiceTranscript(voiceMessageId);
+
+            if (!transcript) {
+                await ctx.answerCallbackQuery({
+                    text: "Transcript not available (may have been pruned after 1000 messages)",
+                    show_alert: true
+                });
+                return;
+            }
+
+            // Answer the callback query first
+            await ctx.answerCallbackQuery({ text: "Generating summary..." });
+
+            // Distill transcript into summary
+            const { distillForReading } = await import("./audio.js");
+            const summary = await distillForReading(transcript);
+
+            // Send summary as a reply
+            const chatId = ctx.callbackQuery.message!.chat.id;
+            const threadOpt = ctx.callbackQuery.message!.message_thread_id;
+
+            await ctx.api.sendMessage(chatId, summary, {
+                message_thread_id: threadOpt,
+            });
+
+            log("INFO", `Sent summary for voice message ${voiceMessageId}`);
+        } catch (err) {
+            log("ERROR", `Voice summary callback failed for message ${voiceMessageId}: ${toErrorMessage(err)}`);
+            try {
+                await ctx.answerCallbackQuery({ text: "Error generating summary", show_alert: true });
+            } catch { /* callback may have already been answered */ }
+        } finally {
+            voiceButtonsInFlight.delete(voiceMessageId);
+        }
+        return;
     }
 });
 
