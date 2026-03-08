@@ -14,6 +14,7 @@ import type {
     SDKAssistantMessage,
     SDKResultMessage,
     SDKToolProgressMessage,
+    SDKMessage,
     Options,
     Query,
     CanUseTool as SDKCanUseTool,
@@ -578,23 +579,63 @@ interface QueryEventObserver {
     onToolUse?(toolName: string): void;
     onToolProgress?(toolName: string, elapsedSeconds: number): void;
     onCompacting?(): void;
+    onStallDetected?(): void;
 }
+
+// If we see end_turn with content and no active subagents, and no new events arrive
+// within this window, assume the CLI process is hung and return what we have.
+const END_TURN_STALL_TIMEOUT_MS = 90_000; // 90 seconds
 
 async function collectQueryResponse(
     q: Query,
     observer?: QueryEventObserver,
-): Promise<{ text: string; sessionId: string | undefined }> {
+): Promise<{ text: string; sessionId: string | undefined; stallRecovered: boolean }> {
     const parts: string[] = [];
     let capturedSessionId: string | undefined;
 
-    for await (const msg of q) {
+    // ─── Stall detection state ───
+    let sawEndTurn = false;
+    let stallDetected = false;
+
+    const iterator = q[Symbol.asyncIterator]();
+
+    while (true) {
+        let iterResult: IteratorResult<SDKMessage, void>;
+
+        if (sawEndTurn && parts.length > 0) {
+            // We have end_turn + content + no active subagents — race against timeout
+            const timeoutPromise = new Promise<"timeout">((resolve) => {
+                setTimeout(() => resolve("timeout"), END_TURN_STALL_TIMEOUT_MS);
+            });
+            const winner = await Promise.race([
+                iterator.next().then((r) => ({ kind: "event" as const, result: r })),
+                timeoutPromise.then(() => ({ kind: "timeout" as const })),
+            ]);
+            if (winner.kind === "timeout") {
+                stallDetected = true;
+                observer?.onStallDetected?.();
+                log(
+                    "WARN",
+                    `end_turn stall detected after ${END_TURN_STALL_TIMEOUT_MS / 1000}s — returning collected response (${parts.join("").length} chars)`,
+                );
+                break;
+            }
+            iterResult = winner.result;
+        } else {
+            iterResult = await iterator.next();
+        }
+
+        if (iterResult.done) break;
+        const msg = iterResult.value;
+
         // Always capture the latest session_id (it may change after compaction)
         if ("session_id" in msg && msg.session_id) {
             capturedSessionId = msg.session_id;
         }
 
         if (msg.type === "assistant") {
-            const content = (msg as SDKAssistantMessage).message?.content;
+            const assistantMsg = msg as SDKAssistantMessage;
+            const content = assistantMsg.message?.content;
             if (Array.isArray(content)) {
                 for (const block of content) {
                     if (block.type === "text" && typeof block.text === "string") {
@@ -604,6 +645,13 @@ async function collectQueryResponse(
                         observer?.onToolUse?.(block.name);
                     }
                 }
+            }
+            // Track end_turn on top-level assistant messages (not from subagents)
+            const stopReason = assistantMsg.message?.stop_reason;
+            if (stopReason === "end_turn" && assistantMsg.parent_tool_use_id === null) {
+                sawEndTurn = true;
+            } else if (stopReason === "tool_use") {
+                sawEndTurn = false;
             }
         }
 
@@ -639,7 +687,16 @@ async function collectQueryResponse(
         }
     }
 
-    return { text: parts.join(""), sessionId: capturedSessionId };
+    // Clean up hung process on stall
+    if (stallDetected) {
+        try {
+            await q.interrupt();
+        } catch {
+            // Best effort — process may already be gone
+        }
+    }
+
+    return { text: parts.join(""), sessionId: capturedSessionId, stallRecovered: stallDetected };
 }
 
 // ─── Heartbeat Processing (one-shot, no persistent session) ───
@@ -703,7 +760,10 @@ async function processHeartbeat(msg: IncomingMessage): Promise<string> {
     });
 
     try {
-        const { text } = await collectQueryResponse(q);
+        const { text, stallRecovered } = await collectQueryResponse(q);
+        if (stallRecovered) {
+            log("WARN", `Heartbeat stall recovered for thread ${msg.threadId}`);
+        }
         const response = text.trim() || "[NO_UPDATES]";
 
         // Always update state on successful response
@@ -1007,25 +1067,34 @@ async function processMessage(messageFile: string): Promise<void> {
             }, 2000);
 
             // Observer callbacks set intent; the interval handles all file writes
+            let toolUseCount = 0;
             const observer: QueryEventObserver = {
                 onToolUse(toolName: string) {
-                    currentStatusLabel = `Using ${toolName}`;
+                    toolUseCount++;
+                    currentStatusLabel = `Using ${toolName} [${toolUseCount}]`;
                 },
                 onToolProgress(toolName: string) {
-                    currentStatusLabel = `Using ${toolName}`;
+                    currentStatusLabel = `Using ${toolName} [${toolUseCount}]`;
                 },
                 onCompacting() {
                     currentStatusLabel = "Compacting context";
                 },
+                onStallDetected() {
+                    currentStatusLabel = "Stall recovered";
+                },
             };
 
             try {
-                const { text, sessionId: newSessionId } = await collectQueryResponse(
+                const { text, sessionId: newSessionId, stallRecovered } = await collectQueryResponse(
                     q,
                     observer,
                 );
                 clearInterval(statusInterval);
                 responseText = text.trim();
+
+                if (stallRecovered) {
+                    responseText += `\n\n---\n⚠️ _Stall recovered: session hung after end\\_turn (${END_TURN_STALL_TIMEOUT_MS / 1000}s timeout). Response above may be incomplete._`;
+                }
 
                 // Persist session ID for future resume (atomic to avoid clobbering team/role)
                 if (newSessionId) {
