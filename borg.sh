@@ -66,7 +66,10 @@ cmd_start() {
     local installations="$SCRIPT_DIR/secrets/github-installations.json"
     if [ ! -f "$installations" ] || [ ! -s "$installations" ]; then
         echo -e "${RED}Missing: secrets/github-installations.json${NC}"
-        echo "  Copy the example and fill in your org + installation ID:"
+        echo "  Run the setup wizard for guided configuration:"
+        echo "    Open Claude Code in this repo and say 'run the setup wizard'"
+        echo ""
+        echo "  Or manually copy the example and fill in your org + installation ID:"
         echo "    cp secrets/github-installations.json.example secrets/github-installations.json"
         echo "    vim secrets/github-installations.json"
         exit 1
