@@ -120,6 +120,7 @@ export function createBorgMcpServer(sourceThreadId: number) {
             const outgoing = {
                 channel: "telegram",
                 targetThreadId,
+                sourceThreadId,
                 sender: sourceName,
                 message,
                 originalMessage: "",

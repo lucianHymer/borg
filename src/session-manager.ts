@@ -346,7 +346,14 @@ function buildMasterCrossThreadBlock(): string {
 - Message any thread by writing to ${BORG_DIR}/queue/outgoing/ with targetThreadId
 - Broadcast to all threads by writing multiple outgoing messages
 - Clear the dead letter queue: \`rm ${BORG_DIR}/queue/dead-letter/*\` (failed messages after 3 retries)
-${buildCommandsBlock()}`;
+${buildCommandsBlock()}
+
+## Cross-Thread Message Pattern
+
+When you receive a message prefixed with "📨 _From {sender} in {thread}_", this is a cross-thread message from another thread. To reply:
+- Use the MCP send_message tool to send your response back to the source thread
+- Do NOT respond in the current thread — the sender is in a different thread and won't see it
+- The visible indicator shows both the sender's name and their thread name for context`;
 }
 
 function buildWorkerCrossThreadBlock(): string {
@@ -354,7 +361,14 @@ function buildWorkerCrossThreadBlock(): string {
 - Active threads: Read ${BORG_DIR}/threads.json
 - Other threads' history: Grep ${BORG_DIR}/message-history.jsonl for their threadId
 - Message another thread: Write JSON to ${BORG_DIR}/queue/outgoing/ with targetThreadId field
-${buildCommandsBlock()}`;
+${buildCommandsBlock()}
+
+## Cross-Thread Message Pattern
+
+When you receive a message prefixed with "📨 _From {sender} in {thread}_", this is a cross-thread message from another thread. To reply:
+- Use the MCP send_message tool to send your response back to the source thread
+- Do NOT respond in the current thread — the sender is in a different thread and won't see it
+- The visible indicator shows both the sender's name and their thread name for context`;
 }
 
 function buildKnowledgeBaseBlock(): string {

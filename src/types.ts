@@ -36,6 +36,7 @@ export interface OutgoingMessage {
     messageId: string;
     model: string;
     targetThreadId?: number;
+    sourceThreadId?: number;  // threadId of the sender (for cross-thread messages)
     routingMetadata?: RoutingMetadata;
 }
 
