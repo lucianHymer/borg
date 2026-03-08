@@ -318,11 +318,11 @@ bot.on("message:forum_topic_edited", (ctx) => {
 
 // ─── Commands ───
 
-bot.command("reset", async (ctx) => {
+bot.command("clear", async (ctx) => {
     if (String(ctx.chat?.id) !== settings.telegram_chat_id) return;
     const threadId = ctx.msg.message_thread_id ?? 1;
     resetThread(threadId);
-    await ctx.reply("Session reset! Starting fresh.", {
+    await ctx.reply("Session cleared! Starting fresh.", {
         message_thread_id: ctx.msg.message_thread_id,
     });
     log("INFO", `Thread ${threadId} reset by ${ctx.from?.first_name ?? "unknown"}`);
@@ -381,7 +381,27 @@ async function queueTeamCommand(ctx: Context, command: string): Promise<void> {
     log("INFO", `Team ${config.team} ${command} queued by ${ctx.from?.first_name ?? "unknown"} (${teamThreads.length} threads)`);
 }
 
-bot.command("clear_team", (ctx) => queueTeamCommand(ctx, "clear"));
+bot.command("clear_team", async (ctx) => {
+    if (String(ctx.chat?.id) !== settings.telegram_chat_id) return;
+    const threadId = ctx.msg?.message_thread_id ?? 1;
+    const threads = loadThreads();
+    const config = threads[String(threadId)];
+    if (!config?.team) {
+        await ctx.reply("This thread isn't part of a team.", {
+            message_thread_id: ctx.msg?.message_thread_id,
+        });
+        return;
+    }
+    const teamThreads = Object.entries(threads).filter(([, t]) => t.team === config.team);
+    for (const [id] of teamThreads) {
+        resetThread(Number(id));
+    }
+    await ctx.reply(`Cleared ${teamThreads.length} session(s) in team **${config.team}**`, {
+        message_thread_id: ctx.msg?.message_thread_id,
+        parse_mode: "Markdown",
+    });
+    log("INFO", `Team ${config.team} clear by ${ctx.from?.first_name ?? "unknown"} (${teamThreads.length} threads)`);
+});
 bot.command("compact_team", (ctx) => queueTeamCommand(ctx, "compact"));
 
 bot.command("status", async (ctx) => {
@@ -1424,7 +1444,7 @@ bot.start({
     allowed_updates: [...API_CONSTANTS.DEFAULT_UPDATE_TYPES, "message_reaction"],
     onStart: async () => {
         await bot.api.setMyCommands([
-            { command: "reset", description: "Reset the current thread session" },
+            { command: "clear", description: "Clear the current thread session" },
             { command: "setdir", description: "Set working directory for this thread" },
             { command: "status", description: "Show all active threads and their status" },
             { command: "clear_team", description: "Clear all team member sessions" },
