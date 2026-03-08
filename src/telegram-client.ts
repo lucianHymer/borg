@@ -941,7 +941,7 @@ async function pollOutgoingQueue(): Promise<void> {
 
 function cleanupPendingMessages(): void {
     const now = Date.now();
-    const timeout = 5 * 60 * 1000; // 5 minutes
+    const timeout = 24 * 60 * 60 * 1000; // 24 hours
 
     for (const [messageId, pending] of pendingMessages) {
         // User messages: "{ts}_{rand}", cross-thread: "cross_{ts}_{rand}"
