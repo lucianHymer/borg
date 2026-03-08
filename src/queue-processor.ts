@@ -28,7 +28,7 @@ import {
 } from "./message-history.js";
 import { createBorgMcpServer } from "./mcp-tools.js";
 import { transcribe, cleanupAudioFile, ensureModels, AUDIO_INCOMING_DIR } from "./audio.js";
-import { cleanupImageFile, IMAGES_INCOMING_DIR } from "./images.js";
+import { IMAGES_INCOMING_DIR } from "./images.js";
 import type { MessageSource, MessageHistoryEntry } from "./message-history.js";
 import {
     loadThreads,
@@ -826,7 +826,6 @@ async function processMessage(messageFile: string): Promise<void> {
         fs.renameSync(tmpFile, errorFile);
         clearStatus(messageId);
         if (msg.audioPath) cleanupAudioFile(msg.audioPath);
-        if (msg.imagePath) cleanupImageFile(msg.imagePath);
         if (fs.existsSync(processingFile)) fs.unlinkSync(processingFile);
     }
 
@@ -1112,11 +1111,6 @@ async function processMessage(messageFile: string): Promise<void> {
 
         clearStatus(messageId);
 
-        // Clean up image file after processing
-        if (msg.imagePath) {
-            cleanupImageFile(msg.imagePath);
-        }
-
         log(
             "INFO",
             `Response ready [${channel}] thread=${threadId} model=${effectiveModel} (${responseText.length} chars)`,
@@ -1129,10 +1123,6 @@ async function processMessage(messageFile: string): Promise<void> {
     } catch (error) {
         log("ERROR", `Processing error for ${filename}: ${toErrorMessage(error)}`);
         clearStatus(messageId);
-        // Clean up image file on error
-        if (msg.imagePath) {
-            cleanupImageFile(msg.imagePath);
-        }
         handleRetry(processingFile, filename, retryCount);
     }
 }

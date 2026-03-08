@@ -21,7 +21,7 @@ import { toErrorMessage, TASK_LISTS_FILENAME } from "./types.js";
 import { RoutingMetadataSchema } from "./types.js";
 import { logDecision, logCorrection, ROUTING_LOG } from "./routing-logger.js";
 import { AUDIO_INCOMING_DIR, cleanupAudioFile, startPeriodicCleanup, ensureModels, distillForSpeech, synthesize, isAvailable } from "./audio.js";
-import { IMAGES_INCOMING_DIR, cleanupImageFile, startPeriodicCleanup as startImageCleanup } from "./images.js";
+import { IMAGES_INCOMING_DIR, startPeriodicCleanup as startImageCleanup } from "./images.js";
 
 // ─── Constants ───
 
@@ -1219,11 +1219,15 @@ bot.on("callback_query:data", async (ctx) => {
             // Send transcript as a reply
             const chatId = ctx.callbackQuery.message!.chat.id;
             const threadOpt = ctx.callbackQuery.message!.message_thread_id;
-            const chunks = splitMessage(transcript);
+            const fullText = `**Full Text:**\n${transcript}`;
+            const chunks = splitMessage(fullText);
 
-            for (const chunk of chunks) {
-                await ctx.api.sendMessage(chatId, chunk, {
+            for (let i = 0; i < chunks.length; i++) {
+                await ctx.api.sendMessage(chatId, chunks[i], {
                     message_thread_id: threadOpt,
+                    parse_mode: "Markdown",
+                    // Reply to original voice message on first chunk
+                    ...(i === 0 ? { reply_parameters: { message_id: Number(voiceMessageId) } } : {}),
                 });
             }
 
@@ -1274,8 +1278,10 @@ bot.on("callback_query:data", async (ctx) => {
             const chatId = ctx.callbackQuery.message!.chat.id;
             const threadOpt = ctx.callbackQuery.message!.message_thread_id;
 
-            await ctx.api.sendMessage(chatId, summary, {
+            await ctx.api.sendMessage(chatId, `**Summary:**\n${summary}`, {
                 message_thread_id: threadOpt,
+                parse_mode: "Markdown",
+                reply_parameters: { message_id: Number(voiceMessageId) },
             });
 
             log("INFO", `Sent summary for voice message ${voiceMessageId}`);

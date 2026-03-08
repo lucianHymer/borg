@@ -12,7 +12,7 @@ const SCRIPT_DIR = path.resolve(__dirname, "..");
 const IMAGES_DIR = path.join(SCRIPT_DIR, ".borg/images");
 const IMAGES_INCOMING_DIR = path.join(IMAGES_DIR, "incoming");
 const CLEANUP_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes
-const MAX_AGE_MS = 60 * 60 * 1000; // 1 hour
+const MAX_AGE_MS = 48 * 60 * 60 * 1000; // 48 hours
 
 // Ensure image directories exist
 [IMAGES_DIR, IMAGES_INCOMING_DIR].forEach((dir) => {
