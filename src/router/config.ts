@@ -26,6 +26,9 @@ export const DEFAULT_ROUTING_CONFIG: RoutingConfig = {
     reasoningKeywords: [
       "prove", "theorem", "derive", "step by step", "chain of thought",
       "formally", "mathematical", "proof", "logically",
+      "deep thinking", "think deeply", "think hard", "deep planning",
+      "deep reasoning", "detailed analysis", "thorough analysis",
+      "planning", "plan",
       // Chinese
       "证明", "定理", "推导", "逐步", "思维链",
       // Japanese
@@ -91,7 +94,7 @@ export const DEFAULT_ROUTING_CONFIG: RoutingConfig = {
 
     // Dimension weights (sum to 1.0)
     dimensionWeights: {
-      tokenCount: 0.08,
+      tokenCount: 0.02,
       codePresence: 0.15,
       reasoningMarkers: 0.18,
       technicalTerms: 0.10,

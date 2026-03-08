@@ -33,6 +33,19 @@ export function route(
   const fullText = `${systemPrompt ?? ""} ${prompt}`;
   const estimatedTokens = Math.ceil(fullText.length / 4);
 
+  // Override: explicit "use opus" → force COMPLEX
+  if (/\buse opus\b/i.test(prompt)) {
+    return {
+      model: config.tiers.COMPLEX,
+      tier: "COMPLEX",
+      confidence: 0.99,
+      method: "rules",
+      reasoning: "Explicit 'use opus' override",
+      signals: ["explicit-opus"],
+      estimatedTokens,
+    };
+  }
+
   // Override: large context → force COMPLEX
   if (estimatedTokens > config.overrides.maxTokensForceComplex) {
     return {
