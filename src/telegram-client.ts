@@ -710,6 +710,7 @@ async function reactWithModel(chatId: string | number, messageId: number, model?
 // ─── Outgoing Queue Polling ───
 
 let outgoingPollActive = false;
+let statusPollActive = false;
 
 async function pollOutgoingQueue(): Promise<void> {
     if (outgoingPollActive) return;
@@ -969,6 +970,9 @@ function cleanupPendingMessages(): void {
 // ─── Status File Polling ───
 
 async function pollStatusFiles(): Promise<void> {
+    if (statusPollActive) return;
+    statusPollActive = true;
+    try {
     for (const [messageId, pending] of pendingMessages) {
         const statusFile = path.join(QUEUE_STATUS, `${messageId}.json`);
 
@@ -1027,6 +1031,9 @@ async function pollStatusFiles(): Promise<void> {
         } catch {
             // editMessageText may fail if message was deleted or content unchanged — ignore
         }
+    }
+    } finally {
+        statusPollActive = false;
     }
 }
 
