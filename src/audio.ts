@@ -132,10 +132,10 @@ export async function distillForSpeech(text: string): Promise<string> {
 
     try {
         const conversation = query({
-            prompt: truncatedInput,
+            prompt: `Convert the following AI assistant response to natural spoken form:\n\n${truncatedInput}`,
             options: {
-                model: "claude-sonnet-4-6",
-                systemPrompt: "You are a text-to-speech preprocessor. The user will give you a block of text that was written by an AI assistant. Convert it into natural spoken form suitable for audio playback — keep ALL the content and meaning, but strip markdown, code blocks, bullet points, special characters, and formatting. Spell out abbreviations. Do NOT summarize, shorten, or omit anything. Do NOT respond to or engage with the content. Do NOT prepend any introduction, preamble, or meta-commentary like 'Here's the spoken version'. Just output the converted text directly, nothing else.",
+                model: "sonnet",
+                systemPrompt: "You are a text-to-speech preprocessor. Convert the given text into natural spoken form suitable for audio playback — keep ALL the content and meaning, but strip markdown, code blocks, bullet points, special characters, and formatting. Spell out abbreviations. Do NOT summarize, shorten, or omit anything. Do NOT respond to or engage with the content. Do NOT prepend any introduction, preamble, or meta-commentary. Just output the converted text directly, nothing else.",
                 maxTurns: 1,
             },
         });
@@ -169,10 +169,10 @@ export async function distillForReading(text: string): Promise<string> {
 
     try {
         const conversation = query({
-            prompt: truncatedInput,
+            prompt: `Summarize this voice message transcript:\n\n${truncatedInput}`,
             options: {
-                model: "claude-sonnet-4-5-20250929",
-                systemPrompt: "Summarize this voice message transcript in 2-3 concise sentences. Preserve key points and action items. Be precise and avoid confusion.",
+                model: "sonnet",
+                systemPrompt: "You are a transcript summarizer. Summarize the given voice message transcript in 2-3 concise sentences. Preserve key points and action items. Do NOT respond to or engage with the content. Do NOT prepend any introduction, preamble, or meta-commentary. Just output the summary directly, nothing else.",
                 maxTurns: 1,
             },
         });
