@@ -503,6 +503,176 @@ tr.clickable { cursor: pointer; }
   color: var(--text-primary);
 }
 
+/* ─── Peers View ─── */
+
+.peers-info-bar {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin-bottom: 16px;
+  padding: 12px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  flex-wrap: wrap;
+}
+
+.peers-info-stat {
+  display: flex;
+  flex-direction: column;
+}
+
+.peers-info-stat .label {
+  font-size: 10px;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.peers-info-stat .value {
+  font-size: 14px;
+  font-weight: 600;
+  margin-top: 2px;
+  font-family: monospace;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.peers-info-stat .copy-btn {
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 11px;
+  padding: 2px 6px;
+}
+
+.peers-info-stat .copy-btn:hover {
+  color: var(--text-primary);
+  background: var(--border);
+}
+
+.peers-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-bottom: 16px;
+}
+
+.peers-table th {
+  text-align: left;
+  padding: 8px 12px;
+  font-size: 11px;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  border-bottom: 1px solid var(--border);
+}
+
+.peers-table td {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+}
+
+.peers-table .status-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-right: 6px;
+}
+
+.peers-table .status-dot.online { background: var(--accent-green); }
+.peers-table .status-dot.offline { background: var(--text-secondary); }
+
+.peers-table .remove-btn {
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 11px;
+  padding: 3px 8px;
+}
+
+.peers-table .remove-btn:hover {
+  color: #f85149;
+  border-color: #f85149;
+}
+
+.peers-add-form {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 16px;
+}
+
+.peers-add-form h3 {
+  margin: 0 0 12px;
+  font-size: 14px;
+}
+
+.peers-form-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.peers-form-grid label {
+  font-size: 11px;
+  color: var(--text-secondary);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.peers-form-grid input {
+  background: var(--bg-primary);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text-primary);
+  padding: 6px 8px;
+  font-size: 13px;
+  font-family: monospace;
+}
+
+.peers-form-grid .full-width {
+  grid-column: 1 / -1;
+}
+
+#peers-add-btn {
+  background: var(--accent-green);
+  color: #fff;
+  border: none;
+  border-radius: 4px;
+  padding: 6px 16px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+#peers-add-btn:hover { opacity: 0.9; }
+
+#peers-add-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+#peers-status-msg {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.peers-empty {
+  text-align: center;
+  padding: 24px;
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
 /* ─── Memory View ─── */
 
 .memory-host-bar {
@@ -754,6 +924,7 @@ tr.clickable { cursor: pointer; }
   <a href="#metrics" data-view="metrics">Metrics</a>
   <a href="#logs" data-view="logs">Logs</a>
   <a href="#memory" data-view="memory">Memory</a>
+  <a href="#peers" data-view="peers">Peers</a>
   <div id="conn-status">
     <div id="conn-dot" class="connecting"></div>
     <span id="conn-text">connecting</span>
@@ -842,6 +1013,66 @@ tr.clickable { cursor: pointer; }
   </div>
 
   <!-- View: Memory -->
+  <div id="view-peers" class="view">
+    <h2>Peer Instances</h2>
+    <div class="peers-info-bar" id="peers-local-info">
+      <div class="peers-info-stat">
+        <span class="label">WireGuard Public Key</span>
+        <span class="value" id="peers-wg-pubkey">loading...</span>
+      </div>
+      <div class="peers-info-stat">
+        <span class="label">VPN IP</span>
+        <span class="value" id="peers-wg-ip">—</span>
+      </div>
+      <div class="peers-info-stat">
+        <span class="label">HTTP Port</span>
+        <span class="value" id="peers-http-port">—</span>
+      </div>
+    </div>
+
+    <table class="peers-table" id="peers-table">
+      <thead>
+        <tr>
+          <th>Name</th>
+          <th>VPN IP</th>
+          <th>Status</th>
+          <th>Threads</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody id="peers-tbody"></tbody>
+    </table>
+    <div id="peers-empty" class="peers-empty" style="display:none">No peers configured</div>
+
+    <div class="peers-add-form">
+      <h3>Add Peer</h3>
+      <div class="peers-form-grid">
+        <label>
+          Name
+          <input type="text" id="peer-add-name" placeholder="borg-b">
+        </label>
+        <label>
+          VPN IP
+          <input type="text" id="peer-add-ip" placeholder="10.8.0.2">
+        </label>
+        <label class="full-width">
+          WireGuard Public Key
+          <input type="text" id="peer-add-pubkey" placeholder="peer's WireGuard public key">
+        </label>
+        <label>
+          Endpoint (host:port)
+          <input type="text" id="peer-add-endpoint" placeholder="peer-host.example.com:51820">
+        </label>
+        <label>
+          Allowed IPs
+          <input type="text" id="peer-add-allowed" placeholder="10.8.0.2/32" value="10.8.0.2/32">
+        </label>
+      </div>
+      <button id="peers-add-btn">Add Peer</button>
+      <div id="peers-status-msg"></div>
+    </div>
+  </div>
+
   <div id="view-memory" class="view">
     <h2>Memory Rebalancing</h2>
     <div class="memory-host-bar" id="memory-host-bar"></div>
@@ -1084,6 +1315,7 @@ tr.clickable { cursor: pointer; }
       case 'metrics': initMetrics(); break;
       case 'logs': initLogs(); break;
       case 'memory': initMemory(); break;
+      case 'peers': initPeers(); break;
     }
   }
 
@@ -1112,6 +1344,9 @@ tr.clickable { cursor: pointer; }
           document.removeEventListener('pointerup', state._memoryPointerUpHandler);
           state._memoryPointerUpHandler = null;
         }
+        break;
+      case 'peers':
+        clearInterval_('peers');
         break;
     }
   }
@@ -1796,6 +2031,128 @@ tr.clickable { cursor: pointer; }
   var memoryServerData = {};
   // Host data from last SSE update
   var memoryHostData = null;
+
+  // ─── View 8: Peers ───
+
+  function initPeers() {
+    fetchPeersData();
+    state.intervals.peers = setInterval(fetchPeersData, 10000);
+
+    const addBtn = document.getElementById('peers-add-btn');
+    addBtn.onclick = addPeer;
+  }
+
+  async function fetchPeersData() {
+    try {
+      const res = await fetch('/api/peers');
+      if (!res.ok) return;
+      const data = await res.json();
+
+      // Local info
+      const pubkeyEl = document.getElementById('peers-wg-pubkey');
+      if (data.wg && data.wg.publicKey) {
+        const shortKey = data.wg.publicKey.slice(0, 20) + '...';
+        pubkeyEl.innerHTML = '<code>' + escapeHtml(shortKey) + '</code>' +
+          '<button class="copy-btn" onclick="navigator.clipboard.writeText(\'' +
+          escapeHtml(data.wg.publicKey) + '\')">Copy</button>';
+      } else {
+        pubkeyEl.textContent = 'not configured';
+      }
+
+      document.getElementById('peers-wg-ip').textContent = data.wg?.address || '—';
+      document.getElementById('peers-http-port').textContent = data.httpPort || '—';
+
+      // Peer table
+      const tbody = document.getElementById('peers-tbody');
+      const emptyMsg = document.getElementById('peers-empty');
+
+      if (!data.peers || data.peers.length === 0) {
+        tbody.innerHTML = '';
+        emptyMsg.style.display = 'block';
+        return;
+      }
+
+      emptyMsg.style.display = 'none';
+      tbody.innerHTML = data.peers.map(function(p) {
+        const dot = '<span class="status-dot ' + (p.online ? 'online' : 'offline') + '"></span>';
+        const statusText = p.online ? 'online' : 'offline';
+        const threadCount = p.threadCount != null ? p.threadCount : '—';
+        return '<tr>' +
+          '<td>' + escapeHtml(p.name) + '</td>' +
+          '<td><code>' + escapeHtml(p.ip) + '</code></td>' +
+          '<td>' + dot + statusText + '</td>' +
+          '<td>' + threadCount + '</td>' +
+          '<td><button class="remove-btn" data-peer="' + escapeHtml(p.name) + '">Remove</button></td>' +
+          '</tr>';
+      }).join('');
+
+      // Bind remove buttons
+      tbody.querySelectorAll('.remove-btn').forEach(function(btn) {
+        btn.onclick = function() { removePeer(btn.dataset.peer); };
+      });
+    } catch (e) {
+      console.error('Failed to fetch peers:', e);
+    }
+  }
+
+  async function addPeer() {
+    const name = document.getElementById('peer-add-name').value.trim();
+    const ip = document.getElementById('peer-add-ip').value.trim();
+    const publicKey = document.getElementById('peer-add-pubkey').value.trim();
+    const endpoint = document.getElementById('peer-add-endpoint').value.trim();
+    const allowedIPs = document.getElementById('peer-add-allowed').value.trim();
+    const statusMsg = document.getElementById('peers-status-msg');
+
+    if (!name || !ip) {
+      statusMsg.textContent = 'Name and VPN IP are required';
+      statusMsg.style.color = '#f85149';
+      return;
+    }
+
+    const btn = document.getElementById('peers-add-btn');
+    btn.disabled = true;
+    statusMsg.textContent = 'Adding peer...';
+    statusMsg.style.color = 'var(--text-secondary)';
+
+    try {
+      const res = await fetch('/api/peers', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, ip, publicKey, endpoint, allowedIPs }),
+      });
+      const result = await res.json();
+      if (res.ok) {
+        statusMsg.textContent = 'Peer added successfully';
+        statusMsg.style.color = 'var(--accent-green)';
+        document.getElementById('peer-add-name').value = '';
+        document.getElementById('peer-add-ip').value = '';
+        document.getElementById('peer-add-pubkey').value = '';
+        document.getElementById('peer-add-endpoint').value = '';
+        document.getElementById('peer-add-allowed').value = '';
+        fetchPeersData();
+      } else {
+        statusMsg.textContent = result.error || 'Failed to add peer';
+        statusMsg.style.color = '#f85149';
+      }
+    } catch (e) {
+      statusMsg.textContent = 'Network error';
+      statusMsg.style.color = '#f85149';
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  async function removePeer(name) {
+    if (!confirm('Remove peer "' + name + '"?')) return;
+    try {
+      const res = await fetch('/api/peers/' + encodeURIComponent(name), { method: 'DELETE' });
+      if (res.ok) {
+        fetchPeersData();
+      }
+    } catch (e) {
+      console.error('Failed to remove peer:', e);
+    }
+  }
 
 
   function initMemory() {

@@ -46,6 +46,7 @@ export interface Settings {
     tts_voice: string;
     tts_speed: number;
     peers?: Peer[];
+    httpPort?: number;  // opt-in; undefined = no HTTP server
 }
 
 // ─── Constants ───

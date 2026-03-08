@@ -698,6 +698,171 @@ app.get("/api/logs/:type", (req, res) => {
     });
 });
 
+// ─── Peers API ───
+
+const SETTINGS_FILE = path.join(BORG_DIR, "settings.json");
+const WG_CONFIG_DIR = process.env.WG_CONFIG_DIR || "/wg-config";
+
+interface PeerConfig {
+    name: string;
+    ip: string;
+}
+
+interface SettingsJson {
+    httpPort?: number;
+    peers?: PeerConfig[];
+    [key: string]: unknown;
+}
+
+function readSettings(): SettingsJson {
+    return readJsonSafe<SettingsJson>(SETTINGS_FILE, {});
+}
+
+function writeSettings(settings: SettingsJson): void {
+    const tmp = SETTINGS_FILE + ".tmp";
+    fs.writeFileSync(tmp, JSON.stringify(settings, null, 2));
+    fs.renameSync(tmp, SETTINGS_FILE);
+}
+
+function readWgInfo(): { publicKey: string | null; address: string | null } {
+    try {
+        const wg0Path = path.join(WG_CONFIG_DIR, "wg_confs", "wg0.conf");
+        if (!fs.existsSync(wg0Path)) return { publicKey: null, address: null };
+        const content = fs.readFileSync(wg0Path, "utf8");
+        const addressMatch = content.match(/Address\s*=\s*(\S+)/);
+        const address = addressMatch ? addressMatch[1].replace(/\/\d+$/, "") : null;
+
+        // Read public key from the WireGuard container's key file
+        const pubkeyPath = path.join(WG_CONFIG_DIR, "server", "publickey-server");
+        let publicKey: string | null = null;
+        if (fs.existsSync(pubkeyPath)) {
+            publicKey = fs.readFileSync(pubkeyPath, "utf8").trim();
+        }
+        return { publicKey, address };
+    } catch {
+        return { publicKey: null, address: null };
+    }
+}
+
+// GET /api/peers — peer list with online status + local WG info
+app.get("/api/peers", async (_req, res) => {
+    const settings = readSettings();
+    const wg = readWgInfo();
+    const httpPort = settings.httpPort;
+
+    const peers = await Promise.all(
+        (settings.peers ?? []).map(async (peer) => {
+            let online = false;
+            let threadCount: number | null = null;
+            if (httpPort) {
+                try {
+                    const controller = new AbortController();
+                    const timeout = setTimeout(() => controller.abort(), 3000);
+                    const r = await fetch(`http://${peer.ip}:${httpPort}/threads`, {
+                        signal: controller.signal,
+                    });
+                    clearTimeout(timeout);
+                    if (r.ok) {
+                        const threads = (await r.json()) as Record<string, unknown>;
+                        online = true;
+                        threadCount = Object.keys(threads).length;
+                    }
+                } catch {
+                    // Peer offline
+                }
+            }
+            return { ...peer, online, threadCount };
+        }),
+    );
+
+    res.json({ wg, httpPort: httpPort ?? null, peers });
+});
+
+// POST /api/peers — add a peer
+app.post("/api/peers", (req, res) => {
+    const { name, ip, publicKey, endpoint, allowedIPs } = req.body as {
+        name?: string;
+        ip?: string;
+        publicKey?: string;
+        endpoint?: string;
+        allowedIPs?: string;
+    };
+
+    if (!name || !ip) {
+        res.status(400).json({ error: "name and ip are required" });
+        return;
+    }
+
+    if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(ip)) {
+        res.status(400).json({ error: "Invalid IP format" });
+        return;
+    }
+
+    const settings = readSettings();
+    const peers = settings.peers ?? [];
+
+    if (peers.some((p) => p.name === name)) {
+        res.status(409).json({ error: `Peer "${name}" already exists` });
+        return;
+    }
+
+    peers.push({ name, ip });
+    settings.peers = peers;
+    writeSettings(settings);
+
+    // If WireGuard public key + endpoint provided, write peer config
+    if (publicKey && endpoint) {
+        try {
+            const peerDir = path.join(WG_CONFIG_DIR, "wg_confs");
+            if (fs.existsSync(peerDir)) {
+                // Append peer to wg0.conf
+                const wg0Path = path.join(peerDir, "wg0.conf");
+                const peerBlock = `\n\n[Peer]\n# ${name}\nPublicKey = ${publicKey}\nEndpoint = ${endpoint}\nAllowedIPs = ${allowedIPs || ip + "/32"}\nPersistentKeepalive = 25\n`;
+                fs.appendFileSync(wg0Path, peerBlock);
+            }
+        } catch (err) {
+            console.warn(`Failed to write WireGuard config for peer ${name}:`, err);
+        }
+    }
+
+    res.json({ ok: true });
+});
+
+// DELETE /api/peers/:name — remove a peer
+app.delete("/api/peers/:name", (req, res) => {
+    const peerName = req.params.name;
+    const settings = readSettings();
+    const peers = settings.peers ?? [];
+    const idx = peers.findIndex((p) => p.name === peerName);
+
+    if (idx === -1) {
+        res.status(404).json({ error: "Peer not found" });
+        return;
+    }
+
+    peers.splice(idx, 1);
+    settings.peers = peers;
+    writeSettings(settings);
+
+    // Remove from WireGuard config
+    try {
+        const wg0Path = path.join(WG_CONFIG_DIR, "wg_confs", "wg0.conf");
+        if (fs.existsSync(wg0Path)) {
+            const content = fs.readFileSync(wg0Path, "utf8");
+            // Remove the peer block (from "# peerName" to next [Peer] or end)
+            const pattern = new RegExp(
+                `\\n*\\[Peer\\]\\n# ${peerName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\n[\\s\\S]*?(?=\\n\\[|$)`,
+            );
+            const updated = content.replace(pattern, "");
+            fs.writeFileSync(wg0Path, updated);
+        }
+    } catch (err) {
+        console.warn(`Failed to clean WireGuard config for peer ${peerName}:`, err);
+    }
+
+    res.json({ ok: true });
+});
+
 // ─── Start Server ───
 
 const server = http.createServer(app);

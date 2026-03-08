@@ -213,9 +213,8 @@ export function parseDevName(raw: string): DevName {
 // ─── Peer Instance ───
 
 export interface Peer {
-    name: string;            // human-readable label for logging
-    queueDir: string;        // absolute path to peer's .borg/queue directory
-    threadsJsonPath: string; // absolute path to peer's .borg/threads.json
+    name: string;  // human-readable label for logging
+    ip: string;    // WireGuard VPN IP, e.g. "10.8.0.2"
 }
 
 // ─── Message Model Cache Entry ───

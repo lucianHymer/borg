@@ -26,7 +26,7 @@ import {
 } from "./docker-client.js";
 import { parseMeminfo, parseCpuPercent, getDiskUsage, countQueueFiles } from "./host-metrics.js";
 import { loadThreads, loadSettings, formatHumanTime, configureThread, saveThreads } from "./session-manager.js";
-import { toErrorMessage, parseSSHPublicKey, parseDevEmail, type Peer } from "./types.js";
+import { toErrorMessage, parseSSHPublicKey, parseDevEmail } from "./types.js";
 import type { ThreadsMap } from "./session-manager.js";
 import { logCorrection, ROUTING_LOG, mergeCorrectionsOntoDecisions } from "./routing-logger.js";
 import { readRecentJsonl } from "./jsonl-reader.js";
@@ -93,50 +93,8 @@ export function createBorgMcpServer(sourceThreadId: number) {
 
             // Determine where the target thread lives: local or peer
             let targetName = "";
-            let incomingQueueDir = QUEUE_INCOMING;
             let peerLabel: string | undefined;
 
-            if (threads[String(targetThreadId)]) {
-                targetName = threads[String(targetThreadId)].name;
-            } else {
-                // Search peers for the target thread
-                const settings = loadSettings();
-                let found = false;
-                for (const peer of settings.peers ?? []) {
-                    try {
-                        const peerData = fs.readFileSync(peer.threadsJsonPath, "utf8");
-                        const peerThreads = JSON.parse(peerData) as ThreadsMap;
-                        if (peerThreads[String(targetThreadId)]) {
-                            targetName = peerThreads[String(targetThreadId)].name;
-                            incomingQueueDir = path.join(peer.queueDir, "incoming");
-                            peerLabel = peer.name;
-                            found = true;
-                            break;
-                        }
-                    } catch {
-                        // Peer may be offline — skip
-                    }
-                }
-                if (!found) {
-                    const localAvailable = Object.entries(threads).map(([tid, t]) => `${tid}: ${t.name}`).join(", ");
-                    const peerLines: string[] = [];
-                    for (const peer of settings.peers ?? []) {
-                        try {
-                            const peerData = fs.readFileSync(peer.threadsJsonPath, "utf8");
-                            const peerThreads = JSON.parse(peerData) as ThreadsMap;
-                            const peerAvail = Object.entries(peerThreads).map(([tid, t]) => `${tid}: ${t.name}`).join(", ");
-                            if (peerAvail) peerLines.push(`${peer.name}: ${peerAvail}`);
-                        } catch {
-                            peerLines.push(`${peer.name}: (unavailable)`);
-                        }
-                    }
-                    let msg = `Thread ${targetThreadId} not found. Local: ${localAvailable}`;
-                    if (peerLines.length > 0) msg += `\nPeers:\n${peerLines.join("\n")}`;
-                    return { content: [textContent(msg)], isError: true };
-                }
-            }
-
-            // Write to incoming queue (local or peer) so the target agent processes it
             const incoming = {
                 channel: "telegram",
                 source: "cross-thread",
@@ -148,15 +106,17 @@ export function createBorgMcpServer(sourceThreadId: number) {
                 messageId: id,
             };
 
-            fs.mkdirSync(incomingQueueDir, { recursive: true });
-            const inTmp = path.join(incomingQueueDir, `${id}.json.tmp`);
-            const inFinal = path.join(incomingQueueDir, `${id}.json`);
-            fs.writeFileSync(inTmp, JSON.stringify(incoming));
-            fs.renameSync(inTmp, inFinal);
+            if (threads[String(targetThreadId)]) {
+                targetName = threads[String(targetThreadId)].name;
 
-            // For local threads, write to outgoing queue so telegram-client displays it in the target topic.
-            // For peer threads, skip this — the peer's telegram-client owns those topics and handles display.
-            if (!peerLabel) {
+                // Local thread: write to local incoming queue
+                fs.mkdirSync(QUEUE_INCOMING, { recursive: true });
+                const inTmp = path.join(QUEUE_INCOMING, `${id}.json.tmp`);
+                const inFinal = path.join(QUEUE_INCOMING, `${id}.json`);
+                fs.writeFileSync(inTmp, JSON.stringify(incoming));
+                fs.renameSync(inTmp, inFinal);
+
+                // Write to outgoing queue so telegram-client displays it in the target topic
                 const outgoing = {
                     channel: "telegram",
                     targetThreadId,
@@ -173,6 +133,59 @@ export function createBorgMcpServer(sourceThreadId: number) {
                 const outFinal = path.join(QUEUE_OUTGOING, `${id}_tg.json`);
                 fs.writeFileSync(outTmp, JSON.stringify(outgoing));
                 fs.renameSync(outTmp, outFinal);
+            } else {
+                // Search peers via HTTP for the target thread
+                const settings = loadSettings();
+                const httpPort = settings.httpPort;
+                if (!httpPort) {
+                    const localAvailable = Object.entries(threads).map(([tid, t]) => `${tid}: ${t.name}`).join(", ");
+                    return { content: [textContent(`Thread ${targetThreadId} not found. Local: ${localAvailable}`)], isError: true };
+                }
+
+                let found = false;
+                for (const peer of settings.peers ?? []) {
+                    try {
+                        const threadsRes = await fetch(`http://${peer.ip}:${httpPort}/threads`);
+                        if (!threadsRes.ok) continue;
+                        const peerThreads = (await threadsRes.json()) as ThreadsMap;
+                        if (peerThreads[String(targetThreadId)]) {
+                            targetName = peerThreads[String(targetThreadId)].name;
+                            peerLabel = peer.name;
+
+                            // POST to peer's incoming endpoint
+                            const postRes = await fetch(`http://${peer.ip}:${httpPort}/incoming`, {
+                                method: "POST",
+                                headers: { "Content-Type": "application/json" },
+                                body: JSON.stringify(incoming),
+                            });
+                            if (!postRes.ok) {
+                                return { content: [textContent(`Failed to deliver message to peer ${peer.name}: HTTP ${postRes.status}`)], isError: true };
+                            }
+                            found = true;
+                            break;
+                        }
+                    } catch {
+                        // Peer may be offline — skip
+                    }
+                }
+                if (!found) {
+                    const localAvailable = Object.entries(threads).map(([tid, t]) => `${tid}: ${t.name}`).join(", ");
+                    const peerLines: string[] = [];
+                    for (const peer of settings.peers ?? []) {
+                        try {
+                            const threadsRes = await fetch(`http://${peer.ip}:${httpPort}/threads`);
+                            if (!threadsRes.ok) { peerLines.push(`${peer.name}: (unavailable)`); continue; }
+                            const peerThreads = (await threadsRes.json()) as ThreadsMap;
+                            const peerAvail = Object.entries(peerThreads).map(([tid, t]) => `${tid}: ${t.name}`).join(", ");
+                            if (peerAvail) peerLines.push(`${peer.name}: ${peerAvail}`);
+                        } catch {
+                            peerLines.push(`${peer.name}: (unavailable)`);
+                        }
+                    }
+                    let msg = `Thread ${targetThreadId} not found. Local: ${localAvailable}`;
+                    if (peerLines.length > 0) msg += `\nPeers:\n${peerLines.join("\n")}`;
+                    return { content: [textContent(msg)], isError: true };
+                }
             }
 
             const label = peerLabel ? ` via peer ${peerLabel}` : "";
@@ -197,21 +210,24 @@ export function createBorgMcpServer(sourceThreadId: number) {
                     return parts.join(" ");
                 });
 
-                // Include peer threads
+                // Include peer threads via HTTP
                 const settings = loadSettings();
-                for (const peer of settings.peers ?? []) {
-                    try {
-                        const peerData = fs.readFileSync(peer.threadsJsonPath, "utf8");
-                        const peerThreads = JSON.parse(peerData) as ThreadsMap;
-                        for (const [id, t] of Object.entries(peerThreads)) {
-                            const parts = [`Thread ${id}: ${t.name} (peer: ${peer.name})`];
-                            if (t.team) parts.push(`team=${t.team}`);
-                            if (t.role) parts.push(`role=${t.role}`);
-                            if (t.cwd) parts.push(`cwd=${t.cwd}`);
-                            lines.push(parts.join(" "));
+                if (settings.httpPort) {
+                    for (const peer of settings.peers ?? []) {
+                        try {
+                            const res = await fetch(`http://${peer.ip}:${settings.httpPort}/threads`);
+                            if (!res.ok) { lines.push(`(peer: ${peer.name} — unavailable)`); continue; }
+                            const peerThreads = (await res.json()) as ThreadsMap;
+                            for (const [id, t] of Object.entries(peerThreads)) {
+                                const parts = [`Thread ${id}: ${t.name} (peer: ${peer.name})`];
+                                if (t.team) parts.push(`team=${t.team}`);
+                                if (t.role) parts.push(`role=${t.role}`);
+                                if (t.cwd) parts.push(`cwd=${t.cwd}`);
+                                lines.push(parts.join(" "));
+                            }
+                        } catch {
+                            lines.push(`(peer: ${peer.name} — unavailable)`);
                         }
-                    } catch {
-                        lines.push(`(peer: ${peer.name} — unavailable)`);
                     }
                 }
 

@@ -48,6 +48,7 @@ services:
       - DOCKER_PROXY_URL=http://docker-proxy:2375/v1.47
     networks:
       - internal
+      - vpn
     deploy:
       resources:
         limits:
@@ -91,14 +92,17 @@ services:
       docker-proxy:
         condition: service_healthy
     volumes:
-      - ./.borg:/app/.borg:ro
+      - ./.borg:/app/.borg
+      - wireguard-config:/wg-config:ro
     ports:
       - "127.0.0.1:3100:3100"
     environment:
       - DOCKER_PROXY_URL=http://docker-proxy:2375/v1.47
       - COMPOSE_PROJECT=${COMPOSE_PROJECT_NAME:-borg}
+      - WG_CONFIG_DIR=/wg-config
     networks:
       - internal
+      - vpn
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://localhost:3100/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
       interval: 10s
@@ -131,6 +135,27 @@ services:
     networks:
       - internal
 
+  wireguard:
+    image: lscr.io/linuxserver/wireguard:latest
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+    volumes:
+      - wireguard-config:/config
+    ports:
+      - "${WG_PORT:-51820}:51820/udp"
+    environment:
+      - PUID=1000
+      - PGID=1000
+    networks:
+      - vpn
+    deploy:
+      resources:
+        limits:
+          memory: 64M
+    sysctls:
+      - net.ipv4.conf.all.src_valid_mark=1
+
   cloudflared:
     image: cloudflare/cloudflared:latest
     restart: always
@@ -147,6 +172,9 @@ networks:
     driver: bridge
   dev:
     driver: bridge
+  vpn:
+    driver: bridge
 
 volumes:
   speaches-cache:
+  wireguard-config:

@@ -45,6 +45,7 @@ import {
 } from "./session-manager.js";
 import type { ThreadConfig, HeartbeatTier } from "./session-manager.js";
 import { z } from "zod/v4";
+import { startHttpServer } from "./server.js";
 
 // ─── Zod Schemas for Queue Messages ───
 
@@ -1330,6 +1331,10 @@ async function shutdown(signal: string): Promise<void> {
     clearInterval(queueInterval);
     clearInterval(sessionSyncInterval);
 
+    if (peerServer) {
+        peerServer.close();
+    }
+
     try {
         const threads = loadThreads();
         saveThreads(threads);
@@ -1360,6 +1365,12 @@ log("INFO", `Watching: ${QUEUE_INCOMING}`);
 
 // Ensure Speaches models are installed (fire-and-forget, cached across restarts)
 ensureModels().catch(() => {});
+
+// Start peer HTTP server if configured
+let peerServer: ReturnType<typeof startHttpServer> | undefined;
+if (startupSettings.httpPort) {
+    peerServer = startHttpServer(startupSettings);
+}
 
 // fs.watch for near-instant pickup
 try {
