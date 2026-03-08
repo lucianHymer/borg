@@ -8,6 +8,7 @@
 - @architecture/voice-message-feature-tts-stt-architecture-and-configuration.md
 - @architecture/cross-thread-pending-message-registration-pattern.md
 - @architecture/image-message-support-download-and-read-tool-pattern.md
+- @architecture/skills-directory-structure-global-vs-workflows.md
 
 ## Patterns
 - @patterns/distillforspeech-uses-agent-sdk-query-not-raw-fetch.md

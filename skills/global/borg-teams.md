@@ -33,6 +33,15 @@ from Borg (hard cleanup — makes teams ephemeral). This is irreversible.
 `/clear_team` and `/compact_team` Telegram commands operate on all members
 of the current thread's team.
 
+## Shared Task List
+
+All threads in a team share a single task list — tasks created in one thread are immediately visible to all teammates. Team members should:
+- Check `TaskList` proactively at the start of each session and after completing any task
+- Claim tasks by setting status `in_progress` before starting work
+- Mark tasks `completed` immediately when done so blockers clear for teammates
+
+The Planner role is responsible for creating ALL tasks (both workflow scaffolding and implementation subtasks) at the start of a session.
+
 ## No Heartbeats
 Team threads don't have heartbeats. If periodic work is needed, ask a main
 thread to add it to their HEARTBEAT.md.
