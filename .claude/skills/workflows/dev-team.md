@@ -2,14 +2,19 @@
 
 Use this workflow when a task requires planning, implementation, review, and knowledge capture.
 
+## ⚠️ Critical: Human Approval Required Before Handoff
+
+**This is not optional.** After the Planner creates the plan and updates the GitHub issue, the Planner MUST explicitly ask the human user (not the master thread) to review and approve the plan. Do not hand work to the Worker until the human user has explicitly approved. The master thread's approval is not sufficient — only the actual human user (project owner, Lucian, etc.) can approve the plan moving forward. This prevents wasted effort on unapproved designs.
+
 ## Workspace Isolation
 
-Before creating team members, you MUST create a git worktree:
+Before creating team members, you MUST create a git worktree based on the latest main:
 ```
-git worktree add .borg/worktrees/{team-name} -b team/{team-name}
+git fetch origin
+git worktree add .borg/worktrees/{team-name} -b team/{team-name} origin/main
 ```
 Set all team members' working directory to the worktree path. This is not
-optional — teams must work in isolation from the main branch.
+optional — teams must work in isolation from the main branch, starting from the latest upstream state.
 
 ## GitHub Integration
 
@@ -56,7 +61,7 @@ After the standard tasks, Planner creates the actual work subtasks (tasks #4–N
 - Goes first: receives the initial task/issue from the user
 - Creates ALL tasks (standard + dynamic) upfront with correct blockers
 - Creates or overwrites the GitHub issue body with the full plan
-- Sends plan to master thread for approval before Worker begins
+- **Ask the human user to review the plan in the GitHub issue** — explicitly tell the human where to find the plan and ask for their approval. Do NOT proceed until the human (not just master thread) confirms
 - Answers Worker questions if plan is unclear
 - Validates Reviewer's "does this match the plan?" check at the end
 
@@ -113,9 +118,9 @@ When you finish a workflow step, update the task status — don't message teamma
 
 1. Create a thread for each role
 2. Give the Planner the task (issue, description, context)
-3. Planner creates all tasks (standard + dynamic) with blockers, then creates/updates GitHub issue
-4. Planner sends plan to **master thread for approval**
-5. Master/user approves or rejects the plan
+3. Planner creates all tasks (standard + dynamic) with blockers, then creates/updates GitHub issue with plan
+4. Planner messages the **human user** directly: "Plan is ready — please review it in the GitHub issue: [link]. Reply here to approve or reject."
+5. Human approves or rejects the plan — master thread approval alone is NOT sufficient, must hear from the human
 6. If approved, Planner sends plan to Worker: "implement tasks #4–N"
 7. Worker claims task #3, reviews plan, asks Planner if unclear, marks #3 done
 8. Worker claims and implements dynamic tasks; opens PR when all are done

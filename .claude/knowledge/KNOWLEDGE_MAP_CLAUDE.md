@@ -9,6 +9,7 @@
 - @architecture/cross-thread-pending-message-registration-pattern.md
 - @architecture/image-message-support-download-and-read-tool-pattern.md
 - @architecture/skills-directory-structure-global-vs-workflows.md
+- @architecture/cross-machine-peer-messaging-http-transport.md
 
 ## Patterns
 - @patterns/distillforspeech-uses-agent-sdk-query-not-raw-fetch.md

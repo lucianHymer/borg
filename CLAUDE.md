@@ -31,6 +31,7 @@ Agents communicate through the file queue system:
 - Grep `.borg/message-history.jsonl` for any thread's history
 - Write JSON to `.borg/queue/outgoing/` with `targetThreadId` field to message another thread
 - Master thread (threadId: 1) has visibility across all threads
+- `send_message` routes to peer Borg instances (other repos, same host) via `peers` in `.borg/settings.json`
 
 ## Message Sources
 
