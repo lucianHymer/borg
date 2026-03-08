@@ -62,4 +62,8 @@ Adding a peer is a human-controlled dashboard operation — not something that c
 - Public internet exposure is unnecessary and increases attack surface
 - WireGuard VPN with bot containers as sole members gives network-layer isolation with minimal config + no per-request auth overhead
 
+## Key Gotcha: No Local Outgoing Display for Peer Sends
+
+When `send_message` routes to a peer, only the incoming queue entry is written — the outgoing `_tg` display entry is skipped (`!peerLabel` guard in mcp-tools.ts). The peer's telegram-client owns those forum topics and handles display. Writing peer threadIds to the local QUEUE_OUTGOING would cause the local telegram-client to post to wrong/nonexistent local topics. This was the #1 gotcha caught during the initial peer messaging review.
+
 **Related files:** src/server.ts, src/mcp-tools.ts, src/session-manager.ts, src/types.ts

@@ -2,4 +2,6 @@
 
 Cross-thread messages generate two queue entries: one incoming (messageId = base ID) for queue-processor, one outgoing (messageId = base ID + "_tg" suffix) for telegram-client display. telegram-client strips "_tg" to recover the base ID and registers a PendingMessage so status updates and final responses are tracked. The _tg suffix convention is an implicit contract between mcp-tools.ts and telegram-client.ts — not codified in a shared constant. cleanupPendingMessages cannot parse timestamps from cross_* IDs (parts[0] is "cross" not a timestamp), causing these entries to leak. The outgoing cross-thread message in mcp-tools.ts is written as a plain object and doesn't include the required threadId field from the OutgoingMessage interface.
 
+**Peer exception:** When `send_message` routes to a peer Borg instance, the outgoing `_tg` entry is NOT written (gated by `!peerLabel` in mcp-tools.ts). Only the owning Borg instance's telegram-client should post to a given forum topic — writing a peer's threadId to the local QUEUE_OUTGOING would cause the local telegram-client to post to a wrong or nonexistent local topic. The peer's own telegram-client handles display when processing its incoming queue.
+
 **Related files:** src/mcp-tools.ts, src/telegram-client.ts, src/types.ts
