@@ -93,7 +93,7 @@ services:
         condition: service_healthy
     volumes:
       - ./.borg:/app/.borg
-      - wireguard-config:/wg-config:ro
+      - wireguard-config:/wg-config
     ports:
       - "127.0.0.1:3100:3100"
     environment:

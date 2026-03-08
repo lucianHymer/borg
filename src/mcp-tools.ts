@@ -63,6 +63,14 @@ function textContent(text: string) {
     return { type: "text" as const, text };
 }
 
+const PEER_FETCH_TIMEOUT_MS = 5000;
+
+function peerFetch(url: string, init?: RequestInit): Promise<Response> {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), PEER_FETCH_TIMEOUT_MS);
+    return fetch(url, { ...init, signal: controller.signal }).finally(() => clearTimeout(timeout));
+}
+
 /**
  * Create an MCP server bound to a specific source thread.
  * Each query gets its own instance so cross-thread messages carry the correct sourceThreadId.
@@ -145,7 +153,7 @@ export function createBorgMcpServer(sourceThreadId: number) {
                 let found = false;
                 for (const peer of settings.peers ?? []) {
                     try {
-                        const threadsRes = await fetch(`http://${peer.ip}:${httpPort}/threads`);
+                        const threadsRes = await peerFetch(`http://${peer.ip}:${httpPort}/threads`);
                         if (!threadsRes.ok) continue;
                         const peerThreads = (await threadsRes.json()) as ThreadsMap;
                         if (peerThreads[String(targetThreadId)]) {
@@ -153,7 +161,7 @@ export function createBorgMcpServer(sourceThreadId: number) {
                             peerLabel = peer.name;
 
                             // POST to peer's incoming endpoint
-                            const postRes = await fetch(`http://${peer.ip}:${httpPort}/incoming`, {
+                            const postRes = await peerFetch(`http://${peer.ip}:${httpPort}/incoming`, {
                                 method: "POST",
                                 headers: { "Content-Type": "application/json" },
                                 body: JSON.stringify(incoming),
@@ -173,7 +181,7 @@ export function createBorgMcpServer(sourceThreadId: number) {
                     const peerLines: string[] = [];
                     for (const peer of settings.peers ?? []) {
                         try {
-                            const threadsRes = await fetch(`http://${peer.ip}:${httpPort}/threads`);
+                            const threadsRes = await peerFetch(`http://${peer.ip}:${httpPort}/threads`);
                             if (!threadsRes.ok) { peerLines.push(`${peer.name}: (unavailable)`); continue; }
                             const peerThreads = (await threadsRes.json()) as ThreadsMap;
                             const peerAvail = Object.entries(peerThreads).map(([tid, t]) => `${tid}: ${t.name}`).join(", ");
@@ -215,7 +223,7 @@ export function createBorgMcpServer(sourceThreadId: number) {
                 if (settings.httpPort) {
                     for (const peer of settings.peers ?? []) {
                         try {
-                            const res = await fetch(`http://${peer.ip}:${settings.httpPort}/threads`);
+                            const res = await peerFetch(`http://${peer.ip}:${settings.httpPort}/threads`);
                             if (!res.ok) { lines.push(`(peer: ${peer.name} — unavailable)`); continue; }
                             const peerThreads = (await res.json()) as ThreadsMap;
                             for (const [id, t] of Object.entries(peerThreads)) {

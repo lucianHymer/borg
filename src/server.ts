@@ -8,7 +8,7 @@ import http from "http";
 import fs from "fs";
 import path from "path";
 import type { Settings } from "./session-manager.js";
-import { loadThreads } from "./session-manager.js";
+import { loadThreads, loadSettings } from "./session-manager.js";
 
 const PROJECT_DIR = path.resolve(__dirname, "..");
 const BORG_DIR = path.join(PROJECT_DIR, ".borg");
@@ -21,8 +21,6 @@ const MAX_PAYLOAD_BYTES = 100 * 1024; // 100KB
  * Returns the server instance for graceful shutdown.
  */
 export function startHttpServer(settings: Settings): http.Server {
-    const allowedIPs = new Set((settings.peers ?? []).map(p => p.ip));
-
     const server = http.createServer((req, res) => {
         // Extract client IP (handle IPv6-mapped IPv4)
         let clientIP = req.socket.remoteAddress ?? "";
@@ -31,6 +29,8 @@ export function startHttpServer(settings: Settings): http.Server {
         if (req.method === "GET" && req.url === "/threads") {
             handleGetThreads(res);
         } else if (req.method === "POST" && req.url === "/incoming") {
+            // Read allowed IPs fresh each request so dashboard-added peers work immediately
+            const allowedIPs = new Set((loadSettings().peers ?? []).map(p => p.ip));
             handlePostIncoming(req, res, clientIP, allowedIPs);
         } else {
             res.writeHead(404);
@@ -100,6 +100,9 @@ function handlePostIncoming(
                 res.end("Invalid message schema");
                 return;
             }
+
+            // Force cross-thread source regardless of what peer sent
+            body.source = "cross-thread";
 
             // Write atomically to incoming queue
             const filename = `peer_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
