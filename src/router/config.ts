@@ -110,11 +110,11 @@ export const DEFAULT_ROUTING_CONFIG: RoutingConfig = {
     // Tier boundaries (simplified to 3 tiers)
     tierBoundaries: {
       simpleMedium: 0.08,
-      mediumComplex: 0.20,
+      mediumComplex: 0.12,
     },
 
     confidenceSteepness: 12,
-    confidenceThreshold: 0.7,
+    confidenceThreshold: 0.55,
   },
 
   tiers: {
