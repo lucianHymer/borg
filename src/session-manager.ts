@@ -5,6 +5,7 @@
 
 import fs from "fs";
 import path from "path";
+import type { Peer } from "./types.js";
 
 // ─── Types ───
 
@@ -44,6 +45,7 @@ export interface Settings {
     session_idle_timeout_minutes: number;
     tts_voice: string;
     tts_speed: number;
+    peers?: Peer[];
 }
 
 // ─── Constants ───
