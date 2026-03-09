@@ -890,29 +890,6 @@ async function processMessage(messageFile: string): Promise<void> {
         messageId,
     });
 
-    // ─── Intercept /compact command (from /compact_team queue or cross-thread) ───
-    if (msg.message.trim() === "/compact") {
-        resetThread(threadId);
-        const compactResponse: OutgoingMessage = {
-            channel,
-            threadId,
-            sender: "borg",
-            message: "Session reset. Recent message history will be available on next message.",
-            originalMessage: "/compact",
-            timestamp: Date.now(),
-            messageId,
-            model: "system",
-        };
-        const outFile = path.join(QUEUE_OUTGOING, `${channel}_${messageId}_${Date.now()}.json`);
-        const tmpOut = outFile + ".tmp";
-        fs.writeFileSync(tmpOut, JSON.stringify(compactResponse, null, 2));
-        fs.renameSync(tmpOut, outFile);
-        clearStatus(messageId);
-        if (fs.existsSync(processingFile)) fs.unlinkSync(processingFile);
-        log("INFO", `Thread ${threadId} compacted via queue message`);
-        return;
-    }
-
     let responseText: string;
     let effectiveModel: string;
     let routingResult: { effectiveModel: string; decision: RoutingDecision } | undefined;
