@@ -1,6 +1,7 @@
 # Knowledge Map (Claude Reference)
 
 ## Architecture
+- @architecture/telegram-bot-commands-vs-queue-processor-command-handling.md
 - @architecture/team-mcp-tools-only-create-thread-configure-thread-disband-team.md
 - @architecture/team-commands-use-simple-queue-messages-not-custom-command-handlers.md
 - @architecture/three-layer-workflow-abstraction-generic-skills-borg-bridge-native-fallback.md
