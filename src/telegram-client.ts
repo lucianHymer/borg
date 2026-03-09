@@ -147,6 +147,7 @@ interface PendingMessage {
     statusMessageId?: number;
     lastStatusText?: string;
     lastStatusLabel?: string;   // base label for change detection
+    lastPreview?: string;       // last preview text shown
     lastEditTs?: number;        // last Telegram edit timestamp for throttling
 }
 
@@ -1038,7 +1039,7 @@ async function pollStatusFiles(): Promise<void> {
     for (const [messageId, pending] of pendingMessages) {
         const statusFile = path.join(QUEUE_STATUS, `${messageId}.json`);
 
-        let statusData: { label: string; ts: number; startTs: number };
+        let statusData: { label: string; ts: number; startTs: number; preview?: string };
         try {
             if (!fs.existsSync(statusFile)) continue;
             statusData = JSON.parse(fs.readFileSync(statusFile, "utf8"));
@@ -1054,17 +1055,34 @@ async function pollStatusFiles(): Promise<void> {
         // STT/Listening has no refresh interval so use a longer threshold)
         const stalledThreshold = statusData.label === "Listening" ? 180_000 : 15_000;
         const isStale = Date.now() - statusData.ts > stalledThreshold;
-        const displayText = isStale
+        let statusLine = isStale
             ? `🕐 ${statusData.label}... — stalled`
             : `🕐 ${statusData.label}... (${elapsed}s)`;
 
-        // Skip if display text hasn't changed
-        if (displayText === pending.lastStatusText) continue;
+        // Append preview text from latest assistant message (if available)
+        const previewText = statusData.preview;
+        let displayText: string;
+        if (previewText) {
+            // Truncate preview for Telegram message limits and readability
+            const maxPreview = 300;
+            const truncated = previewText.length > maxPreview
+                ? previewText.slice(0, maxPreview) + "…"
+                : previewText;
+            displayText = `${statusLine}\n\n💬 ${truncated}\n\n[still processing...]`;
+        } else {
+            displayText = statusLine;
+        }
 
-        // Label changes: edit immediately. Timer-only changes: throttle to every 20s.
+        // Check if anything changed (status line, preview, or stale state)
+        const previewChanged = previewText !== pending.lastPreview;
         const labelChanged = statusData.label !== pending.lastStatusLabel;
         const timeSinceLastEdit = Date.now() - (pending.lastEditTs ?? 0);
-        if (!labelChanged && !isStale && timeSinceLastEdit < 20_000) continue;
+
+        // Skip if nothing has changed
+        if (displayText === pending.lastStatusText) continue;
+
+        // Throttle: label/preview changes edit immediately, timer-only throttle to 20s
+        if (!labelChanged && !previewChanged && !isStale && timeSinceLastEdit < 20_000) continue;
 
         try {
             if (pending.statusMessageId) {
@@ -1091,6 +1109,7 @@ async function pollStatusFiles(): Promise<void> {
             }
             pending.lastStatusText = displayText;
             pending.lastStatusLabel = statusData.label;
+            pending.lastPreview = previewText;
             pending.lastEditTs = Date.now();
         } catch {
             // editMessageText may fail if message was deleted or content unchanged — ignore

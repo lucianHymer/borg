@@ -30,3 +30,4 @@
 
 ## Gotchas
 - @gotchas/speaches-container-handles-request-queuing-internally.md
+- @gotchas/stall-detection-must-use-absolute-time-not-per-event.md

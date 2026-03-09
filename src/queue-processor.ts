@@ -468,11 +468,13 @@ function buildSourcePrefix(msg: IncomingMessage): string {
 
 // ─── Status File Helpers ───
 
-function writeStatus(messageId: string, label: string, startTs: number): void {
+function writeStatus(messageId: string, label: string, startTs: number, preview?: string): void {
     try {
         const statusFile = path.join(QUEUE_STATUS, `${messageId}.json`);
         const tmpFile = statusFile + ".tmp";
-        fs.writeFileSync(tmpFile, JSON.stringify({ label, ts: Date.now(), startTs }));
+        const data: Record<string, unknown> = { label, ts: Date.now(), startTs };
+        if (preview) data.preview = preview;
+        fs.writeFileSync(tmpFile, JSON.stringify(data));
         fs.renameSync(tmpFile, statusFile);
     } catch {
         // Status updates are best-effort — never crash the process
@@ -580,11 +582,16 @@ interface QueryEventObserver {
     onToolProgress?(toolName: string, elapsedSeconds: number): void;
     onCompacting?(): void;
     onStallDetected?(): void;
+    onTextContent?(text: string): void;
 }
 
-// If we see end_turn with content and no active subagents, and no new events arrive
-// within this window, assume the CLI process is hung and return what we have.
+// If we see end_turn with content and no active subagents, and total elapsed time
+// since end_turn exceeds this window, assume the CLI process is hung and return.
+// Uses absolute time (not per-event) to handle background tasks that emit
+// tool_progress events indefinitely after end_turn.
 const END_TURN_STALL_TIMEOUT_MS = 90_000; // 90 seconds
+// Short poll interval: once end_turn is seen, don't wait forever for each event
+const POST_END_TURN_POLL_MS = 5_000; // 5 seconds per event poll
 
 async function collectQueryResponse(
     q: Query,
@@ -595,6 +602,7 @@ async function collectQueryResponse(
 
     // ─── Stall detection state ───
     let sawEndTurn = false;
+    let endTurnSeenAt = 0; // absolute timestamp when end_turn was first seen
     let stallDetected = false;
 
     const iterator = q[Symbol.asyncIterator]();
@@ -603,22 +611,31 @@ async function collectQueryResponse(
         let iterResult: IteratorResult<SDKMessage, void>;
 
         if (sawEndTurn && parts.length > 0) {
-            // We have end_turn + content + no active subagents — race against timeout
+            // Check absolute time since end_turn (not reset by incoming events)
+            const elapsed = Date.now() - endTurnSeenAt;
+            if (elapsed >= END_TURN_STALL_TIMEOUT_MS) {
+                stallDetected = true;
+                observer?.onStallDetected?.();
+                log(
+                    "WARN",
+                    `end_turn stall detected after ${Math.round(elapsed / 1000)}s — returning collected response (${parts.join("").length} chars)`,
+                );
+                break;
+            }
+            // Short poll: don't wait the full remaining time per event, so we can
+            // re-check the absolute deadline even if tool_progress keeps arriving
+            const remaining = END_TURN_STALL_TIMEOUT_MS - elapsed;
+            const pollTimeout = Math.min(POST_END_TURN_POLL_MS, remaining);
             const timeoutPromise = new Promise<"timeout">((resolve) => {
-                setTimeout(() => resolve("timeout"), END_TURN_STALL_TIMEOUT_MS);
+                setTimeout(() => resolve("timeout"), pollTimeout);
             });
             const winner = await Promise.race([
                 iterator.next().then((r) => ({ kind: "event" as const, result: r })),
                 timeoutPromise.then(() => ({ kind: "timeout" as const })),
             ]);
             if (winner.kind === "timeout") {
-                stallDetected = true;
-                observer?.onStallDetected?.();
-                log(
-                    "WARN",
-                    `end_turn stall detected after ${END_TURN_STALL_TIMEOUT_MS / 1000}s — returning collected response (${parts.join("").length} chars)`,
-                );
-                break;
+                // Don't break yet — loop back and check absolute deadline
+                continue;
             }
             iterResult = winner.result;
         } else {
@@ -640,6 +657,7 @@ async function collectQueryResponse(
                 for (const block of content) {
                     if (block.type === "text" && typeof block.text === "string") {
                         parts.push(block.text);
+                        observer?.onTextContent?.(block.text);
                     }
                     if (block.type === "tool_use" && "name" in block) {
                         observer?.onToolUse?.(block.name);
@@ -649,9 +667,13 @@ async function collectQueryResponse(
             // Track end_turn on top-level assistant messages (not from subagents)
             const stopReason = assistantMsg.message?.stop_reason;
             if (stopReason === "end_turn" && assistantMsg.parent_tool_use_id === null) {
+                if (!sawEndTurn) {
+                    endTurnSeenAt = Date.now();
+                }
                 sawEndTurn = true;
             } else if (stopReason === "tool_use") {
                 sawEndTurn = false;
+                endTurnSeenAt = 0;
             }
         }
 
@@ -696,7 +718,7 @@ async function collectQueryResponse(
         }
     }
 
-    return { text: parts.join(""), sessionId: capturedSessionId, stallRecovered: stallDetected };
+    return { text: parts.join("\n\n"), sessionId: capturedSessionId, stallRecovered: stallDetected };
 }
 
 // ─── Heartbeat Processing (one-shot, no persistent session) ───
@@ -1061,9 +1083,10 @@ async function processMessage(messageFile: string): Promise<void> {
             writeStatus(messageId, currentStatusLabel, statusStartTime);
 
             // Refresh the status file every 2 seconds to keep ts fresh (for staleness detection)
-            // and to pick up label changes from the observer callbacks
+            // and to pick up label changes and preview text from the observer callbacks
+            let currentPreview: string | undefined;
             const statusInterval = setInterval(() => {
-                writeStatus(messageId, currentStatusLabel, statusStartTime);
+                writeStatus(messageId, currentStatusLabel, statusStartTime, currentPreview);
             }, 2000);
 
             // Observer callbacks set intent; the interval handles all file writes
@@ -1081,6 +1104,10 @@ async function processMessage(messageFile: string): Promise<void> {
                 },
                 onStallDetected() {
                     currentStatusLabel = "Stall recovered";
+                },
+                onTextContent(text: string) {
+                    // Keep the latest text block as preview (truncate for status file size)
+                    currentPreview = text.length > 500 ? text.slice(0, 500) + "…" : text;
                 },
             };
 
