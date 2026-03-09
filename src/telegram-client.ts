@@ -1078,8 +1078,10 @@ async function pollStatusFiles(): Promise<void> {
         // Compute elapsed time from processing start
         const elapsed = Math.round((Date.now() - statusData.startTs) / 1000);
 
-        // Detect stalled processing (queue processor should write every 2s)
-        const isStale = Date.now() - statusData.ts > 15_000;
+        // Detect stalled processing (queue processor refreshes every 2s during SDK work;
+        // STT/Listening has no refresh interval so use a longer threshold)
+        const stalledThreshold = statusData.label === "Listening" ? 180_000 : 15_000;
+        const isStale = Date.now() - statusData.ts > stalledThreshold;
         const displayText = isStale
             ? `🕐 ${statusData.label}... — stalled`
             : `🕐 ${statusData.label}... (${elapsed}s)`;
