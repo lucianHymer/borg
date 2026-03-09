@@ -121,6 +121,7 @@ Legitimate messages (recipient must act):
 - Worker → Reviewer: "PR ready for review: #N" (with PR link)
 - Reviewer → Planner: "Does this implement what you planned?" (required validation)
 - Reviewer → Worker: "These issues need fixing: ..." (actionable feedback with specifics)
+- Reviewer → Documenter: "Review complete, docs task is yours" (handoff)
 - Documenter → each teammate: interview question (one message, expects one reply)
 - Documenter → master thread: final summary (done signal)
 
@@ -135,12 +136,12 @@ When you finish a workflow step, update the task status — don't message teamma
 5. Master/user approves or rejects the plan
 6. If approved, Planner sends plan to Worker: "implement tasks #4–N"
 7. Worker claims task #3, reviews plan, asks Planner if unclear, marks #3 done
-8. Worker runs `/compound-engineering:workflows:work` with the plan file, implements tasks, opens PR
+8. Worker runs `/compound-engineering:workflows:work` with the plan file, implements tasks, opens PR; **messages Reviewer: "PR ready for review: #N"**
 9. Reviewer's task unblocks — runs `/compound-engineering:workflows:review` on the PR
 10. Reviewer spawns skeptic sub-agent to triage todos: keep real issues, delete noise, fix trivials inline
 11. Reviewer runs `/compound-engineering:resolve_todo_parallel` on triaged list
 12. Reviewer asks Planner to confirm plan match (required)
-13. If approved: Reviewer approves PR on GitHub; Documenter's task unblocks
+13. If approved: Reviewer approves PR on GitHub; **messages Documenter: "Review complete, docs task is yours"**
 14. Documenter sends ONE interview message to each teammate, waits for replies
 15. Documenter writes docs, sends summary to master thread (DONE)
 16. All agents go silent — no farewell messages
