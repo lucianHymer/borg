@@ -60,6 +60,18 @@ npm run queue    # Start queue processor
 ```
 
 
+## Key Learnings (Peer Messaging, PR #30)
+
+**Design iteration lesson:** Started with filesystem-based peers (PR #29), then HTTP+filesystem dual transport, then simplified to HTTP-only. The biggest win came from ruthlessly simplifying the security model once we understood what WireGuard already provides. Initial plan had HMAC signing, complex config — final version: just peer IP validation + JSON schema validation. *Key insight:* WireGuard handles all transport security; application-level crypto is redundant.
+
+**Organizational lesson:** The Planner handed work to Worker before the human user approved the plan. This caused waste (Worker built the filesystem version, then pivoted when the revised plan was approved). **Critical fix:** Dev-team workflow now explicitly requires human (Lucian) approval in the GitHub issue BEFORE Planner tells Worker to start. Master thread approval is not sufficient.
+
+**Architecture insight:** Unified HTTP transport (not dual filesystem+HTTP) keeps the code path clean. `send_message` treats local cross-thread and peer sends identically up to the delivery point — same queue structure, different target. This single-path approach prevented bugs and made validation straightforward.
+
+**The `_tg` suffix gotcha:** Ownership is the key rule. QUEUE_OUTGOING entries can ONLY target threadIds owned by the local telegram-client. For peer sends, skip the `_tg` display entry entirely — the peer's telegram-client handles its own display when processing the message from its queue. This non-obvious rule is exactly what future agents would repeat as a bug if not documented.
+
+**Config simplification:** Peer config went from `{ name, url, threadsJsonUrl, expectedIp, sharedSecret }` to just `{ name, ip }`. Simpler is better.
+
 ## Mim Knowledge
 
 @.claude/knowledge/INSTRUCTIONS.md
