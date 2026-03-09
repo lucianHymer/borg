@@ -72,9 +72,10 @@ After the standard tasks, Planner creates the actual work subtasks (tasks #4–N
 ### Reviewer
 - Claims the review task when it unblocks (after PR is open)
 - Uses `/compound-engineering:workflows:review` to run multi-agent code review — discovers and delegates to review sub-agents in parallel, synthesizes findings, and creates actionable todo files
+- **Triage step**: spins up a skeptic sub-agent to go through the generated todos and triage them — keep real issues (mark as todo), delete false positives and low-value noise. The skeptic should be proactive: if a "fix" is trivial, just do it rather than leaving it as a todo
+- Runs `/compound-engineering:resolve_todo_parallel` on the triaged list
 - MUST ask the Planner: "Does this implementation match your plan?" — required step
 - Approves the PR on GitHub when satisfied
-- If issues found: uses `/compound-engineering:resolve_todo_parallel` to fix review findings, or sends specific feedback to Worker for complex issues
 - Never rubber-stamp — if you can't point to specific code you verified, you haven't reviewed
 
 ### Documenter
@@ -136,12 +137,13 @@ When you finish a workflow step, update the task status — don't message teamma
 7. Worker claims task #3, reviews plan, asks Planner if unclear, marks #3 done
 8. Worker runs `/compound-engineering:workflows:work` with the plan file, implements tasks, opens PR
 9. Reviewer's task unblocks — runs `/compound-engineering:workflows:review` on the PR
-10. Reviewer asks Planner to confirm plan match (required)
-11. If issues: Reviewer → Worker with specific fixes OR runs `/compound-engineering:resolve_todo_parallel`; Worker fixes and updates PR, goto 9
-12. If approved: Reviewer approves PR on GitHub; Documenter's task unblocks
-13. Documenter sends ONE interview message to each teammate, waits for replies
-14. Documenter writes docs, sends summary to master thread (DONE)
-15. All agents go silent — no farewell messages
+10. Reviewer spawns skeptic sub-agent to triage todos: keep real issues, delete noise, fix trivials inline
+11. Reviewer runs `/compound-engineering:resolve_todo_parallel` on triaged list
+12. Reviewer asks Planner to confirm plan match (required)
+13. If approved: Reviewer approves PR on GitHub; Documenter's task unblocks
+14. Documenter sends ONE interview message to each teammate, waits for replies
+15. Documenter writes docs, sends summary to master thread (DONE)
+16. All agents go silent — no farewell messages
 
 ## After Completion
 
