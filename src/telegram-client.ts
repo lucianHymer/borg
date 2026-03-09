@@ -319,15 +319,19 @@ bot.on("message:forum_topic_edited", (ctx) => {
 
 // ─── Commands ───
 
-bot.command("clear", async (ctx) => {
-    if (String(ctx.chat?.id) !== settings.telegram_chat_id) return;
-    const threadId = ctx.msg.message_thread_id ?? 1;
-    resetThread(threadId);
-    await ctx.reply("Session cleared! Starting fresh.", {
-        message_thread_id: ctx.msg.message_thread_id,
+// /compact resets the session; recent message history is automatically injected on next message.
+// Currently an alias for /clear — may add summarization in the future.
+for (const cmd of ["clear", "compact"] as const) {
+    bot.command(cmd, async (ctx) => {
+        if (String(ctx.chat?.id) !== settings.telegram_chat_id) return;
+        const threadId = ctx.msg.message_thread_id ?? 1;
+        resetThread(threadId);
+        await ctx.reply("Session reset. Recent message history will be available on next message.", {
+            message_thread_id: ctx.msg.message_thread_id,
+        });
+        log("INFO", `Thread ${threadId} ${cmd} by ${ctx.from?.first_name ?? "unknown"}`);
     });
-    log("INFO", `Thread ${threadId} reset by ${ctx.from?.first_name ?? "unknown"}`);
-});
+}
 
 bot.command("setdir", async (ctx) => {
     if (String(ctx.chat?.id) !== settings.telegram_chat_id) return;
@@ -348,62 +352,30 @@ bot.command("setdir", async (ctx) => {
     log("INFO", `Thread ${threadId} cwd set to ${dir} by ${ctx.from?.first_name ?? "unknown"}`);
 });
 
-async function queueTeamCommand(ctx: Context, command: string): Promise<void> {
-    if (String(ctx.chat?.id) !== settings.telegram_chat_id) return;
-    const threadId = ctx.msg?.message_thread_id ?? 1;
-    const threads = loadThreads();
-    const config = threads[String(threadId)];
-    if (!config?.team) {
-        await ctx.reply("This thread isn't part of a team.", {
+// /compact_team resets all team sessions; an alias for /clear_team.
+for (const cmd of ["clear_team", "compact_team"] as const) {
+    bot.command(cmd, async (ctx) => {
+        if (String(ctx.chat?.id) !== settings.telegram_chat_id) return;
+        const threadId = ctx.msg?.message_thread_id ?? 1;
+        const threads = loadThreads();
+        const config = threads[String(threadId)];
+        if (!config?.team) {
+            await ctx.reply("This thread isn't part of a team.", {
+                message_thread_id: ctx.msg?.message_thread_id,
+            });
+            return;
+        }
+        const teamThreads = Object.entries(threads).filter(([, t]) => t.team === config.team);
+        for (const [id] of teamThreads) {
+            resetThread(Number(id));
+        }
+        await ctx.reply(`Reset ${teamThreads.length} session(s) in team **${config.team}**. Recent history available on next message.`, {
             message_thread_id: ctx.msg?.message_thread_id,
+            parse_mode: "Markdown",
         });
-        return;
-    }
-    const teamThreads = Object.entries(threads).filter(([, t]) => t.team === config.team);
-    for (const [id] of teamThreads) {
-        const msgId = `${command}_${id}_${Date.now()}`;
-        const queueData = {
-            channel: "telegram",
-            source: "system",
-            threadId: Number(id),
-            sender: ctx.from?.first_name ?? "system",
-            message: `/${command}`,
-            timestamp: Date.now(),
-            messageId: msgId,
-        };
-        const tmpFile = path.join(QUEUE_INCOMING, `${msgId}.json.tmp`);
-        fs.writeFileSync(tmpFile, JSON.stringify(queueData));
-        fs.renameSync(tmpFile, path.join(QUEUE_INCOMING, `${msgId}.json`));
-    }
-    await ctx.reply(`Queued /${command} to ${teamThreads.length} thread(s) in team **${config.team}**`, {
-        message_thread_id: ctx.msg?.message_thread_id,
-        parse_mode: "Markdown",
+        log("INFO", `Team ${config.team} ${cmd} by ${ctx.from?.first_name ?? "unknown"} (${teamThreads.length} threads)`);
     });
-    log("INFO", `Team ${config.team} ${command} queued by ${ctx.from?.first_name ?? "unknown"} (${teamThreads.length} threads)`);
 }
-
-bot.command("clear_team", async (ctx) => {
-    if (String(ctx.chat?.id) !== settings.telegram_chat_id) return;
-    const threadId = ctx.msg?.message_thread_id ?? 1;
-    const threads = loadThreads();
-    const config = threads[String(threadId)];
-    if (!config?.team) {
-        await ctx.reply("This thread isn't part of a team.", {
-            message_thread_id: ctx.msg?.message_thread_id,
-        });
-        return;
-    }
-    const teamThreads = Object.entries(threads).filter(([, t]) => t.team === config.team);
-    for (const [id] of teamThreads) {
-        resetThread(Number(id));
-    }
-    await ctx.reply(`Cleared ${teamThreads.length} session(s) in team **${config.team}**`, {
-        message_thread_id: ctx.msg?.message_thread_id,
-        parse_mode: "Markdown",
-    });
-    log("INFO", `Team ${config.team} clear by ${ctx.from?.first_name ?? "unknown"} (${teamThreads.length} threads)`);
-});
-bot.command("compact_team", (ctx) => queueTeamCommand(ctx, "compact"));
 
 bot.command("status", async (ctx) => {
     if (String(ctx.chat?.id) !== settings.telegram_chat_id) return;
@@ -1516,11 +1488,12 @@ bot.start({
     allowed_updates: [...API_CONSTANTS.DEFAULT_UPDATE_TYPES, "message_reaction"],
     onStart: async () => {
         await bot.api.setMyCommands([
-            { command: "clear", description: "Clear the current thread session" },
+            { command: "clear", description: "Reset session (recent history preserved)" },
+            { command: "compact", description: "Reset session (recent history preserved)" },
             { command: "setdir", description: "Set working directory for this thread" },
             { command: "status", description: "Show all active threads and their status" },
-            { command: "clear_team", description: "Clear all team member sessions" },
-            { command: "compact_team", description: "Compact all team member sessions" },
+            { command: "clear_team", description: "Reset all team member sessions" },
+            { command: "compact_team", description: "Reset all team member sessions" },
         ]);
         // Start task watcher
         setInterval(() => { pollTaskUpdates().catch(() => {}); }, TASK_POLL_INTERVAL);
