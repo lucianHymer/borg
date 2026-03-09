@@ -11,11 +11,11 @@ Use the `Agent` tool to delegate work to sub-agents. Sub-agents run Claude Code 
 - You need to implement a feature, fix a bug, or write code
 - Multiple independent tasks can be done in parallel
 
-**Don't delegate when:**
+**Do it inline when:**
 - It's a trivial lookup you can do in one tool call
-- The task depends on context you've already accumulated in this conversation (e.g., "now apply what we just discussed")
+- The task is small AND heavily depends on nuanced context you've built up over many conversation turns
 
-When in doubt, delegate. Sub-agents preserve your context window — doing significant work inline consumes it.
+This is a tradeoff, not a hard rule. Sub-agents always need context passed via the prompt, and your conversation context is always *somewhat* relevant. The question is whether the task is big enough that preserving your context window is worth the cost of summarizing context for the sub-agent. For any significant work, it almost always is. When in doubt, delegate.
 
 ## Always use blocking sub-agents
 
