@@ -844,9 +844,10 @@ async function pollOutgoingQueue(): Promise<void> {
                         if (firstSentId) {
                             // First chunk was edited in-place — store model and react
                             if (data.model) {
-                                // Store full text ONLY for multi-segment messages
-                                const fullText = chunks.length > 1 ? data.message : undefined;
-                                storeMessageModel(firstSentId, data.model, data.threadId, fullText);
+                                // Store full text for all messages (single and multi-segment)
+                                // This lets Listen button distinguish between fresh single-segment messages
+                                // and cache-evicted multi-segment messages
+                                storeMessageModel(firstSentId, data.model, data.threadId, data.message);
                                 await reactWithModel(pending.chatId, firstSentId, data.model);
                             }
                             // Send remaining chunks as new messages
@@ -1225,9 +1226,9 @@ bot.on("callback_query:data", async (ctx) => {
 
         try {
             // Show loading feedback
-            // If we're falling back to first segment (cache miss on multi-segment), warn user
-            const isFirstSegmentOnly = !messageModel?.fullText && ctx.callbackQuery.message?.text;
-            if (isFirstSegmentOnly) {
+            // Warn if message model exists but fullText is missing (cache eviction/old message)
+            const isCacheEvicted = messageModel && !messageModel.fullText;
+            if (isCacheEvicted) {
                 await ctx.answerCallbackQuery({
                     text: "⚠️ Full text not available (message too old), playing first segment only",
                     show_alert: true
