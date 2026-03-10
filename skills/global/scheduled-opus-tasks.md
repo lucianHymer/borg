@@ -14,20 +14,22 @@ When the user or another thread says things like:
 
 The `[use opus]` prefix in any message triggers the router to upgrade to opus regardless of content complexity. This works on any message source — user, cross-thread, system, or heartbeat-triggered.
 
-## The Pattern: Delegate to a Heartbeated Thread
+## The Pattern: Heartbeat Schedules, send_message Delivers
 
-Threads with heartbeats (main repo threads) already have a recurring ~8-minute check cycle with support for timed tasks via `@HH:MM` syntax in HEARTBEAT.md. This is the primary scheduling mechanism.
+Threads with heartbeats (main repo threads) have a recurring ~8-minute check cycle with `@HH:MM` timed task support in HEARTBEAT.md. This is the scheduling mechanism.
+
+**Critical detail:** Heartbeats always run as haiku — the cheapest model. A heartbeat cannot do opus-level work itself. Instead, the heartbeat's job is to **fire off a `send_message` with `[use opus]`** to the target thread. The `[use opus]` prefix triggers opus routing when the *target thread* processes the message.
 
 ### If you ARE a heartbeated thread (main thread)
 
-Add a timed task directly to your own HEARTBEAT.md:
+Add a timed task to your HEARTBEAT.md that sends a message:
 
 ```markdown
 ## Timed Tasks
-- @03:00 — Send `[use opus] Check portfolio status and report issues` to thread 1146 via send_message
+- @03:00 — Use send_message to thread 1146: `[use opus] Check portfolio status and report issues`
 ```
 
-The heartbeat processor will fire this at the specified time. After execution, remove or update the entry.
+The heartbeat (haiku) just fires the send_message. The target thread receives it and gets routed to opus.
 
 ### If you are NOT a heartbeated thread (team worker, etc.)
 
@@ -40,7 +42,7 @@ Ask a heartbeated thread to schedule it for you:
 Example message to send:
 > "Can you add a @03:00 timed task to your HEARTBEAT.md to send me (thread 482) this message via send_message: `[use opus] Review overnight trades and iterate on the strategy`"
 
-The main thread adds the entry, its heartbeat fires it at 3am, and your thread wakes up with an opus-routed message.
+The main thread's heartbeat (haiku) fires the send_message at 3am. Your thread receives it and processes with opus.
 
 ### Immediate (no scheduling needed)
 
