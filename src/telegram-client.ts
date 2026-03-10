@@ -30,6 +30,7 @@ const SCRIPT_DIR = path.resolve(__dirname, "..");
 const QUEUE_INCOMING = path.join(SCRIPT_DIR, ".borg/queue/incoming");
 const QUEUE_OUTGOING = path.join(SCRIPT_DIR, ".borg/queue/outgoing");
 const QUEUE_DEAD_LETTER = path.join(SCRIPT_DIR, ".borg/queue/dead-letter");
+const QUEUE_CANCEL = path.join(SCRIPT_DIR, ".borg/queue/cancel");
 const LOG_FILE = path.join(SCRIPT_DIR, ".borg/logs/telegram.log");
 const MESSAGE_MODELS_FILE = path.join(SCRIPT_DIR, ".borg/message-models.json");
 const QUEUE_STATUS = path.join(SCRIPT_DIR, ".borg/status");
@@ -61,7 +62,7 @@ function isDuplicate(threadId: number, senderId: string, text: string): boolean 
 
 // ─── Ensure Directories Exist ───
 
-[QUEUE_INCOMING, QUEUE_OUTGOING, QUEUE_DEAD_LETTER, QUEUE_STATUS, path.dirname(LOG_FILE), path.dirname(MESSAGE_MODELS_FILE)].forEach(
+[QUEUE_INCOMING, QUEUE_OUTGOING, QUEUE_DEAD_LETTER, QUEUE_CANCEL, QUEUE_STATUS, path.dirname(LOG_FILE), path.dirname(MESSAGE_MODELS_FILE)].forEach(
     (dir) => {
         if (!fs.existsSync(dir)) {
             fs.mkdirSync(dir, { recursive: true });
@@ -171,6 +172,7 @@ interface PendingMessage {
 }
 
 const pendingMessages = new Map<string, PendingMessage>();
+const telegramToQueueId = new Map<number, string>(); // Telegram message_id → queue messageId
 const listenInFlight = new Set<number>(); // track message IDs being processed for TTS
 const voiceButtonsInFlight = new Set<string>(); // track voice button callbacks being processed
 
@@ -467,6 +469,7 @@ bot.on("message:text").filter(
             threadId,
             telegramMessageId: ctx.msg.message_id,
         });
+        telegramToQueueId.set(ctx.msg.message_id, messageId);
 
         // React with 👀 to acknowledge we've seen the message
         try {
@@ -482,6 +485,85 @@ bot.on("message:text").filter(
         );
     },
 );
+
+// ─── Edited Message Handler ───
+
+bot.on("edited_message:text", async (ctx) => {
+    const editedMsg = ctx.editedMessage;
+    if (!editedMsg || ctx.from.id === bot.botInfo.id) return;
+
+    const telegramMsgId = editedMsg.message_id;
+    const queueMessageId = telegramToQueueId.get(telegramMsgId);
+    if (!queueMessageId) return; // Not a tracked message — ignore silently
+
+    const newText = editedMsg.text?.trim() ?? "";
+
+    // Check if it's still queued (file in incoming/)
+    const queueFile = path.join(QUEUE_INCOMING, `telegram_${queueMessageId}.json`);
+    if (fs.existsSync(queueFile)) {
+        if (newText === "") {
+            // Empty edit = delete the queued message
+            try {
+                fs.unlinkSync(queueFile);
+                pendingMessages.delete(queueMessageId);
+                telegramToQueueId.delete(telegramMsgId);
+                log("INFO", `Deleted queued message ${queueMessageId} (edited to empty)`);
+                await bot.api.setMessageReaction(ctx.chat!.id, telegramMsgId,
+                    [{ type: "emoji", emoji: "👌" as any }]).catch(() => {});
+            } catch {
+                log("WARN", `Failed to delete queued message file for ${queueMessageId}`);
+            }
+        } else {
+            // Rewrite the queue file with updated text
+            try {
+                const raw = JSON.parse(fs.readFileSync(queueFile, "utf8"));
+                raw.message = newText;
+                const tmpFile = queueFile + ".tmp";
+                fs.writeFileSync(tmpFile, JSON.stringify(raw, null, 2));
+                fs.renameSync(tmpFile, queueFile);
+                log("INFO", `Updated queued message ${queueMessageId}: ${newText.substring(0, 80)}`);
+                await bot.api.setMessageReaction(ctx.chat!.id, telegramMsgId,
+                    [{ type: "emoji", emoji: "✍" as any }]).catch(() => {});
+            } catch {
+                log("WARN", `Failed to rewrite queued message file for ${queueMessageId}`);
+            }
+        }
+        return;
+    }
+
+    // Check if it's currently processing (file in processing/)
+    const processingFile = path.join(
+        SCRIPT_DIR, ".borg/queue/processing", `telegram_${queueMessageId}.json`,
+    );
+    if (fs.existsSync(processingFile)) {
+        const pending = pendingMessages.get(queueMessageId);
+        if (pending) {
+            // Read original text from processing file
+            let originalText = "";
+            try {
+                const raw = JSON.parse(fs.readFileSync(processingFile, "utf8"));
+                originalText = raw.message ?? "";
+            } catch { /* best effort */ }
+
+            const warning = originalText
+                ? `⚠️ Edit received but already processing. Original text was:\n\n${originalText}`
+                : `⚠️ Edit received but already processing.`;
+
+            const threadOpt = getThreadOpt(pending);
+            await bot.api.sendMessage(
+                pending.chatId,
+                warning,
+                {
+                    message_thread_id: threadOpt,
+                    reply_parameters: { message_id: telegramMsgId },
+                },
+            ).catch(() => {});
+        }
+        return;
+    }
+
+    // Already done — ignore silently
+});
 
 // ─── Broadcast Group Listener ───
 
@@ -1106,6 +1188,7 @@ function cleanupPendingMessages(): void {
             } catch { /* best effort */ }
 
             pendingMessages.delete(messageId);
+            telegramToQueueId.delete(pending.telegramMessageId);
             log("DEBUG", `Cleaned up stale pending message: ${messageId}`);
         }
     }
@@ -1165,6 +1248,10 @@ async function pollStatusFiles(): Promise<void> {
         // Throttle: label/preview changes edit immediately, timer-only throttle to 20s
         if (!labelChanged && !previewChanged && !isStale && timeSinceLastEdit < 20_000) continue;
 
+        const cancelKeyboard = statusData.label !== "Cancelled"
+            ? new InlineKeyboard().text("✕ Cancel", `cancel:${messageId}`)
+            : undefined;
+
         try {
             if (pending.statusMessageId) {
                 // Edit existing status message
@@ -1172,6 +1259,7 @@ async function pollStatusFiles(): Promise<void> {
                     pending.chatId,
                     pending.statusMessageId,
                     displayText,
+                    { reply_markup: cancelKeyboard },
                 );
             } else {
                 // Send new status message as reply to original
@@ -1183,6 +1271,7 @@ async function pollStatusFiles(): Promise<void> {
                     displayText,
                     {
                         message_thread_id: getThreadOpt(pending),
+                        reply_markup: cancelKeyboard,
                         ...replyOpts,
                     },
                 );
@@ -1268,6 +1357,29 @@ bot.on("message_reaction", async (ctx) => {
 
 bot.on("callback_query:data", async (ctx) => {
     const data = ctx.callbackQuery.data;
+
+    // ─── Cancel Button (abort running SDK process) ───
+    if (data.startsWith("cancel:")) {
+        const queueMessageId = data.replace("cancel:", "");
+        const pending = pendingMessages.get(queueMessageId);
+        if (!pending) {
+            await ctx.answerCallbackQuery({ text: "Processing already finished" });
+            return;
+        }
+
+        // Write cancel signal file for queue-processor to pick up
+        const cancelFile = path.join(QUEUE_CANCEL, `${queueMessageId}.json`);
+        const tmpFile = cancelFile + ".tmp";
+        try {
+            fs.writeFileSync(tmpFile, JSON.stringify({ ts: Date.now() }));
+            fs.renameSync(tmpFile, cancelFile);
+            await ctx.answerCallbackQuery({ text: "Cancelling..." });
+            log("INFO", `Cancel signal written for ${queueMessageId}`);
+        } catch {
+            await ctx.answerCallbackQuery({ text: "Failed to cancel" });
+        }
+        return;
+    }
 
     // ─── Listen Button (TTS of bot response) ───
     if (data.startsWith("listen:")) {

@@ -11,6 +11,7 @@
 - @architecture/image-message-support-download-and-read-tool-pattern.md
 - @architecture/skills-directory-structure-global-vs-workflows.md
 - @architecture/broadcast-system-cross-repo-knowledge-sharing.md
+- @architecture/cancel-signal-file-pattern-for-sdk-interruption.md
 
 ## Patterns
 - @patterns/distillforspeech-uses-agent-sdk-query-not-raw-fetch.md
@@ -19,6 +20,8 @@
 - @patterns/message-history-deduplication-by-messageid.md
 - @patterns/cross-thread-message-handling.md
 - @patterns/telegram-markdownv2-conversion-pattern.md
+- @patterns/queue-message-coalescing-per-thread.md
+- @patterns/edit-pending-messages-telegram-to-queue-mapping.md
 
 ## Api
 - @api/telegram-bot-api-reaction-feature-details.md
@@ -34,3 +37,5 @@
 - @gotchas/speaches-container-handles-request-queuing-internally.md
 - @gotchas/stall-detection-must-use-absolute-time-not-per-event.md
 - @gotchas/message-history-dedup-must-check-direction.md
+- @gotchas/growing-preview-must-show-tail-not-head.md
+- @gotchas/github-app-token-cannot-approve-own-prs.md
