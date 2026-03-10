@@ -189,7 +189,7 @@ export const canUseTool: CanUseTool = async (toolName, input) => {
     if (toolName === "CronCreate" || toolName === "CronDelete" || toolName === "CronList") {
         return {
             behavior: "deny",
-            message: "Cron tools are session-only and won't survive restarts. Use the scheduled-opus-tasks pattern instead: add a @HH:MM timed task to your HEARTBEAT.md that fires a send_message with [use opus]. See ~/.claude/skills/scheduled-opus-tasks.md for details.",
+            message: "Cron tools are session-only and won't survive restarts. Read ~/.claude/skills/scheduled-opus-tasks.md for how to schedule tasks durably.",
         };
     }
     if (toolName === "EnterPlanMode" || toolName === "ExitPlanMode") {
