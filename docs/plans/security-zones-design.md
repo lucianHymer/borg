@@ -201,7 +201,9 @@ services:
     networks: [internal]
 ```
 
-**Note:** Core and perimeter both mount their zone storage at `/app/.borg` so existing code paths work unchanged. threads.json is a single shared bind-mount.
+**threads.json is a single host file bind-mounted into all 3 containers.** All containers read/write the same inode on the host. The existing atomic write pattern (tmp+rename) prevents partial reads. This is the same concurrency model used today (telegram-client and queue-processor already share threads.json in the current single container).
+
+**Note:** Core and perimeter both mount their zone storage at `/app/.borg` so existing code paths work unchanged.
 
 ## 4. Resolved Questions
 
