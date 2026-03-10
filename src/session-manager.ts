@@ -186,6 +186,12 @@ export const canUseTool: CanUseTool = async (toolName, input) => {
             message: "No human is available. State what you need in your response text.",
         };
     }
+    if (toolName === "CronCreate" || toolName === "CronDelete" || toolName === "CronList") {
+        return {
+            behavior: "deny",
+            message: "Cron tools are session-only and won't survive restarts. Read ~/.claude/skills/scheduled-opus-tasks.md for how to schedule tasks durably.",
+        };
+    }
     if (toolName === "EnterPlanMode" || toolName === "ExitPlanMode") {
         return {
             behavior: "deny",
