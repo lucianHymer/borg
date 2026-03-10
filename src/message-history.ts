@@ -46,8 +46,9 @@ function isDuplicate(entry: MessageHistoryEntry, recentEntries: MessageHistoryEn
     const normalizedId = normalizeMessageId(entry.messageId);
 
     for (const existing of recentEntries) {
-        // Match by messageId if both have it
-        if (normalizedId && existing.messageId) {
+        // Match by messageId if both have it AND same direction
+        // (incoming and outgoing share the same messageId — they're not duplicates)
+        if (normalizedId && existing.messageId && entry.direction === existing.direction) {
             const existingNormalizedId = normalizeMessageId(existing.messageId);
             if (normalizedId === existingNormalizedId) {
                 return true;
