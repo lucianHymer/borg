@@ -300,12 +300,13 @@ const bot = new Bot<Context>(settings.telegram_bot_token);
 async function sendInThread(
     pending: PendingMessage,
     text: string,
+    parseMode?: "MarkdownV2",
 ): Promise<{ message_id: number }> {
     const threadId = getThreadOpt(pending);
     if (pending.ctx) {
-        return pending.ctx.reply(text, { message_thread_id: threadId });
+        return pending.ctx.reply(text, { message_thread_id: threadId, parse_mode: parseMode });
     }
-    return bot.api.sendMessage(pending.chatId, text, { message_thread_id: threadId });
+    return bot.api.sendMessage(pending.chatId, text, { message_thread_id: threadId, parse_mode: parseMode });
 }
 
 /** Resolve the Telegram message_thread_id for a pending message */
@@ -866,7 +867,9 @@ async function pollOutgoingQueue(): Promise<void> {
                             fs.unlinkSync(statusFile);
                         } catch { /* may not exist */ }
 
-                        const chunks = splitMessage(data.message);
+                        // Convert Claude's GFM output to Telegram MarkdownV2
+                        const markdownV2Response = toTelegramMarkdownV2(data.message);
+                        const chunks = splitMessage(markdownV2Response);
 
                         if (pending.statusMessageId && chunks.length > 0) {
                             // Edit the status message in-place with the first chunk
@@ -875,6 +878,7 @@ async function pollOutgoingQueue(): Promise<void> {
                                     pending.chatId,
                                     pending.statusMessageId,
                                     chunks[0],
+                                    { parse_mode: "MarkdownV2" },
                                 );
                                 firstSentId = pending.statusMessageId;
                             } catch {
@@ -894,7 +898,7 @@ async function pollOutgoingQueue(): Promise<void> {
                             }
                             // Send remaining chunks as new messages
                             for (let i = 1; i < chunks.length; i++) {
-                                const sent = await sendInThread(pending, chunks[i]);
+                                const sent = await sendInThread(pending, chunks[i], "MarkdownV2");
                                 if (data.model) {
                                     storeMessageModel(sent.message_id, data.model, data.threadId);
                                 }
@@ -902,7 +906,7 @@ async function pollOutgoingQueue(): Promise<void> {
                         } else {
                             // No status message or edit failed — send all chunks normally
                             for (const chunk of chunks) {
-                                const sent = await sendInThread(pending, chunk);
+                                const sent = await sendInThread(pending, chunk, "MarkdownV2");
                                 if (!firstSentId) {
                                     firstSentId = sent.message_id;
                                     // Store full text ONLY for multi-segment messages, on the first segment
@@ -943,13 +947,14 @@ async function pollOutgoingQueue(): Promise<void> {
 
                         // Fallback: send to the configured chat, routing to the correct thread
                         const chatId = settings.telegram_chat_id;
-                        const chunks = splitMessage(data.message);
+                        const markdownV2Fallback = toTelegramMarkdownV2(data.message);
+                        const chunks = splitMessage(markdownV2Fallback);
                         const threadOpt = data.threadId && data.threadId !== 1
                             ? { message_thread_id: data.threadId }
                             : {};
 
                         for (const chunk of chunks) {
-                            const sent = await bot.api.sendMessage(chatId, chunk, threadOpt);
+                            const sent = await bot.api.sendMessage(chatId, chunk, { ...threadOpt, parse_mode: "MarkdownV2" });
                             if (!firstSentId) {
                                 firstSentId = sent.message_id;
                                 // Store full text ONLY for multi-segment messages, on the first segment
