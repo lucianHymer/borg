@@ -1124,7 +1124,7 @@ async function processMessage(messageFile: string): Promise<void> {
                 onTextContent(text: string) {
                     // Accumulate text blocks as preview (growing preview)
                     const accumulated = currentPreview ? currentPreview + "\n\n" + text : text;
-                    currentPreview = accumulated.length > 500 ? accumulated.slice(0, 500) + "…" : accumulated;
+                    currentPreview = accumulated.length > 500 ? "…" + accumulated.slice(-500) : accumulated;
                 },
             };
 
