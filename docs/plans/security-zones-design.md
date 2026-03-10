@@ -7,7 +7,7 @@
 
 ## 1. Problem Statement
 
-All Borg threads run in a single container with full permissions. A socially-engineered agent (e.g. one reading Twitter/Reddit) could trick other agents into leaking secrets, accessing repos, or doing damage. We need container-level isolation between trusted and untrusted agents.
+All Borg threads run in a single container with full permissions. A socially-engineered agent (e.g. one reading Twitter) could trick other agents into leaking secrets, accessing repos, or doing damage. We need container-level isolation between trusted and untrusted agents.
 
 ## 2. Architecture
 
@@ -17,19 +17,17 @@ All Borg threads run in a single container with full permissions. A socially-eng
 |-----------|----------|-------------|
 | **infra** | telegram-client + queue-processor (no agent sessions, no SDK, pure deterministic routing) | Highest — routes everything |
 | **core** | Agent SDK sessions for trusted threads | High — repos, trading, writing |
-| **perimeter** | Agent SDK sessions for untrusted threads | Low — social media, web-facing |
+| **perimeter** | Agent SDK sessions for untrusted threads (e.g. Twitter agent) | Low — social media, web-facing |
 
-**Why infra is separate:** Zone containers need full freedom — sudo, read all messages in their zone, full filesystem access within their zone. If routing code runs inside a zone container, that container sees raw unrouted messages from ALL zones before approval has happened. Infra must be a separate container so it's the only thing that sees cross-zone traffic before approval.
+**Why infra is separate:** Zone containers need full freedom — sudo, read all messages in their zone, full filesystem access. If routing code runs inside a zone container, that container sees raw unrouted messages from ALL zones before approval. Infra must be separate so it's the only thing that sees cross-zone traffic before approval.
 
-**Infra is dumb plumbing.** Not a repo, not a thinking participant, not messageable. It runs:
-- Queue processor (Node.js routing code, no SDK, no agents)
-- Telegram client (grammY bot, no SDK)
+**Infra is dumb plumbing.** Not a repo, not a thinking participant, not messageable. Pure deterministic code. No knowledge accumulation, no learning. Zone enforcement is mechanical: check zone-config.json, route or hold.
 
-Pure deterministic code. No knowledge accumulation, no learning. Zone enforcement is mechanical: check zone-config.json, route or hold.
+**Zones are invisible to agents.** Agents don't know about zones. They see all threads, send messages to any thread, and use the same MCP tools as today. The only difference is that cross-zone messages take longer because a human approves them. All zone enforcement happens in Docker (filesystem isolation) and infra (routing).
 
 ### 2.2 Zone Configuration
 
-`zone-config.json` — owned by infra, read-only to zone containers. Agents see their zone in their system prompt but cannot change it. Human-editable via dashboard or direct file edit.
+`zone-config.json` — used by infra's router to decide whether a message crosses zones. Human-editable via dashboard or direct file edit.
 
 ```json
 {
@@ -45,14 +43,18 @@ Pure deterministic code. No knowledge accumulation, no learning. Zone enforcemen
 
 ### 2.3 Cross-Zone Messaging
 
-`send_message` feels identical to agents — they don't need to know about zones. The routing layer handles it:
+`send_message` feels identical to agents — they don't know about zones:
 
 - **Same-zone** → direct queue write (like today)
 - **Cross-zone** → message held in pending queue, Telegram inline keyboard shown to human (Approve / Reject), delivered on approve
 
-Agents can see ALL threads via `list_threads` regardless of zone. The whole point is agents should proactively message each other cross-zone — they just need human approval to do so.
+Agents can see ALL threads via `list_threads` regardless of zone. The whole point is agents should proactively message each other — they just need human approval for cross-zone delivery.
 
-### 2.4 Per-Zone Storage
+### 2.4 Pending Approval Reminders
+
+Infra runs a daily scan of the pending approval queue. Any unapproved cross-zone messages are summarized and posted to the master thread's Telegram topic with links to the original approval messages. This prevents approvals from getting lost in message history.
+
+### 2.5 Per-Zone Storage
 
 Each zone gets its own `.borg-{zone}/` directory:
 
@@ -73,63 +75,58 @@ Each zone gets its own `.borg-{zone}/` directory:
   └── (same structure)
 
 .borg-infra/
-  ├── threads.json          # infra-owned, zones read-only
-  ├── zone-config.json      # infra-owned, zones read-only
+  ├── zone-config.json      # zone routing rules
   ├── queue/pending/        # cross-zone messages awaiting approval
   ├── message-models.json   # routing metadata
   └── logs/routing.jsonl    # routing decisions
 ```
 
-**Key principle:** Each zone container mounts ONLY its own `.borg-{zone}/` directory read-write, plus `.borg-infra/threads.json` and `.borg-infra/zone-config.json` read-only. Infra mounts everything.
+**threads.json** stays as a single shared file, writable by all containers — same as today. Agents manage it via MCP tools (configure_thread, create_thread, delete_thread) exactly as before. No ownership change needed. Zone isolation comes from Docker filesystem boundaries, not from restricting threads.json access.
 
-### 2.5 Broadcast Handling
+**Key principle:** Each zone container mounts its own `.borg-{zone}/` as `/app/.borg` so existing code paths work unchanged. Agents can't see the other zone's queue or message history because Docker doesn't mount it.
+
+### 2.6 Broadcast Handling
 
 **Broadcasts are core-only** for both sending and receiving:
 
-- **Receiving:** Only `mainThread: true` threads in the core zone receive broadcast fan-outs. Perimeter threads don't need cross-repo knowledge to do their jobs. Keeping them ignorant of repo internals limits what an attacker can extract.
-- **Sending:** The `broadcast` MCP tool is only available to core threads. Perimeter threads don't have it.
-- **Perimeter wants to broadcast?** Option C — message a core thread (cross-zone approval), core agent decides whether to broadcast. Two layers of review for the highest-risk operation.
+- **Receiving:** Only `mainThread: true` threads in the core zone receive broadcast fan-outs. Infra enforces this by checking zone-config.json during fan-out.
+- **Sending:** The `broadcast` MCP tool only exists in core's queue-processor. Perimeter's queue-processor doesn't register it.
+- **Perimeter wants to broadcast?** Message a core thread (cross-zone approval), core agent decides whether to broadcast. Two layers of review.
 
 ## 3. Detailed Design
 
-### 3.1 MCP Tool Access by Zone
+### 3.1 What Changes for Agents: Almost Nothing
 
-| Tool | Core | Perimeter | Notes |
-|------|------|-----------|-------|
-| `send_message` | ✅ | ✅ | Cross-zone triggers approval |
-| `list_threads` | ✅ (all zones) | ✅ (all zones) | Shows zone labels so agents know context |
-| `query_knowledge_base` | ✅ | ❌ | Reads master thread's knowledge — core-only |
-| `create_thread` | ✅ (core zone) | ✅ (perimeter zone) | New threads inherit creator's zone |
-| `configure_thread` | Same-zone only | Same-zone only | Can't modify cross-zone threads |
-| `delete_thread` | Same-zone only | Same-zone only | Can't delete cross-zone threads |
-| `get_container_stats` | ✅ | ❌ | Infrastructure visibility |
-| `get_host_memory` | ✅ | ❌ | |
-| `get_system_status` | ✅ | ❌ | |
-| `get_current_time` | ✅ | ✅ | Harmless utility |
-| `get_elapsed_time` | ✅ | ✅ | Harmless utility |
-| `create_dev_container` | Master only | ❌ | |
-| `broadcast` | ✅ | ❌ | Perimeter uses Option C (ask core to broadcast) |
+Agents don't need to know about zones. The zone boundary is enforced by:
+1. **Docker** — filesystem isolation (each zone only sees its own `.borg-{zone}/`)
+2. **Infra router** — holds cross-zone messages for approval
+3. **Infra broadcast handler** — filters fan-out to core-zone mainThread threads
 
-**Implementation:** `createBorgMcpServer(sourceThreadId)` already takes a thread ID. Add zone lookup and filter tools based on zone. `list_threads` includes a `zone` field in output.
+Agents use the same MCP tools, same threads.json, same patterns. The only MCP difference: perimeter's queue-processor doesn't register `broadcast` (since the broadcast Telegram group credentials are only in infra, and infra only fans out to core).
 
-### 3.2 Thread Lifecycle
+### 3.2 How list_threads Works Cross-Zone
 
-**Creation:** `create_thread` assigns new thread to creator's zone. Perimeter agent creating a thread gets a perimeter thread. Entry added to both `threads.json` and `zone-config.json`.
+`list_threads` reads the shared `threads.json` (mounted in all containers). It returns ALL threads like today. No zone filtering needed. Agents see the full picture and can send messages to any thread.
 
-**Deletion:** `delete_thread` removes from both files. Same-zone only.
+### 3.3 How Cross-Zone Routing Works
 
-**Zone migration:** Manual operation (human edits zone-config.json or uses dashboard). Requires session reset since system prompt changes. Intentionally hard — zone changes should be rare and deliberate.
+When infra receives an outgoing `send_message` from a zone container:
 
-### 3.3 The `threads.json` Ownership Question
+1. Look up sender's zone and target's zone in zone-config.json
+2. **Same zone?** → Write to target zone's `queue/incoming/` (direct delivery, like today)
+3. **Cross zone?** → Write to `.borg-infra/queue/pending/` + show Telegram inline keyboard (Approve / Reject) with sender info and message preview
+4. **On approve** → Move from pending to target zone's `queue/incoming/`
+5. **On reject** → Notify sender (write to sender zone's `queue/incoming/` with rejection notice)
 
-Currently agents can write `threads.json` via MCP tools (saveThreads). A compromised agent could:
-- Change its own `cwd` to a sensitive directory
-- Change another thread's `sessionId` to hijack its session
-- Set `mainThread: true` to receive broadcasts
+### 3.4 Thread Lifecycle
 
-**Solution:** `threads.json` lives in `.borg-infra/`, mounted read-only to zone containers. MCP tools that modify thread state (configure_thread, create_thread, delete_thread) write to a request queue in the zone's directory; infra processes and applies validated changes.
+**Creation:** `create_thread` works like today (MCP tool creates Telegram topic, adds to threads.json). Infra adds the new thread to zone-config.json in the creator's zone (determined by which zone container the MCP call came from).
 
-### 3.4 Credential Isolation
+**Deletion:** `delete_thread` works like today. Infra removes from zone-config.json.
+
+**Zone migration:** Manual operation (human edits zone-config.json via dashboard). Session reset recommended since the agent moves to a different container.
+
+### 3.5 Credential Isolation
 
 | Credential | Core | Perimeter | Infra |
 |------------|------|-----------|-------|
@@ -139,54 +136,45 @@ Currently agents can write `threads.json` via MCP tools (saveThreads). A comprom
 | SSH keys | ✅ | ❌ | ❌ |
 | Docker proxy | ✅ | ❌ | ❌ |
 
-### 3.5 Heartbeat
+### 3.6 Heartbeat
 
 - **Core container** runs heartbeats for core threads
 - **Perimeter container** runs heartbeats for perimeter threads (if any need them)
 - **Infra** does NOT run heartbeats (no agent sessions)
 
-### 3.6 Message History Isolation
+### 3.7 Message History Isolation
 
-- Each zone has its own `message-history.jsonl` — agents `grep` their zone's log only
+- Each zone has its own `message-history.jsonl` — agents grep their zone's log only
 - Cross-zone messages (after approval): logged in BOTH zone histories (sender's outgoing + recipient's incoming)
-- Infra mounts both read-only for routing decisions
-
-### 3.7 Session Management Decomposition
-
-Current `session-manager.ts` mixes infrastructure and agent knowledge. Split into:
-
-1. **`thread-config.ts`** — ThreadConfig type, load/save threads.json, zone-config.json loader
-2. **`system-prompts.ts`** — System prompt building, teammate resolution (agent knowledge)
-3. **`session-lifecycle.ts`** — Session create/resume/sync (infrastructure)
-
-This reduces coupling and makes the container split cleaner.
+- Infra writes to both zones' history files when delivering cross-zone messages
 
 ### 3.8 Dashboard
 
 - Mounts `.borg-core:ro`, `.borg-perimeter:ro`, `.borg-infra:ro`
 - Shows zone labels on threads
 - Zone filter in UI
-- Zone-config.json editor (human zone management)
-- Cross-zone pending approvals visible in dashboard
+- zone-config.json editor (human zone management)
+- Pending cross-zone approvals visible
 
 ### 3.9 Docker Compose Layout
 
 ```yaml
 services:
   infra:
-    # telegram-client + queue-processor
+    # telegram-client + queue-processor (routing only, no SDK)
     volumes:
       - .borg-infra:/app/.borg-infra
       - .borg-core:/app/.borg-core        # read-write (routes messages)
       - .borg-perimeter:/app/.borg-perimeter  # read-write (routes messages)
+      - ./threads.json:/app/threads.json   # shared, read-write
     networks: [internal]
 
   core:
     # Agent SDK sessions for core threads
     volumes:
       - .borg-core:/app/.borg              # read-write (own zone)
-      - .borg-infra/threads.json:/app/.borg-infra/threads.json:ro
-      - .borg-infra/zone-config.json:/app/.borg-infra/zone-config.json:ro
+      - ./threads.json:/app/threads.json   # shared, read-write
+      - .borg-infra/zone-config.json:/app/zone-config.json:ro
       - ${WORKSPACE_ROOT}:${WORKSPACE_ROOT}
       - ./secrets/github-installations.json:/secrets/github-installations.json:ro
       - ${CLAUDE_CREDENTIALS}:/home/node/.claude/.credentials.json
@@ -197,8 +185,8 @@ services:
     # Agent SDK sessions for perimeter threads
     volumes:
       - .borg-perimeter:/app/.borg         # read-write (own zone)
-      - .borg-infra/threads.json:/app/.borg-infra/threads.json:ro
-      - .borg-infra/zone-config.json:/app/.borg-infra/zone-config.json:ro
+      - ./threads.json:/app/threads.json   # shared, read-write
+      - .borg-infra/zone-config.json:/app/zone-config.json:ro
       - ${WORKSPACE_ROOT}:${WORKSPACE_ROOT}
       - ./secrets/github-installations.json:/secrets/github-installations.json:ro
       - ${CLAUDE_CREDENTIALS}:/home/node/.claude/.credentials.json
@@ -206,54 +194,52 @@ services:
     networks: [internal]
 ```
 
-**Note:** Core and perimeter both mount their zone storage at `/app/.borg` so existing code paths work unchanged. They just can't see the other zone's data.
+**Note:** Core and perimeter both mount their zone storage at `/app/.borg` so existing code paths work unchanged. threads.json is a single shared bind-mount.
 
 ## 4. Resolved Questions
 
-1. **Perimeter has GitHub access.** GitHub App installations already prevent pushing to main/production branches. Safe for perimeter.
-2. **Dev teams won't span zones** in practice — not worth building enforcement for.
-3. **Planned perimeter threads:** Twitter agent (reads/learns from Twitter). This is the motivating use case — external social media input that could be used for social engineering.
+1. **Perimeter has GitHub access.** Branch protection prevents push to main/production. Safe.
+2. **Dev teams won't span zones** in practice — no enforcement needed.
+3. **Planned perimeter threads:** Twitter agent (reads/learns from Twitter).
+4. **threads.json stays shared and writable.** No ownership change. Zone isolation is Docker-level, not file-level.
+5. **Agents don't know about zones.** No zone labels in prompts, no MCP tool filtering (except broadcast). Zones are infrastructure-only.
 
 ## 5. Risks
 
 | Risk | Likelihood | Impact | Mitigation |
 |------|-----------|--------|------------|
-| Session manager split introduces bugs | Medium | High | Extensive testing, validate before deploy |
-| threads.json write from agents bypasses zones | High (if not addressed) | Critical | Move to infra-owned, MCP-mediated access |
 | Cross-zone approval UX is annoying | Medium | Medium | Start with few perimeter threads, tune later |
-| Three containers increase memory usage | Low | Medium | Core+perimeter share base image, SDK sessions are the real cost |
+| Pending approvals get lost | Medium | Medium | Daily infra reminder to master thread |
+| Three containers increase memory | Low | Medium | Core+perimeter share base image, SDK sessions are the real cost |
+| threads.json concurrent writes from 3 containers | Low | Low | Atomic tmp+rename already handles this |
 
 ## 6. Implementation Tasks
 
 All done in a single phase — containers, storage, and routing land together.
 
-1. Create `zone-config.json` schema and loader (`zone-config.ts`)
-2. Add zone label to agent system prompts
-3. `list_threads` shows all zones with zone labels
-4. Implement cross-zone `send_message` hold + Telegram inline keyboard approval
-5. Filter MCP tools by zone (restrict perimeter access per table above)
-6. Enforce broadcast delivery to core-zone `mainThread` threads only
-7. Split session-manager.ts into thread-config, system-prompts, session-lifecycle
-8. Per-zone storage directories (`.borg-core/`, `.borg-perimeter/`, `.borg-infra/`)
-9. Move threads.json to infra-owned `.borg-infra/`
-10. Create Dockerfile.infra, Dockerfile.core, Dockerfile.perimeter
-11. Update docker-compose.yml with three containers + volume mounts
-12. Credential isolation per container
-13. Add zone column + filter to dashboard
-14. Write tests for zone-aware routing, MCP filtering, cross-zone approval
+1. Create `zone-config.json` schema and loader
+2. Cross-zone `send_message` hold + Telegram inline keyboard approval in infra
+3. Pending approval daily reminder to master thread
+4. Broadcast fan-out filtered to core-zone `mainThread` threads
+5. Broadcast MCP tool only registered in core's queue-processor
+6. Per-zone storage directories (`.borg-core/`, `.borg-perimeter/`, `.borg-infra/`)
+7. Dockerfiles for infra, core, perimeter
+8. docker-compose.yml with three containers + volume mounts + credential isolation
+9. Dashboard zone labels, filter, zone-config editor
+10. Tests for cross-zone routing, approval flow, broadcast filtering
 
 ## 7. Acceptance Criteria
 
 - [ ] Three containers running: infra, core, perimeter
-- [ ] Perimeter agent cannot read core's message history
-- [ ] Perimeter agent can list all threads (with zone labels) but not access core data
+- [ ] Perimeter agent cannot read core's message history (Docker isolation)
+- [ ] Agents can list all threads and send messages to any thread
 - [ ] Cross-zone `send_message` requires human approval via Telegram inline keyboard
 - [ ] Same-zone `send_message` works as today (no approval)
-- [ ] Zone assignment cannot be changed by agents
+- [ ] Daily reminder of pending cross-zone approvals sent to master thread
 - [ ] New threads inherit creator's zone (default: perimeter)
 - [ ] Broadcasts only reach core `mainThread` threads
-- [ ] Perimeter doesn't have broadcast MCP tool
-- [ ] threads.json is infra-owned, read-only to zones
+- [ ] Broadcast MCP tool not available in perimeter
+- [ ] threads.json shared and writable by all containers
 - [ ] Dashboard shows zone labels and supports zone filtering
-- [ ] Credential isolation enforced (no SSH/GitHub/docker-proxy in perimeter)
-- [ ] All existing single-zone functionality works unchanged (backward compatible)
+- [ ] Credential isolation enforced (no SSH/docker-proxy in perimeter)
+- [ ] All existing functionality works unchanged (backward compatible)
