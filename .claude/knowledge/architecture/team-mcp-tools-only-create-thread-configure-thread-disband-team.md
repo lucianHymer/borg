@@ -2,8 +2,8 @@
 
 The collaborative agent teams feature has 4 team-related MCP tools, plus 1 broadcast tool:
 
-1. **create_thread** — Creates Telegram forum topic via direct HTTP API + registers in threads.json
-2. **configure_thread** — Updates team/role metadata
+1. **create_thread** — Creates Telegram forum topic via direct HTTP API + registers in threads.json. Accepts `workflow` param (path to workflow skill file) — required for team threads so agents know which workflow to follow.
+2. **configure_thread** — Updates team/role/workflow metadata
 3. **disband_team** — Removes team association from all threads (soft cleanup, keeps topics)
 4. **delete_thread** — Permanently deletes Telegram forum topic + unregisters from threads.json (hard cleanup, makes topics ephemeral)
 

@@ -4,8 +4,13 @@ This skill maps generic team concepts to Borg's MCP tools.
 
 ## Creating Threads
 When a workflow says "create a thread for each role", use the `create_thread`
-MCP tool for each role. Set the team, role, and initialMessage fields.
+MCP tool for each role. Set the team, role, workflow, and initialMessage fields.
 Teammates are derived automatically from the shared `team` field — no manual setup needed.
+
+**You MUST set the `workflow` parameter** to the path of the workflow skill file
+(e.g., `workflow: ".claude/skills/workflows/dev-team.md"`). This tells the agent
+exactly which workflow to follow — without it, the agent has to guess from
+multiple workflow files and may pick the wrong one.
 
 ## Workspace Isolation (Worktrees)
 When a workflow says "create a git worktree for the team":
