@@ -150,6 +150,7 @@ export function createBorgMcpServer(sourceThreadId: number) {
                 const lines = Object.entries(threads).map(([id, t]) => {
                     const parts = [`Thread ${id}: ${t.name}`];
                     if (t.isMaster) parts.push("(master)");
+                    if (t.mainThread) parts.push("(mainThread)");
                     if (t.team) parts.push(`team=${t.team}`);
                     if (t.role) parts.push(`role=${t.role}`);
                     if (t.cwd) parts.push(`cwd=${t.cwd}`);
@@ -642,10 +643,12 @@ export function createBorgMcpServer(sourceThreadId: number) {
                 .describe("Agent role (lowercase alphanumeric + hyphens)"),
             cwd: z.string().optional()
                 .describe("Working directory for the thread. REQUIRED for team threads — set this to the absolute path of the team's git worktree (e.g., /absolute/path/.borg/worktrees/{team-name}). All team members must share the same cwd for proper isolation."),
+            mainThread: z.boolean().optional()
+                .describe("Mark as a main thread that receives broadcast fan-outs (only for long-lived threads, NOT team workers)"),
             initialMessage: z.string().optional()
                 .describe("First message to send to the new thread"),
         },
-        async ({ name, team, role, cwd, initialMessage }) => {
+        async ({ name, team, role, cwd, mainThread, initialMessage }) => {
             try {
                 const settings = loadSettings();
                 const threads = loadThreads();
@@ -717,6 +720,7 @@ export function createBorgMcpServer(sourceThreadId: number) {
                     lastActive: Date.now(),
                     ...(team ? { team } : {}),
                     ...(role ? { role } : {}),
+                    ...(mainThread ? { mainThread } : {}),
                 });
 
                 // Send initial message if provided
@@ -764,8 +768,10 @@ export function createBorgMcpServer(sourceThreadId: number) {
                 .describe("Team identifier"),
             role: z.string().min(1).max(64).regex(/^[a-z][a-z0-9-]*$/).optional()
                 .describe("Agent role"),
+            mainThread: z.boolean().optional()
+                .describe("Mark as a main thread that receives broadcast fan-outs"),
         },
-        async ({ threadId, team, role }) => {
+        async ({ threadId, team, role, mainThread }) => {
             try {
                 const threads = loadThreads();
                 if (!threads[String(threadId)]) {
@@ -774,8 +780,9 @@ export function createBorgMcpServer(sourceThreadId: number) {
                 configureThread(threadId, {
                     ...(team !== undefined ? { team } : {}),
                     ...(role !== undefined ? { role } : {}),
+                    ...(mainThread !== undefined ? { mainThread } : {}),
                 });
-                return { content: [textContent(`Updated thread ${threadId}: team=${team ?? "(unchanged)"}, role=${role ?? "(unchanged)"}`)] };
+                return { content: [textContent(`Updated thread ${threadId}: team=${team ?? "(unchanged)"}, role=${role ?? "(unchanged)"}, mainThread=${mainThread ?? "(unchanged)"}`)] };
             } catch (err) {
                 return { content: [textContent(`Failed: ${toErrorMessage(err)}`)], isError: true };
             }
@@ -876,6 +883,82 @@ export function createBorgMcpServer(sourceThreadId: number) {
         },
     );
 
+    const broadcastTool = tool(
+        "broadcast",
+        "Broadcast a knowledge message to all Borg instances via the shared broadcast Telegram group. Use this to share useful patterns, workflow changes, gotchas, or skills with other repos. Requires broadcast_chat_id in settings.json.",
+        {
+            type: z.enum(["workflow-change", "pattern", "gotcha", "skill", "config"])
+                .describe("Type of broadcast"),
+            repoName: z.string()
+                .describe("Name of the source repo (e.g., 'borg', 'my-project')"),
+            content: z.string()
+                .describe("The broadcast content — what changed, WHY it's useful, context on the problem it solves, how to adapt for other repos, and GitHub links to live code"),
+        },
+        async ({ type, repoName, content }) => {
+            try {
+                const settings = loadSettings();
+                if (!settings.broadcast_chat_id) {
+                    return {
+                        content: [textContent("broadcast_chat_id not configured in settings.json. Set it to the Telegram group ID for broadcasts.")],
+                        isError: true,
+                    };
+                }
+
+                const message = [
+                    `📡 Broadcast from [${repoName}]`,
+                    "",
+                    `**Type:** ${type}`,
+                    "",
+                    "---",
+                    "",
+                    content,
+                    "",
+                    "---",
+                    "",
+                    `⚠️ Recipients: This broadcast is from **${repoName}**. Evaluate whether`,
+                    `this applies to your repo before adapting. If you ARE ${repoName},`,
+                    `you already have these changes — skip this.`,
+                ].join("\n");
+
+                const response = await fetch(
+                    `https://api.telegram.org/bot${settings.telegram_bot_token}/sendMessage`,
+                    {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({
+                            chat_id: settings.broadcast_chat_id,
+                            text: message,
+                            parse_mode: "Markdown",
+                        }),
+                    }
+                );
+
+                if (!response.ok) {
+                    const errBody = await response.text();
+                    return {
+                        content: [textContent(`Telegram API error sending broadcast: ${errBody}`)],
+                        isError: true,
+                    };
+                }
+
+                const result = await response.json() as { ok: boolean };
+                if (!result.ok) {
+                    return {
+                        content: [textContent("Telegram API returned unexpected response")],
+                        isError: true,
+                    };
+                }
+
+                return { content: [textContent(`Broadcast sent to broadcast group (type: ${type}, repo: ${repoName})`)] };
+            } catch (err) {
+                return {
+                    content: [textContent(`Failed to send broadcast: ${toErrorMessage(err)}`)],
+                    isError: true,
+                };
+            }
+        },
+    );
+
     // Build tool list: base tools + read-only monitoring for all threads, mutating tools for master only
     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- heterogeneous tool schemas require type erasure
     const tools: Array<ReturnType<typeof tool<any>>> = [
@@ -884,6 +967,7 @@ export function createBorgMcpServer(sourceThreadId: number) {
         getRoutingDecisions,
         getCurrentTime, getElapsedTime,
         createThread, configureThreadTool, disbandTeam, deleteThread,
+        broadcastTool,
     ];
     if (sourceThreadId === 1) {
         tools.push(

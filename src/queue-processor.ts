@@ -49,7 +49,7 @@ import { z } from "zod/v4";
 
 // ─── Zod Schemas for Queue Messages ───
 
-const MessageSourceSchema = z.enum(["user", "cross-thread", "heartbeat", "cli", "system"]);
+const MessageSourceSchema = z.enum(["user", "cross-thread", "heartbeat", "cli", "system", "broadcast"]);
 
 const IncomingMessageSchema = z.object({
     channel: z.string(),
@@ -462,6 +462,7 @@ function buildSourcePrefix(msg: IncomingMessage): string {
         heartbeat: `[Heartbeat check-in]:`,
         cli: `[CLI message]:`,
         system: `[System event]:`,
+        broadcast: `[Broadcast]:`,
     };
     return prefixMap[msg.source ?? "user"];
 }

@@ -463,6 +463,55 @@ bot.on("message:text").filter(
     },
 );
 
+// ─── Broadcast Group Listener ───
+
+bot.on("message:text").filter(
+    (ctx) => {
+        // Only listen to the broadcast group (not the main Borg chat)
+        if (!settings.broadcast_chat_id) return false;
+        if (String(ctx.chat.id) !== settings.broadcast_chat_id) return false;
+        // Ignore our own messages
+        if (ctx.from.id === bot.botInfo.id) return false;
+        return true;
+    },
+    async (ctx) => {
+        const broadcastText = ctx.message.text;
+        log("INFO", `Broadcast received: ${broadcastText.substring(0, 80)}`);
+
+        // Fan-out to ALL mainThread:true threads
+        const threads = loadThreads();
+        const mainThreads = Object.entries(threads).filter(([, t]) => t.mainThread);
+
+        if (mainThreads.length === 0) {
+            log("INFO", "Broadcast received but no mainThread threads configured — skipping fan-out");
+            return;
+        }
+
+        for (const [threadIdStr] of mainThreads) {
+            const threadId = Number(threadIdStr);
+            const messageId = `broadcast_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+            // Prefix with [use opus] so router forces opus for evaluation
+            const queueData = {
+                channel: "telegram",
+                source: "broadcast" as const,
+                threadId,
+                sender: ctx.from.first_name ?? "Broadcast",
+                senderId: String(ctx.from.id),
+                message: `[use opus] ${broadcastText}`,
+                timestamp: Date.now(),
+                messageId,
+            };
+
+            const queueFile = path.join(QUEUE_INCOMING, `broadcast_${messageId}.json`);
+            const tmpFile = queueFile + ".tmp";
+            fs.writeFileSync(tmpFile, JSON.stringify(queueData, null, 2));
+            fs.renameSync(tmpFile, queueFile);
+
+            log("INFO", `Broadcast fan-out to mainThread ${threadId}`);
+        }
+    },
+);
+
 // ─── Voice Message Handler ───
 
 bot.on("message:voice").filter(

@@ -34,7 +34,7 @@ Agents communicate through the file queue system:
 
 ## Message Sources
 
-Queue messages carry a `source` field: `"user"`, `"cross-thread"`, `"heartbeat"`, `"cli"`, `"system"`.
+Queue messages carry a `source` field: `"user"`, `"cross-thread"`, `"heartbeat"`, `"cli"`, `"system"`, `"broadcast"`.
 
 ## Model Routing
 
@@ -48,6 +48,10 @@ Smart routing uses 14 weighted dimensions to classify messages as SIMPLE (haiku)
 - Atomic file writes: write to .tmp then rename
 - JSONL appends: use appendFileSync (O_APPEND safe on ext4)
 - Message history deduplication: appendHistory() deduplicates by messageId (strips `_tg` and `_retry\d+` suffixes), checks last ~50 entries, falls back to timestamp matching (5s window) for outgoing messages without messageId
+
+## Broadcasting
+
+Cross-repo knowledge sharing via a shared Telegram group. The `broadcast` MCP tool posts structured messages; incoming broadcasts fan out to all `mainThread: true` threads with `[use opus]` prefix. See `skills/global/broadcasting.md` for send/receive guidance. Requires `broadcast_chat_id` in settings.json and `mainThread: true` on primary repo threads.
 
 ## Build
 
