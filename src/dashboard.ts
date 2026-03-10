@@ -155,6 +155,28 @@ app.get("/api/threads", (_req, res) => {
     res.json(threads);
 });
 
+// GET /api/heartbeats — all threads' HEARTBEAT.md contents
+app.get("/api/heartbeats", (_req, res) => {
+    const threads = readJsonSafe<Record<string, { name?: string; cwd?: string }>>(
+        path.join(BORG_DIR, "threads.json"),
+        {},
+    );
+    const results = Object.entries(threads).map(([id, cfg]) => {
+        const cwd = cfg.cwd;
+        let content: string | null = null;
+        let exists = false;
+        if (cwd) {
+            const heartbeatPath = path.join(cwd, "HEARTBEAT.md");
+            if (fs.existsSync(heartbeatPath)) {
+                exists = true;
+                try { content = fs.readFileSync(heartbeatPath, "utf8"); } catch { content = null; }
+            }
+        }
+        return { threadId: parseInt(id, 10), name: cfg.name || `Thread ${id}`, cwd: cwd || null, exists, content };
+    });
+    res.json(results);
+});
+
 // GET /api/threads/:id/messages — message history filtered by threadId
 app.get("/api/threads/:id/messages", (req, res) => {
     const threadId = parseInt(req.params.id, 10);
