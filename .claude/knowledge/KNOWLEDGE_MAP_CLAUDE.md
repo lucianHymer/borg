@@ -12,6 +12,7 @@
 - @architecture/skills-directory-structure-global-vs-workflows.md
 - @architecture/broadcast-system-cross-repo-knowledge-sharing.md
 - @architecture/cancel-signal-file-pattern-for-sdk-interruption.md
+- @architecture/security-zones-container-isolation.md
 
 ## Patterns
 - @patterns/distillforspeech-uses-agent-sdk-query-not-raw-fetch.md
