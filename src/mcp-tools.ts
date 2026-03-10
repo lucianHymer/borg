@@ -1025,8 +1025,12 @@ export function createBorgMcpServer(sourceThreadId: number) {
         getRoutingDecisions,
         getCurrentTime, getElapsedTime,
         createThread, configureThreadTool, disbandTeam, deleteThread,
-        broadcastTool,
     ];
+    // Broadcast tool only available in core zone (or when no zone config / single container)
+    const borgZone = process.env.BORG_ZONE;
+    if (!borgZone || borgZone === "core") {
+        tools.push(broadcastTool);
+    }
     if (sourceThreadId === 1) {
         tools.push(
             updateContainerMemory,
