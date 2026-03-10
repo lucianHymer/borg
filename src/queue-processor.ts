@@ -87,6 +87,7 @@ const QUEUE_OUTGOING = path.join(BORG_DIR, "queue/outgoing");
 const QUEUE_PROCESSING = path.join(BORG_DIR, "queue/processing");
 const QUEUE_DEAD_LETTER = path.join(BORG_DIR, "queue/dead-letter");
 const QUEUE_COMMANDS = path.join(BORG_DIR, "queue/commands");
+const QUEUE_CANCEL = path.join(BORG_DIR, "queue/cancel");
 const QUEUE_STATUS = path.join(BORG_DIR, "status");
 const LOG_FILE = path.join(BORG_DIR, "logs/queue.log");
 const PROMPTS_LOG = path.join(BORG_DIR, "logs/prompts.jsonl");
@@ -103,6 +104,7 @@ const TASK_LISTS_FILE = path.join(BORG_DIR, TASK_LISTS_FILENAME);
     QUEUE_PROCESSING,
     QUEUE_DEAD_LETTER,
     QUEUE_COMMANDS,
+    QUEUE_CANCEL,
     QUEUE_STATUS,
     path.dirname(LOG_FILE),
     SESSIONS_DIR,
@@ -1084,9 +1086,22 @@ async function processMessage(messageFile: string): Promise<void> {
             writeStatus(messageId, currentStatusLabel, statusStartTime);
 
             // Refresh the status file every 2 seconds to keep ts fresh (for staleness detection)
-            // and to pick up label changes and preview text from the observer callbacks
+            // and to pick up label changes and preview text from the observer callbacks.
+            // Also checks for cancel signal files written by telegram-client.
             let currentPreview: string | undefined;
-            const statusInterval = setInterval(() => {
+            let cancelled = false;
+            const cancelFile = path.join(QUEUE_CANCEL, `${messageId}.json`);
+            const statusInterval = setInterval(async () => {
+                // Check for cancel signal
+                if (!cancelled && fs.existsSync(cancelFile)) {
+                    cancelled = true;
+                    currentStatusLabel = "Cancelled";
+                    writeStatus(messageId, currentStatusLabel, statusStartTime, currentPreview);
+                    try { fs.unlinkSync(cancelFile); } catch { /* best effort */ }
+                    try { await q.interrupt(); } catch { /* process may be gone */ }
+                    log("INFO", `Cancelled processing for ${messageId}`);
+                    return;
+                }
                 writeStatus(messageId, currentStatusLabel, statusStartTime, currentPreview);
             }, 2000);
 
@@ -1107,8 +1122,9 @@ async function processMessage(messageFile: string): Promise<void> {
                     currentStatusLabel = "Stall recovered";
                 },
                 onTextContent(text: string) {
-                    // Keep the latest text block as preview (truncate for status file size)
-                    currentPreview = text.length > 500 ? text.slice(0, 500) + "…" : text;
+                    // Accumulate text blocks as preview (growing preview)
+                    const accumulated = currentPreview ? currentPreview + "\n\n" + text : text;
+                    currentPreview = accumulated.length > 500 ? accumulated.slice(0, 500) + "…" : accumulated;
                 },
             };
 
@@ -1118,35 +1134,57 @@ async function processMessage(messageFile: string): Promise<void> {
                     observer,
                 );
                 clearInterval(statusInterval);
-                responseText = text.trim();
 
-                if (stallRecovered) {
-                    responseText += `\n\n---\n⚠️ _Stall recovered: session hung after end\\_turn (${END_TURN_STALL_TIMEOUT_MS / 1000}s timeout). Response above may be incomplete._`;
-                }
+                if (cancelled) {
+                    // Cancelled — send short status, don't retry
+                    responseText = "🚫 Processing was cancelled.";
+                    clearStatus(messageId);
+                    // Still persist session so resume works
+                    if (newSessionId) {
+                        updateThread(threadId, {
+                            sessionId: newSessionId,
+                            model: effectiveModel,
+                            lastActive: Date.now(),
+                        });
+                    }
+                } else {
+                    responseText = text.trim();
 
-                // Persist session ID for future resume (atomic to avoid clobbering team/role)
-                if (newSessionId) {
-                    updateThread(threadId, {
-                        sessionId: newSessionId,
-                        model: effectiveModel,
-                        lastActive: Date.now(),
-                    });
-                    const cwd = loadThreads()[String(threadId)]?.cwd;
-                    if (cwd) syncSessionLog(newSessionId, cwd);
+                    if (stallRecovered) {
+                        responseText += `\n\n---\n⚠️ _Stall recovered: session hung after end\\_turn (${END_TURN_STALL_TIMEOUT_MS / 1000}s timeout). Response above may be incomplete._`;
+                    }
+
+                    // Persist session ID for future resume (atomic to avoid clobbering team/role)
+                    if (newSessionId) {
+                        updateThread(threadId, {
+                            sessionId: newSessionId,
+                            model: effectiveModel,
+                            lastActive: Date.now(),
+                        });
+                        const cwd = loadThreads()[String(threadId)]?.cwd;
+                        if (cwd) syncSessionLog(newSessionId, cwd);
+                    }
                 }
             } catch (queryErr) {
                 clearInterval(statusInterval);
-                const stderrOutput = stderrLines.join("").trim();
-                log(
-                    "ERROR",
-                    `Query error for thread ${threadId}: ${toErrorMessage(queryErr)}` +
-                        (stderrOutput ? `\n  stderr: ${stderrOutput.slice(0, 2000)}` : ""),
-                );
 
-                // Clear stale sessionId on error so retries start a fresh session (atomic)
-                deleteThreadField(threadId, "sessionId");
+                if (cancelled) {
+                    // Cancelled — treat as expected, send cancelled message
+                    responseText = "🚫 Processing was cancelled.";
+                    clearStatus(messageId);
+                } else {
+                    const stderrOutput = stderrLines.join("").trim();
+                    log(
+                        "ERROR",
+                        `Query error for thread ${threadId}: ${toErrorMessage(queryErr)}` +
+                            (stderrOutput ? `\n  stderr: ${stderrOutput.slice(0, 2000)}` : ""),
+                    );
 
-                throw queryErr;
+                    // Clear stale sessionId on error so retries start a fresh session (atomic)
+                    deleteThreadField(threadId, "sessionId");
+
+                    throw queryErr;
+                }
             }
         }
 
@@ -1384,6 +1422,42 @@ async function processQueue(): Promise<void> {
 
             // Only 1 heartbeat can process concurrently — reserve other slots for user messages
             if (msg.source === 'heartbeat' && activeHeartbeatCount >= 1) continue;
+
+            // Coalesce: grab other queued messages for the same thread
+            // Skip command messages (starting with /) and non-user sources
+            const coalesced: QueueFile[] = [];
+            if (!msg.message.startsWith("/")) {
+                for (const other of files) {
+                    if (other === file) continue;
+                    try {
+                        const otherRaw: unknown = JSON.parse(fs.readFileSync(other.path, "utf8"));
+                        const otherParsed = IncomingMessageSchema.safeParse(otherRaw);
+                        if (!otherParsed.success) continue;
+                        const otherMsg = otherParsed.data;
+                        if (otherMsg.threadId !== msg.threadId) continue;
+                        if (otherMsg.message.startsWith("/")) continue;
+                        coalesced.push(other);
+                        // Append text to primary message
+                        msg.message = msg.message + "\n\n" + otherMsg.message;
+                    } catch { continue; }
+                }
+
+                if (coalesced.length > 0) {
+                    // Rewrite primary queue file with coalesced text
+                    try {
+                        const tmpFile = file.path + ".tmp";
+                        fs.writeFileSync(tmpFile, JSON.stringify(msg, null, 2));
+                        fs.renameSync(tmpFile, file.path);
+                    } catch { /* proceed with original if rewrite fails */ }
+
+                    // Delete coalesced files
+                    for (const cf of coalesced) {
+                        try { fs.unlinkSync(cf.path); } catch { /* best effort */ }
+                    }
+
+                    log("INFO", `Coalesced ${coalesced.length + 1} messages for thread ${msg.threadId}`);
+                }
+            }
 
             // Claim the slot
             activeCount++;
