@@ -730,21 +730,40 @@ export function createBorgMcpServer(sourceThreadId: number) {
                 if (initialMessage) {
                     const ts = Date.now();
                     const msgId = `init_${threadId}_${ts}`;
+                    const sourceName = threads[String(sourceThreadId)]?.name ?? `Thread ${sourceThreadId}`;
                     const incoming = {
                         channel: "telegram",
                         source: "cross-thread",
                         threadId,
                         sourceThreadId,
-                        sender: threads[String(sourceThreadId)]?.name ?? `Thread ${sourceThreadId}`,
+                        sender: sourceName,
                         message: initialMessage,
                         timestamp: ts,
                         messageId: msgId,
                     };
                     fs.mkdirSync(QUEUE_INCOMING, { recursive: true });
-                    const tmpPath = path.join(QUEUE_INCOMING, `${msgId}.json.tmp`);
-                    const finalPath = path.join(QUEUE_INCOMING, `${msgId}.json`);
-                    fs.writeFileSync(tmpPath, JSON.stringify(incoming));
-                    fs.renameSync(tmpPath, finalPath);
+                    const inTmp = path.join(QUEUE_INCOMING, `${msgId}.json.tmp`);
+                    const inFinal = path.join(QUEUE_INCOMING, `${msgId}.json`);
+                    fs.writeFileSync(inTmp, JSON.stringify(incoming));
+                    fs.renameSync(inTmp, inFinal);
+
+                    // Write to outgoing queue so it appears in Telegram
+                    const outgoing = {
+                        channel: "telegram",
+                        targetThreadId: threadId,
+                        sourceThreadId,
+                        sender: sourceName,
+                        message: initialMessage,
+                        originalMessage: "",
+                        timestamp: ts,
+                        messageId: `${msgId}_tg`,
+                        model: "",
+                    };
+                    fs.mkdirSync(QUEUE_OUTGOING, { recursive: true });
+                    const outTmp = path.join(QUEUE_OUTGOING, `${msgId}_tg.json.tmp`);
+                    const outFinal = path.join(QUEUE_OUTGOING, `${msgId}_tg.json`);
+                    fs.writeFileSync(outTmp, JSON.stringify(outgoing));
+                    fs.renameSync(outTmp, outFinal);
                 }
 
                 const parts = [`Created thread "${name}" (ID: ${threadId})`];
