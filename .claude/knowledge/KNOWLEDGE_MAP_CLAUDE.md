@@ -18,6 +18,7 @@
 - @patterns/emoji-reactions-for-model-visibility-in-telegram.md
 - @patterns/message-history-deduplication-by-messageid.md
 - @patterns/cross-thread-message-handling.md
+- @patterns/telegram-markdownv2-conversion-pattern.md
 
 ## Api
 - @api/telegram-bot-api-reaction-feature-details.md
@@ -32,3 +33,4 @@
 ## Gotchas
 - @gotchas/speaches-container-handles-request-queuing-internally.md
 - @gotchas/stall-detection-must-use-absolute-time-not-per-event.md
+- @gotchas/message-history-dedup-must-check-direction.md

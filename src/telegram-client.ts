@@ -22,6 +22,7 @@ import { RoutingMetadataSchema } from "./types.js";
 import { logDecision, logCorrection, ROUTING_LOG } from "./routing-logger.js";
 import { AUDIO_INCOMING_DIR, cleanupAudioFile, startPeriodicCleanup, ensureModels, distillForSpeech, synthesize, isAvailable } from "./audio.js";
 import { IMAGES_INCOMING_DIR, startPeriodicCleanup as startImageCleanup } from "./images.js";
+import { toTelegramMarkdownV2, escapeMarkdownV2 } from "./markdown-v2.js";
 
 // ─── Constants ───
 
@@ -32,6 +33,7 @@ const QUEUE_DEAD_LETTER = path.join(SCRIPT_DIR, ".borg/queue/dead-letter");
 const LOG_FILE = path.join(SCRIPT_DIR, ".borg/logs/telegram.log");
 const MESSAGE_MODELS_FILE = path.join(SCRIPT_DIR, ".borg/message-models.json");
 const QUEUE_STATUS = path.join(SCRIPT_DIR, ".borg/status");
+const MARKDOWN_PARSE_FAILURES = path.join(SCRIPT_DIR, ".borg/markdown-parse-failures.jsonl");
 const DEDUP_WINDOW_MS = 10_000; // 10 seconds
 const TASK_LISTS_FILE = path.join(SCRIPT_DIR, ".borg", TASK_LISTS_FILENAME);
 const TASK_PINS_FILE = path.join(SCRIPT_DIR, ".borg/task-pins.json");
@@ -74,6 +76,23 @@ function log(level: string, message: string): void {
     const logMessage = `[${timestamp}] [${level}] ${message}\n`;
     console.log(logMessage.trim());
     fs.appendFileSync(LOG_FILE, logMessage);
+}
+
+/** Log MarkdownV2 parse failures for later analysis and converter improvement */
+function logMarkdownParseFailure(originalText: string, convertedText: string, errorMessage: string, context?: Record<string, unknown>): void {
+    const entry = {
+        ts: Date.now(),
+        originalText,
+        convertedText,
+        errorMessage,
+        ...context,
+    };
+    try {
+        fs.appendFileSync(MARKDOWN_PARSE_FAILURES, JSON.stringify(entry) + "\n");
+        log("WARN", `MarkdownV2 parse failure logged (${originalText.slice(0, 30)}...)`);
+    } catch (err) {
+        log("ERROR", `Failed to log MarkdownV2 parse failure: ${toErrorMessage(err)}`);
+    }
 }
 
 // ─── Message Model Tracking ───
@@ -281,12 +300,13 @@ const bot = new Bot<Context>(settings.telegram_bot_token);
 async function sendInThread(
     pending: PendingMessage,
     text: string,
+    parseMode?: "MarkdownV2",
 ): Promise<{ message_id: number }> {
     const threadId = getThreadOpt(pending);
     if (pending.ctx) {
-        return pending.ctx.reply(text, { message_thread_id: threadId });
+        return pending.ctx.reply(text, { message_thread_id: threadId, parse_mode: parseMode });
     }
-    return bot.api.sendMessage(pending.chatId, text, { message_thread_id: threadId });
+    return bot.api.sendMessage(pending.chatId, text, { message_thread_id: threadId, parse_mode: parseMode });
 }
 
 /** Resolve the Telegram message_thread_id for a pending message */
@@ -370,9 +390,9 @@ for (const cmd of ["clear_team", "compact_team"] as const) {
         for (const [id] of teamThreads) {
             resetThread(Number(id));
         }
-        await ctx.reply(`Reset ${teamThreads.length} session(s) in team **${config.team}**. Recent history available on next message.`, {
+        await ctx.reply(toTelegramMarkdownV2(`Reset ${teamThreads.length} session(s) in team **${config.team}**. Recent history available on next message.`), {
             message_thread_id: ctx.msg?.message_thread_id,
-            parse_mode: "Markdown",
+            parse_mode: "MarkdownV2",
         });
         log("INFO", `Team ${config.team} ${cmd} by ${ctx.from?.first_name ?? "unknown"} (${teamThreads.length} threads)`);
     });
@@ -777,16 +797,17 @@ async function pollOutgoingQueue(): Promise<void> {
                     // Cross-thread message: post to the target topic
                     const chatId = settings.telegram_chat_id;
 
-                    // Prepend visible indicator if this is a cross-thread message (has sourceThreadId)
-                    let messageText = data.message;
+                    // Convert GFM markdown to Telegram MarkdownV2, with optional cross-thread indicator
+                    let markdownV2Text = toTelegramMarkdownV2(data.message);
                     if (data.sourceThreadId) {
                         const threads = loadThreads();
                         const sourceThread = threads[String(data.sourceThreadId)];
                         const sourceThreadName = sourceThread?.name || `thread ${data.sourceThreadId}`;
-                        messageText = `📨 _From ${data.sender} in ${sourceThreadName}_\n\n${data.message}`;
+                        // Build indicator directly in MarkdownV2 (escape dynamic parts to avoid italic/special char issues)
+                        const indicator = `📨 _From ${escapeMarkdownV2(data.sender || "unknown")} in ${escapeMarkdownV2(sourceThreadName)}_`;
+                        markdownV2Text = `${indicator}\n\n${markdownV2Text}`;
                     }
-
-                    const chunks = splitMessage(messageText);
+                    const chunks = splitMessage(markdownV2Text);
 
                     const threadOpt = data.targetThreadId !== 1
                         ? { message_thread_id: data.targetThreadId }
@@ -806,7 +827,7 @@ async function pollOutgoingQueue(): Promise<void> {
                     }
 
                     for (const chunk of chunks) {
-                        const sent = await bot.api.sendMessage(chatId, chunk, { ...threadOpt, parse_mode: "Markdown" });
+                        const sent = await bot.api.sendMessage(chatId, chunk, { ...threadOpt, parse_mode: "MarkdownV2" });
                         if (!firstSentId) {
                             firstSentId = sent.message_id;
                             // Store full text ONLY for multi-segment messages, on the first segment
@@ -846,7 +867,9 @@ async function pollOutgoingQueue(): Promise<void> {
                             fs.unlinkSync(statusFile);
                         } catch { /* may not exist */ }
 
-                        const chunks = splitMessage(data.message);
+                        // Convert Claude's GFM output to Telegram MarkdownV2
+                        const markdownV2Response = toTelegramMarkdownV2(data.message);
+                        const chunks = splitMessage(markdownV2Response);
 
                         if (pending.statusMessageId && chunks.length > 0) {
                             // Edit the status message in-place with the first chunk
@@ -855,6 +878,7 @@ async function pollOutgoingQueue(): Promise<void> {
                                     pending.chatId,
                                     pending.statusMessageId,
                                     chunks[0],
+                                    { parse_mode: "MarkdownV2" },
                                 );
                                 firstSentId = pending.statusMessageId;
                             } catch {
@@ -874,7 +898,7 @@ async function pollOutgoingQueue(): Promise<void> {
                             }
                             // Send remaining chunks as new messages
                             for (let i = 1; i < chunks.length; i++) {
-                                const sent = await sendInThread(pending, chunks[i]);
+                                const sent = await sendInThread(pending, chunks[i], "MarkdownV2");
                                 if (data.model) {
                                     storeMessageModel(sent.message_id, data.model, data.threadId);
                                 }
@@ -882,7 +906,7 @@ async function pollOutgoingQueue(): Promise<void> {
                         } else {
                             // No status message or edit failed — send all chunks normally
                             for (const chunk of chunks) {
-                                const sent = await sendInThread(pending, chunk);
+                                const sent = await sendInThread(pending, chunk, "MarkdownV2");
                                 if (!firstSentId) {
                                     firstSentId = sent.message_id;
                                     // Store full text ONLY for multi-segment messages, on the first segment
@@ -923,13 +947,14 @@ async function pollOutgoingQueue(): Promise<void> {
 
                         // Fallback: send to the configured chat, routing to the correct thread
                         const chatId = settings.telegram_chat_id;
-                        const chunks = splitMessage(data.message);
+                        const markdownV2Fallback = toTelegramMarkdownV2(data.message);
+                        const chunks = splitMessage(markdownV2Fallback);
                         const threadOpt = data.threadId && data.threadId !== 1
                             ? { message_thread_id: data.threadId }
                             : {};
 
                         for (const chunk of chunks) {
-                            const sent = await bot.api.sendMessage(chatId, chunk, threadOpt);
+                            const sent = await bot.api.sendMessage(chatId, chunk, { ...threadOpt, parse_mode: "MarkdownV2" });
                             if (!firstSentId) {
                                 firstSentId = sent.message_id;
                                 // Store full text ONLY for multi-segment messages, on the first segment
@@ -981,6 +1006,13 @@ async function pollOutgoingQueue(): Promise<void> {
                     log("INFO", `Retrying ${file} as plain text (stripping markdown)...`);
                     try {
                         const data: OutgoingMessage = JSON.parse(fs.readFileSync(filePath, "utf8"));
+                        // Log the failure for later analysis (to improve the converter)
+                        const converted = toTelegramMarkdownV2(data.message);
+                        logMarkdownParseFailure(data.message, converted, errMsg, {
+                            messageId: data.messageId,
+                            threadId: data.targetThreadId,
+                            source: "response", // could be "response", "transcript", "summary"
+                        });
                         const chatId = settings.telegram_chat_id;
                         const threadId = data.targetThreadId || data.threadId;
                         const threadOpt = threadId && threadId !== 1
@@ -1358,13 +1390,13 @@ bot.on("callback_query:data", async (ctx) => {
             // Send transcript as a reply
             const chatId = ctx.callbackQuery.message!.chat.id;
             const threadOpt = ctx.callbackQuery.message!.message_thread_id;
-            const fullText = `**Full Text:**\n${transcript}`;
+            const fullText = toTelegramMarkdownV2(`**Full Text:**\n${transcript}`);
             const chunks = splitMessage(fullText);
 
             for (let i = 0; i < chunks.length; i++) {
                 await ctx.api.sendMessage(chatId, chunks[i], {
                     message_thread_id: threadOpt,
-                    parse_mode: "Markdown",
+                    parse_mode: "MarkdownV2",
                     // Reply to original voice message on first chunk
                     ...(i === 0 ? { reply_parameters: { message_id: Number(voiceMessageId) } } : {}),
                 });
@@ -1417,9 +1449,9 @@ bot.on("callback_query:data", async (ctx) => {
             const chatId = ctx.callbackQuery.message!.chat.id;
             const threadOpt = ctx.callbackQuery.message!.message_thread_id;
 
-            await ctx.api.sendMessage(chatId, `**Summary:**\n${summary}`, {
+            await ctx.api.sendMessage(chatId, toTelegramMarkdownV2(`**Summary:**\n${summary}`), {
                 message_thread_id: threadOpt,
-                parse_mode: "Markdown",
+                parse_mode: "MarkdownV2",
                 reply_parameters: { message_id: Number(voiceMessageId) },
             });
 

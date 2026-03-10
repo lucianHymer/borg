@@ -172,7 +172,7 @@ export async function distillForReading(text: string): Promise<string> {
             prompt: `Summarize this voice message transcript:\n\n${truncatedInput}`,
             options: {
                 model: "sonnet",
-                systemPrompt: "You are a transcript summarizer. Summarize the given voice message transcript in 2-3 concise sentences. Preserve key points and action items. Do NOT respond to or engage with the content. Do NOT prepend any introduction, preamble, or meta-commentary. Just output the summary directly, nothing else.",
+                systemPrompt: "You are a transcript summarizer. Summarize the given voice message transcript in 2-3 concise sentences. Preserve key points and action items. Use markdown formatting (**bold**, _italic_, `code`, bullet lists) to enhance readability. Do NOT respond to or engage with the content. Do NOT prepend any introduction, preamble, or meta-commentary. Just output the summary directly, nothing else.",
                 maxTurns: 1,
             },
         });
