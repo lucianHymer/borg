@@ -38,3 +38,4 @@
 - @gotchas/stall-detection-must-use-absolute-time-not-per-event.md
 - @gotchas/message-history-dedup-must-check-direction.md
 - @gotchas/growing-preview-must-show-tail-not-head.md
+- @gotchas/github-app-token-cannot-approve-own-prs.md
