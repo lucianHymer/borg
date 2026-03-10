@@ -17,6 +17,7 @@ export interface ThreadConfig {
     lastActive: number;
     team?: string;          // Team identifier (e.g., "auth-feature")
     role?: string;          // Agent role (e.g., "planner", "reviewer")
+    mainThread?: boolean;   // Receives broadcast fan-outs (only long-lived threads)
 }
 
 export type ThreadsMap = Record<string, ThreadConfig>;
@@ -39,6 +40,7 @@ export interface Settings {
     timezone: string;
     telegram_bot_token: string;
     telegram_chat_id: string;
+    broadcast_chat_id?: string;  // Telegram group for cross-repo broadcasts
     heartbeat_interval: number;
     max_concurrent_sessions: number;
     session_idle_timeout_minutes: number;
