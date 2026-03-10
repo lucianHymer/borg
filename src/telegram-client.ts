@@ -23,6 +23,7 @@ import { logDecision, logCorrection, ROUTING_LOG } from "./routing-logger.js";
 import { AUDIO_INCOMING_DIR, cleanupAudioFile, startPeriodicCleanup, ensureModels, distillForSpeech, synthesize, isAvailable } from "./audio.js";
 import { IMAGES_INCOMING_DIR, startPeriodicCleanup as startImageCleanup } from "./images.js";
 import { toTelegramMarkdownV2, escapeMarkdownV2 } from "./markdown-v2.js";
+import { loadZoneConfig, getThreadZone } from "./zone-config.js";
 
 // ─── Constants ───
 
@@ -581,12 +582,20 @@ bot.on("message:text").filter(
         const broadcastText = ctx.message.text;
         log("INFO", `Broadcast received: ${broadcastText.substring(0, 80)}`);
 
-        // Fan-out to ALL mainThread:true threads
+        // Fan-out to mainThread:true threads in core zone only
         const threads = loadThreads();
-        const mainThreads = Object.entries(threads).filter(([, t]) => t.mainThread);
+        const zoneConfig = loadZoneConfig(path.join(SCRIPT_DIR, "zone-config.json"));
+        const mainThreads = Object.entries(threads).filter(([id, t]) => {
+            if (!t.mainThread) return false;
+            // If zone config exists, only include core zone threads
+            if (zoneConfig) {
+                return getThreadZone(zoneConfig, Number(id)) === "core";
+            }
+            return true; // no zone config = all mainThread threads (backward compatible)
+        });
 
         if (mainThreads.length === 0) {
-            log("INFO", "Broadcast received but no mainThread threads configured — skipping fan-out");
+            log("INFO", "Broadcast received but no eligible mainThread threads — skipping fan-out");
             return;
         }
 
