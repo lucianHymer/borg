@@ -196,3 +196,127 @@ describe("saveZoneConfig", () => {
         expect(fs.existsSync(CONFIG_PATH)).toBe(true);
     });
 });
+
+// ─── Cross-Zone Routing Logic Tests ───
+
+describe("cross-zone routing decisions", () => {
+    it("core→core is same zone (no approval needed)", () => {
+        expect(isSameZone(validConfig, 1, 43)).toBe(true);
+        expect(isSameZone(validConfig, 1, 58)).toBe(true);
+    });
+
+    it("perimeter→perimeter is same zone (no approval needed)", () => {
+        expect(isSameZone(validConfig, 100, 200)).toBe(true);
+    });
+
+    it("core→perimeter requires approval", () => {
+        expect(isSameZone(validConfig, 1, 100)).toBe(false);
+    });
+
+    it("perimeter→core requires approval", () => {
+        expect(isSameZone(validConfig, 100, 1)).toBe(false);
+    });
+
+    it("new thread (unknown) → core requires approval if default is perimeter", () => {
+        // Thread 9999 not in any zone → defaults to perimeter
+        expect(isSameZone(validConfig, 9999, 1)).toBe(false);
+    });
+
+    it("new thread → new thread is same zone (both default to perimeter)", () => {
+        expect(isSameZone(validConfig, 9999, 8888)).toBe(true);
+    });
+
+    it("no zone config means no cross-zone (loadZoneConfig returns null)", () => {
+        const config = loadZoneConfig(path.join(TEMP_DIR, "nonexistent.json"));
+        expect(config).toBeNull();
+        // Caller should treat null as "no zones = deliver directly"
+    });
+});
+
+describe("broadcast filtering (core-only)", () => {
+    const broadcastConfig: ZoneConfig = {
+        zones: {
+            core: { threads: [1, 43] },
+            perimeter: { threads: [100] },
+        },
+        defaults: { newThread: "perimeter" },
+    };
+
+    it("core mainThread threads are eligible for broadcast", () => {
+        // Simulates the fan-out filter: mainThread=true AND core zone
+        const threads: Record<string, { mainThread?: boolean }> = {
+            "1": { mainThread: true },
+            "43": { mainThread: false },
+            "100": { mainThread: true },
+        };
+
+        const eligible = Object.entries(threads).filter(([id, t]) => {
+            if (!t.mainThread) return false;
+            return getThreadZone(broadcastConfig, Number(id)) === "core";
+        });
+
+        expect(eligible.map(([id]) => id)).toEqual(["1"]);
+    });
+
+    it("perimeter mainThread threads are excluded from broadcast", () => {
+        expect(getThreadZone(broadcastConfig, 100)).toBe("perimeter");
+        // Thread 100 has mainThread=true but is in perimeter → excluded
+    });
+
+    it("unknown thread defaults to perimeter (excluded from broadcast)", () => {
+        expect(getThreadZone(broadcastConfig, 9999)).toBe("perimeter");
+    });
+});
+
+describe("thread lifecycle zone management", () => {
+    it("create_thread adds to creator's zone", () => {
+        writeConfig(validConfig);
+        const config = loadZoneConfig(CONFIG_PATH)!;
+
+        // Creator is in core (thread 1), new thread 500
+        const creatorZone = getThreadZone(config, 1);
+        expect(creatorZone).toBe("core");
+
+        addThreadToZone(config, 500, creatorZone);
+        expect(getThreadZone(config, 500)).toBe("core");
+        expect(config.zones.core.threads).toContain(500);
+    });
+
+    it("delete_thread removes from zone config", () => {
+        writeConfig(validConfig);
+        const config = loadZoneConfig(CONFIG_PATH)!;
+
+        expect(getThreadZone(config, 43)).toBe("core");
+        removeThreadFromZones(config, 43);
+        // After removal, thread 43 falls back to default zone
+        expect(getThreadZone(config, 43)).toBe("perimeter");
+        expect(config.zones.core.threads).not.toContain(43);
+    });
+
+    it("move thread between zones", () => {
+        writeConfig(validConfig);
+        const config = loadZoneConfig(CONFIG_PATH)!;
+
+        // Thread 1 starts in core
+        expect(getThreadZone(config, 1)).toBe("core");
+
+        // Move to perimeter
+        addThreadToZone(config, 1, "perimeter");
+        expect(getThreadZone(config, 1)).toBe("perimeter");
+        expect(config.zones.core.threads).not.toContain(1);
+        expect(config.zones.perimeter.threads).toContain(1);
+    });
+
+    it("creating thread in perimeter zone isolates from core", () => {
+        writeConfig(validConfig);
+        const config = loadZoneConfig(CONFIG_PATH)!;
+
+        // Creator is in perimeter (thread 100), new thread 600
+        const creatorZone = getThreadZone(config, 100);
+        expect(creatorZone).toBe("perimeter");
+
+        addThreadToZone(config, 600, creatorZone);
+        expect(isSameZone(config, 600, 100)).toBe(true);  // same zone as creator
+        expect(isSameZone(config, 600, 1)).toBe(false);    // different zone from core
+    });
+});

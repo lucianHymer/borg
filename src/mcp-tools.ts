@@ -30,7 +30,7 @@ import { toErrorMessage, parseSSHPublicKey, parseDevEmail } from "./types.js";
 import type { PendingApproval } from "./types.js";
 import { logCorrection, ROUTING_LOG, mergeCorrectionsOntoDecisions } from "./routing-logger.js";
 import { readRecentJsonl } from "./jsonl-reader.js";
-import { loadZoneConfig, getThreadZone, isSameZone } from "./zone-config.js";
+import { loadZoneConfig, getThreadZone, isSameZone, addThreadToZone, removeThreadFromZones, saveZoneConfig } from "./zone-config.js";
 
 const PROJECT_DIR = path.resolve(__dirname, "..");
 const BORG_DIR = path.join(PROJECT_DIR, ".borg");
@@ -784,6 +784,16 @@ export function createBorgMcpServer(sourceThreadId: number) {
                     ...(mainThread ? { mainThread } : {}),
                 });
 
+                // Register in zone-config.json — new thread goes into creator's zone
+                try {
+                    const zoneConfig = loadZoneConfig(ZONE_CONFIG_PATH);
+                    if (zoneConfig) {
+                        const creatorZone = getThreadZone(zoneConfig, sourceThreadId);
+                        addThreadToZone(zoneConfig, threadId, creatorZone);
+                        saveZoneConfig(ZONE_CONFIG_PATH, zoneConfig);
+                    }
+                } catch { /* zone config may not exist yet — non-fatal */ }
+
                 // Send initial message if provided
                 if (initialMessage) {
                     const ts = Date.now();
@@ -954,6 +964,15 @@ export function createBorgMcpServer(sourceThreadId: number) {
                 const threadName = threads[String(threadId)].name;
                 delete threads[String(threadId)];
                 saveThreads(threads);
+
+                // Remove from zone-config.json
+                try {
+                    const zoneConfig = loadZoneConfig(ZONE_CONFIG_PATH);
+                    if (zoneConfig) {
+                        removeThreadFromZones(zoneConfig, threadId);
+                        saveZoneConfig(ZONE_CONFIG_PATH, zoneConfig);
+                    }
+                } catch { /* zone config may not exist — non-fatal */ }
 
                 return {
                     content: [textContent(`Deleted thread ${threadId} ("${threadName}") from Telegram and unregistered from Borg`)],
