@@ -74,6 +74,38 @@ function resolveZoneOutgoing(targetZone: string): string {
     }
     return QUEUE_OUTGOING;
 }
+
+/**
+ * Resolve the incoming queue path for a specific thread.
+ * Loads zone config to determine which zone the thread belongs to.
+ * In single-container mode, always returns the default QUEUE_INCOMING.
+ */
+function resolveIncomingForThread(threadId: number): string {
+    if (BORG_ZONE !== "infra") return QUEUE_INCOMING;
+    try {
+        const config = loadZoneConfig(ZONE_CONFIG_PATH);
+        if (!config) return QUEUE_INCOMING;
+        const zone = getThreadZone(config, threadId);
+        return resolveZoneIncoming(zone);
+    } catch {
+        return QUEUE_INCOMING;
+    }
+}
+
+/**
+ * Get all outgoing queue directories to poll.
+ * In infra mode, returns both zone outgoing queues.
+ * In single-container mode, returns just the default.
+ */
+function getOutgoingQueueDirs(): string[] {
+    if (BORG_ZONE === "infra") {
+        return [
+            path.join(SCRIPT_DIR, ".borg-core/queue/outgoing"),
+            path.join(SCRIPT_DIR, ".borg-perimeter/queue/outgoing"),
+        ];
+    }
+    return [QUEUE_OUTGOING];
+}
 const DEDUP_WINDOW_MS = 10_000; // 10 seconds
 const TASK_LISTS_FILE = path.join(SCRIPT_DIR, ".borg", TASK_LISTS_FILENAME);
 const TASK_PINS_FILE = path.join(SCRIPT_DIR, ".borg/task-pins.json");
@@ -497,7 +529,9 @@ bot.on("message:text").filter(
             messageId,
         };
 
-        const queueFile = path.join(QUEUE_INCOMING, `telegram_${messageId}.json`);
+        const incomingDir = resolveIncomingForThread(threadId);
+        fs.mkdirSync(incomingDir, { recursive: true });
+        const queueFile = path.join(incomingDir, `telegram_${messageId}.json`);
         const tmpFile = queueFile + ".tmp";
         fs.writeFileSync(tmpFile, JSON.stringify(queueData, null, 2));
         fs.renameSync(tmpFile, queueFile);
@@ -651,7 +685,9 @@ bot.on("message:text").filter(
                 messageId,
             };
 
-            const queueFile = path.join(QUEUE_INCOMING, `broadcast_${messageId}.json`);
+            const broadcastIncoming = resolveIncomingForThread(threadId);
+            fs.mkdirSync(broadcastIncoming, { recursive: true });
+            const queueFile = path.join(broadcastIncoming, `broadcast_${messageId}.json`);
             const tmpFile = queueFile + ".tmp";
             fs.writeFileSync(tmpFile, JSON.stringify(queueData, null, 2));
             fs.renameSync(tmpFile, queueFile);
@@ -743,7 +779,9 @@ bot.on("message:voice").filter(
             telegramMessageId: ctx.msg.message_id,
         };
 
-        const queueFile = path.join(QUEUE_INCOMING, `telegram_${messageId}.json`);
+        const incomingDir = resolveIncomingForThread(threadId);
+        fs.mkdirSync(incomingDir, { recursive: true });
+        const queueFile = path.join(incomingDir, `telegram_${messageId}.json`);
         const tmpFile = queueFile + ".tmp";
         fs.writeFileSync(tmpFile, JSON.stringify(queueData, null, 2));
         fs.renameSync(tmpFile, queueFile);
@@ -846,7 +884,9 @@ bot.on("message:photo").filter(
             messageId,
         };
 
-        const queueFile = path.join(QUEUE_INCOMING, `telegram_${messageId}.json`);
+        const incomingDir = resolveIncomingForThread(threadId);
+        fs.mkdirSync(incomingDir, { recursive: true });
+        const queueFile = path.join(incomingDir, `telegram_${messageId}.json`);
         const tmpFile = queueFile + ".tmp";
         fs.writeFileSync(tmpFile, JSON.stringify(queueData, null, 2));
         fs.renameSync(tmpFile, queueFile);
@@ -908,14 +948,18 @@ async function pollOutgoingQueue(): Promise<void> {
     if (outgoingPollActive) return;
     outgoingPollActive = true;
     try {
-        if (!fs.existsSync(QUEUE_OUTGOING)) return;
+        // In infra mode, poll all zone outgoing queues; in single-container, just one
+        const outgoingDirs = getOutgoingQueueDirs();
+        const allFiles: Array<{ file: string; filePath: string }> = [];
+        for (const dir of outgoingDirs) {
+            if (!fs.existsSync(dir)) continue;
+            const files = fs.readdirSync(dir).filter((f) => f.endsWith(".json"));
+            for (const file of files) {
+                allFiles.push({ file, filePath: path.join(dir, file) });
+            }
+        }
 
-        const files = fs
-            .readdirSync(QUEUE_OUTGOING)
-            .filter((f) => f.endsWith(".json"));
-
-        for (const file of files) {
-            const filePath = path.join(QUEUE_OUTGOING, file);
+        for (const { file, filePath } of allFiles) {
 
             try {
                 const data: OutgoingMessage = JSON.parse(fs.readFileSync(filePath, "utf8"));
