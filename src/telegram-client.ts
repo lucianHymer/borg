@@ -1718,6 +1718,62 @@ bot.catch((err) => {
 process.once("SIGINT", () => bot.stop());
 process.once("SIGTERM", () => bot.stop());
 
+// ─── Cross-Zone Pending Approval Reminder ───
+
+let lastReminderDate = "";
+
+async function checkPendingApprovalReminder(): Promise<void> {
+    // Only send once per day
+    const today = new Date().toISOString().slice(0, 10);
+    if (today === lastReminderDate) return;
+
+    if (!fs.existsSync(QUEUE_PENDING)) return;
+
+    const files = fs.readdirSync(QUEUE_PENDING).filter(f => f.endsWith(".json"));
+    if (files.length === 0) return;
+
+    const pendingItems: Array<PendingApproval & { age: string }> = [];
+    for (const file of files) {
+        try {
+            const data: PendingApproval = JSON.parse(
+                fs.readFileSync(path.join(QUEUE_PENDING, file), "utf8"),
+            );
+            const ageMs = Date.now() - data.timestamp;
+            const ageHours = Math.floor(ageMs / 3600000);
+            const age = ageHours < 24 ? `${ageHours}h` : `${Math.floor(ageHours / 24)}d`;
+            pendingItems.push({ ...data, age });
+        } catch { /* skip malformed files */ }
+    }
+
+    if (pendingItems.length === 0) return;
+
+    const chatId = settings.telegram_chat_id;
+    const lines = [
+        `🔒 *${pendingItems.length} cross\\-zone message\\(s\\) pending approval:*`,
+        "",
+    ];
+
+    for (const item of pendingItems) {
+        const preview = item.message.length > 80
+            ? item.message.substring(0, 80) + "..."
+            : item.message;
+        let line = `• ${escapeMarkdownV2(item.senderName)} → ${escapeMarkdownV2(item.targetName)} \\(${escapeMarkdownV2(item.age)} ago\\): ${escapeMarkdownV2(preview)}`;
+        if (item.telegramMessageId) {
+            // Add deep link to the approval message
+            line += ` [→ approve](https://t.me/c/${chatId.replace("-100", "")}/${item.telegramMessageId})`;
+        }
+        lines.push(line);
+    }
+
+    try {
+        await bot.api.sendMessage(chatId, lines.join("\n"), { parse_mode: "MarkdownV2" });
+        lastReminderDate = today;
+        log("INFO", `Sent daily reminder for ${pendingItems.length} pending cross-zone approval(s)`);
+    } catch (err) {
+        log("ERROR", `Failed to send pending approval reminder: ${toErrorMessage(err)}`);
+    }
+}
+
 // ─── Start ───
 
 // Poll outgoing queue every 1 second
@@ -1737,6 +1793,11 @@ startPeriodicCleanup();
 
 // Start periodic image file cleanup
 startImageCleanup();
+
+// Check for pending cross-zone approvals every hour (sends daily reminder)
+setInterval(checkPendingApprovalReminder, 3600_000);
+// Also check shortly after startup
+setTimeout(checkPendingApprovalReminder, 30_000);
 
 // Ensure Speaches models are installed (fire-and-forget, cached across restarts)
 ensureModels().catch(() => {});
