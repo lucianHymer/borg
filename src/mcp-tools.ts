@@ -785,9 +785,10 @@ export function createBorgMcpServer(sourceThreadId: number) {
                 try {
                     const zoneConfig = loadZoneConfig(ZONE_CONFIG_PATH);
                     if (zoneConfig) {
-                        const creatorZone = getThreadZone(zoneConfig, sourceThreadId);
-                        addThreadToZone(zoneConfig, threadId, creatorZone);
-                        saveZoneConfig(ZONE_CONFIG_PATH, zoneConfig);
+                        const updated = structuredClone(zoneConfig);
+                        const creatorZone = getThreadZone(updated, sourceThreadId);
+                        addThreadToZone(updated, threadId, creatorZone);
+                        saveZoneConfig(ZONE_CONFIG_PATH, updated);
                     }
                 } catch { /* zone config may not exist yet — non-fatal */ }
 
@@ -943,8 +944,9 @@ export function createBorgMcpServer(sourceThreadId: number) {
                 try {
                     const zoneConfig = loadZoneConfig(ZONE_CONFIG_PATH);
                     if (zoneConfig) {
-                        removeThreadFromZones(zoneConfig, threadId);
-                        saveZoneConfig(ZONE_CONFIG_PATH, zoneConfig);
+                        const updated = structuredClone(zoneConfig);
+                        removeThreadFromZones(updated, threadId);
+                        saveZoneConfig(ZONE_CONFIG_PATH, updated);
                     }
                 } catch { /* zone config may not exist — non-fatal */ }
 

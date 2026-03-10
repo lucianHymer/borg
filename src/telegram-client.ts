@@ -28,14 +28,51 @@ import { loadZoneConfig, getThreadZone } from "./zone-config.js";
 // ─── Constants ───
 
 const SCRIPT_DIR = path.resolve(__dirname, "..");
-const QUEUE_INCOMING = path.join(SCRIPT_DIR, ".borg/queue/incoming");
-const QUEUE_OUTGOING = path.join(SCRIPT_DIR, ".borg/queue/outgoing");
-const QUEUE_DEAD_LETTER = path.join(SCRIPT_DIR, ".borg/queue/dead-letter");
-const LOG_FILE = path.join(SCRIPT_DIR, ".borg/logs/telegram.log");
-const MESSAGE_MODELS_FILE = path.join(SCRIPT_DIR, ".borg/message-models.json");
-const QUEUE_STATUS = path.join(SCRIPT_DIR, ".borg/status");
-const MARKDOWN_PARSE_FAILURES = path.join(SCRIPT_DIR, ".borg/markdown-parse-failures.jsonl");
-const QUEUE_PENDING = path.join(SCRIPT_DIR, ".borg/queue/pending");
+const BORG_ZONE = process.env.BORG_ZONE || "";
+const ZONE_CONFIG_PATH = process.env.ZONE_CONFIG_PATH || path.join(SCRIPT_DIR, "zone-config.json");
+
+// In infra mode, .borg dirs are at /app/.borg-{zone}. In single-container, at /app/.borg.
+const BORG_DIR = path.join(SCRIPT_DIR, ".borg");
+const QUEUE_INCOMING = path.join(BORG_DIR, "queue/incoming");
+const QUEUE_OUTGOING = path.join(BORG_DIR, "queue/outgoing");
+const QUEUE_DEAD_LETTER = path.join(BORG_DIR, "queue/dead-letter");
+const LOG_FILE = BORG_ZONE === "infra"
+    ? path.join(SCRIPT_DIR, ".borg-infra/logs/telegram.log")
+    : path.join(BORG_DIR, "logs/telegram.log");
+const MESSAGE_MODELS_FILE = BORG_ZONE === "infra"
+    ? path.join(SCRIPT_DIR, ".borg-infra/message-models.json")
+    : path.join(BORG_DIR, "message-models.json");
+const QUEUE_STATUS = path.join(BORG_DIR, "status");
+const MARKDOWN_PARSE_FAILURES = BORG_ZONE === "infra"
+    ? path.join(SCRIPT_DIR, ".borg-infra/markdown-parse-failures.jsonl")
+    : path.join(BORG_DIR, "markdown-parse-failures.jsonl");
+const QUEUE_PENDING = BORG_ZONE === "infra"
+    ? path.join(SCRIPT_DIR, ".borg-infra/queue/pending")
+    : path.join(BORG_DIR, "queue/pending");
+
+/**
+ * Resolve the incoming queue path for a target thread's zone.
+ * In infra mode, routes to /app/.borg-{zone}/queue/incoming/.
+ * In single-container mode, routes to /app/.borg/queue/incoming/.
+ */
+function resolveZoneIncoming(targetZone: string): string {
+    if (BORG_ZONE === "infra") {
+        return path.join(SCRIPT_DIR, `.borg-${targetZone}/queue/incoming`);
+    }
+    return QUEUE_INCOMING;
+}
+
+/**
+ * Resolve the outgoing queue path for a target thread's zone.
+ * In infra mode, routes to /app/.borg-{zone}/queue/outgoing/.
+ * In single-container mode, routes to /app/.borg/queue/outgoing/.
+ */
+function resolveZoneOutgoing(targetZone: string): string {
+    if (BORG_ZONE === "infra") {
+        return path.join(SCRIPT_DIR, `.borg-${targetZone}/queue/outgoing`);
+    }
+    return QUEUE_OUTGOING;
+}
 const DEDUP_WINDOW_MS = 10_000; // 10 seconds
 const TASK_LISTS_FILE = path.join(SCRIPT_DIR, ".borg", TASK_LISTS_FILENAME);
 const TASK_PINS_FILE = path.join(SCRIPT_DIR, ".borg/task-pins.json");
@@ -1523,17 +1560,25 @@ bot.on("callback_query:data", async (ctx) => {
         const isApprove = data.startsWith("zone_approve:");
         const pendingId = data.replace(/^zone_(approve|reject):/, "");
         const pendingFile = path.join(QUEUE_PENDING, `${pendingId}.json`);
+        const processingFile = path.join(QUEUE_PENDING, `${pendingId}.processing`);
 
         try {
-            if (!fs.existsSync(pendingFile)) {
+            // Atomic claim: rename to .processing to prevent double-delivery race
+            try {
+                fs.renameSync(pendingFile, processingFile);
+            } catch {
                 await ctx.answerCallbackQuery({ text: "This approval has already been handled", show_alert: true });
                 return;
             }
 
-            const pending: PendingApproval = JSON.parse(fs.readFileSync(pendingFile, "utf8"));
+            const pending: PendingApproval = JSON.parse(fs.readFileSync(processingFile, "utf8"));
 
             if (isApprove) {
-                // Deliver the message: write to incoming queue for the target thread
+                // Resolve target zone's queue paths (zone-aware for infra container)
+                const targetIncoming = resolveZoneIncoming(pending.targetZone);
+                const targetOutgoing = resolveZoneOutgoing(pending.targetZone);
+
+                // Deliver the message: write to target zone's incoming queue
                 const incoming = {
                     channel: "telegram",
                     source: "cross-thread" as const,
@@ -1545,9 +1590,9 @@ bot.on("callback_query:data", async (ctx) => {
                     messageId: pending.id,
                 };
 
-                fs.mkdirSync(QUEUE_INCOMING, { recursive: true });
-                const inTmp = path.join(QUEUE_INCOMING, `${pending.id}.json.tmp`);
-                const inFinal = path.join(QUEUE_INCOMING, `${pending.id}.json`);
+                fs.mkdirSync(targetIncoming, { recursive: true });
+                const inTmp = path.join(targetIncoming, `${pending.id}.json.tmp`);
+                const inFinal = path.join(targetIncoming, `${pending.id}.json`);
                 fs.writeFileSync(inTmp, JSON.stringify(incoming));
                 fs.renameSync(inTmp, inFinal);
 
@@ -1564,14 +1609,14 @@ bot.on("callback_query:data", async (ctx) => {
                     model: "",
                 };
 
-                fs.mkdirSync(QUEUE_OUTGOING, { recursive: true });
-                const outTmp = path.join(QUEUE_OUTGOING, `${pending.id}_approved_tg.json.tmp`);
-                const outFinal = path.join(QUEUE_OUTGOING, `${pending.id}_approved_tg.json`);
+                fs.mkdirSync(targetOutgoing, { recursive: true });
+                const outTmp = path.join(targetOutgoing, `${pending.id}_approved_tg.json.tmp`);
+                const outFinal = path.join(targetOutgoing, `${pending.id}_approved_tg.json`);
                 fs.writeFileSync(outTmp, JSON.stringify(outgoing));
                 fs.renameSync(outTmp, outFinal);
 
-                // Remove pending file
-                fs.unlinkSync(pendingFile);
+                // Remove processing file
+                try { fs.unlinkSync(processingFile); } catch { /* best effort */ }
 
                 // Update the approval message
                 await ctx.answerCallbackQuery({ text: "Message approved and delivered" });
@@ -1584,6 +1629,9 @@ bot.on("callback_query:data", async (ctx) => {
 
                 log("INFO", `Cross-zone message ${pendingId} approved: ${pending.sourceZone} → ${pending.targetZone}`);
             } else {
+                // Resolve sender zone's incoming queue for rejection notice
+                const senderIncoming = resolveZoneIncoming(pending.sourceZone);
+
                 // Reject: notify sender
                 const rejection = {
                     channel: "telegram",
@@ -1595,14 +1643,14 @@ bot.on("callback_query:data", async (ctx) => {
                     messageId: `${pending.id}_rejected`,
                 };
 
-                fs.mkdirSync(QUEUE_INCOMING, { recursive: true });
-                const rejTmp = path.join(QUEUE_INCOMING, `${pending.id}_rejected.json.tmp`);
-                const rejFinal = path.join(QUEUE_INCOMING, `${pending.id}_rejected.json`);
+                fs.mkdirSync(senderIncoming, { recursive: true });
+                const rejTmp = path.join(senderIncoming, `${pending.id}_rejected.json.tmp`);
+                const rejFinal = path.join(senderIncoming, `${pending.id}_rejected.json`);
                 fs.writeFileSync(rejTmp, JSON.stringify(rejection));
                 fs.renameSync(rejTmp, rejFinal);
 
-                // Remove pending file
-                fs.unlinkSync(pendingFile);
+                // Remove processing file
+                try { fs.unlinkSync(processingFile); } catch { /* best effort */ }
 
                 // Update the approval message
                 await ctx.answerCallbackQuery({ text: "Message rejected" });
@@ -1616,6 +1664,8 @@ bot.on("callback_query:data", async (ctx) => {
                 log("INFO", `Cross-zone message ${pendingId} rejected: ${pending.sourceZone} → ${pending.targetZone}`);
             }
         } catch (err) {
+            // On error, try to move back from processing to pending for retry
+            try { fs.renameSync(processingFile, pendingFile); } catch { /* may already be gone */ }
             log("ERROR", `Zone approval callback failed for ${pendingId}: ${toErrorMessage(err)}`);
             try {
                 await ctx.answerCallbackQuery({ text: "Error processing approval", show_alert: true });
@@ -1766,7 +1816,18 @@ async function checkPendingApprovalReminder(): Promise<void> {
     }
 
     try {
-        await bot.api.sendMessage(chatId, lines.join("\n"), { parse_mode: "MarkdownV2" });
+        // Send to master thread — find it from threads.json
+        const threads = loadThreads();
+        const masterEntry = Object.entries(threads).find(([, t]) => t.isMaster);
+        const masterThreadId = masterEntry ? Number(masterEntry[0]) : undefined;
+        const threadOpt = masterThreadId && masterThreadId !== 1
+            ? { message_thread_id: masterThreadId }
+            : {};
+
+        await bot.api.sendMessage(chatId, lines.join("\n"), {
+            parse_mode: "MarkdownV2",
+            ...threadOpt,
+        });
         lastReminderDate = today;
         log("INFO", `Sent daily reminder for ${pendingItems.length} pending cross-zone approval(s)`);
     } catch (err) {
