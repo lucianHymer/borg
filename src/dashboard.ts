@@ -731,7 +731,10 @@ app.get("/api/logs/:type", (req, res) => {
 // ─── Zone Management API ───
 
 const ZONE_CONFIG_PATH = process.env.ZONE_CONFIG_PATH || path.join(SCRIPT_DIR, "zone-config.json");
-const PENDING_DIR = path.join(SCRIPT_DIR, ".borg-infra/queue/pending");
+const PENDING_DIRS = [
+    path.join(SCRIPT_DIR, ".borg-core/queue/pending"),
+    path.join(SCRIPT_DIR, ".borg-perimeter/queue/pending"),
+];
 
 // GET /api/zones — zone configuration with thread-to-zone mapping
 app.get("/api/zones", (_req, res) => {
@@ -789,19 +792,18 @@ app.post("/api/zones/move", (req, res) => {
 // GET /api/zones/pending — list pending cross-zone approvals
 app.get("/api/zones/pending", (_req, res) => {
     try {
-        if (!fs.existsSync(PENDING_DIR)) {
-            res.json({ pending: [] });
-            return;
-        }
-        const files = fs.readdirSync(PENDING_DIR).filter(f => f.endsWith(".json"));
         const pending: Array<PendingApproval & { ageMs: number }> = [];
-        for (const file of files) {
-            try {
-                const data: PendingApproval = JSON.parse(
-                    fs.readFileSync(path.join(PENDING_DIR, file), "utf8"),
-                );
-                pending.push({ ...data, ageMs: Date.now() - data.timestamp });
-            } catch { /* skip malformed */ }
+        for (const dir of PENDING_DIRS) {
+            if (!fs.existsSync(dir)) continue;
+            const files = fs.readdirSync(dir).filter(f => f.endsWith(".json"));
+            for (const file of files) {
+                try {
+                    const data: PendingApproval = JSON.parse(
+                        fs.readFileSync(path.join(dir, file), "utf8"),
+                    );
+                    pending.push({ ...data, ageMs: Date.now() - data.timestamp });
+                } catch { /* skip malformed */ }
+            }
         }
         pending.sort((a, b) => a.timestamp - b.timestamp);
         res.json({ pending });

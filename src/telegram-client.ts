@@ -47,9 +47,34 @@ const QUEUE_STATUS = path.join(BORG_DIR, "status");
 const MARKDOWN_PARSE_FAILURES = BORG_ZONE === "infra"
     ? path.join(SCRIPT_DIR, ".borg-infra/markdown-parse-failures.jsonl")
     : path.join(BORG_DIR, "markdown-parse-failures.jsonl");
-const QUEUE_PENDING = BORG_ZONE === "infra"
-    ? path.join(SCRIPT_DIR, ".borg-infra/queue/pending")
-    : path.join(BORG_DIR, "queue/pending");
+const QUEUE_PENDING = path.join(BORG_DIR, "queue/pending");
+
+/**
+ * Get all pending queue directories to scan.
+ * In infra mode, pending files live in each zone's own dir (written by zone MCP tools).
+ * In single-container mode, there's just one pending dir.
+ */
+function getPendingQueueDirs(): string[] {
+    if (BORG_ZONE === "infra") {
+        return [
+            path.join(SCRIPT_DIR, ".borg-core/queue/pending"),
+            path.join(SCRIPT_DIR, ".borg-perimeter/queue/pending"),
+        ];
+    }
+    return [QUEUE_PENDING];
+}
+
+/**
+ * Find a pending approval file by ID across all pending dirs.
+ * Returns the full path to the .json file, or null if not found.
+ */
+function findPendingFile(pendingId: string): string | null {
+    for (const dir of getPendingQueueDirs()) {
+        const filePath = path.join(dir, `${pendingId}.json`);
+        if (fs.existsSync(filePath)) return filePath;
+    }
+    return null;
+}
 
 /**
  * Resolve the incoming queue path for a target thread's zone.
@@ -994,14 +1019,16 @@ async function pollOutgoingQueue(): Promise<void> {
                         });
 
                         // Update the pending file with the Telegram message ID (for reminder links)
-                        const pendingFile = path.join(QUEUE_PENDING, `${pendingId}.json`);
-                        try {
-                            const pendingData: PendingApproval = JSON.parse(fs.readFileSync(pendingFile, "utf8"));
-                            pendingData.telegramMessageId = sent.message_id;
-                            const tmp = pendingFile + ".tmp";
-                            fs.writeFileSync(tmp, JSON.stringify(pendingData));
-                            fs.renameSync(tmp, pendingFile);
-                        } catch { /* pending file may not exist if running in different container */ }
+                        const pendingFile = findPendingFile(pendingId);
+                        if (pendingFile) {
+                            try {
+                                const pendingData: PendingApproval = JSON.parse(fs.readFileSync(pendingFile, "utf8"));
+                                pendingData.telegramMessageId = sent.message_id;
+                                const tmp = pendingFile + ".tmp";
+                                fs.writeFileSync(tmp, JSON.stringify(pendingData));
+                                fs.renameSync(tmp, pendingFile);
+                            } catch { /* pending file may have been processed already */ }
+                        }
 
                         log("INFO", `Cross-zone approval keyboard shown for ${pendingId}`);
                     } catch (err) {
@@ -1715,8 +1742,12 @@ bot.on("callback_query:data", async (ctx) => {
     if (data.startsWith("zone_approve:") || data.startsWith("zone_reject:")) {
         const isApprove = data.startsWith("zone_approve:");
         const pendingId = data.replace(/^zone_(approve|reject):/, "");
-        const pendingFile = path.join(QUEUE_PENDING, `${pendingId}.json`);
-        const processingFile = path.join(QUEUE_PENDING, `${pendingId}.processing`);
+        const pendingFile = findPendingFile(pendingId);
+        if (!pendingFile) {
+            await ctx.answerCallbackQuery({ text: "This approval has already been handled", show_alert: true });
+            return;
+        }
+        const processingFile = pendingFile.replace(/\.json$/, ".processing");
 
         try {
             // Atomic claim: rename to .processing to prevent double-delivery race
@@ -1933,22 +1964,22 @@ async function checkPendingApprovalReminder(): Promise<void> {
     const today = new Date().toISOString().slice(0, 10);
     if (today === lastReminderDate) return;
 
-    if (!fs.existsSync(QUEUE_PENDING)) return;
-
-    const files = fs.readdirSync(QUEUE_PENDING).filter(f => f.endsWith(".json"));
-    if (files.length === 0) return;
-
+    const pendingDirs = getPendingQueueDirs();
     const pendingItems: Array<PendingApproval & { age: string }> = [];
-    for (const file of files) {
-        try {
-            const data: PendingApproval = JSON.parse(
-                fs.readFileSync(path.join(QUEUE_PENDING, file), "utf8"),
-            );
-            const ageMs = Date.now() - data.timestamp;
-            const ageHours = Math.floor(ageMs / 3600000);
-            const age = ageHours < 24 ? `${ageHours}h` : `${Math.floor(ageHours / 24)}d`;
-            pendingItems.push({ ...data, age });
-        } catch { /* skip malformed files */ }
+    for (const dir of pendingDirs) {
+        if (!fs.existsSync(dir)) continue;
+        const files = fs.readdirSync(dir).filter(f => f.endsWith(".json"));
+        for (const file of files) {
+            try {
+                const data: PendingApproval = JSON.parse(
+                    fs.readFileSync(path.join(dir, file), "utf8"),
+                );
+                const ageMs = Date.now() - data.timestamp;
+                const ageHours = Math.floor(ageMs / 3600000);
+                const age = ageHours < 24 ? `${ageHours}h` : `${Math.floor(ageHours / 24)}d`;
+                pendingItems.push({ ...data, age });
+            } catch { /* skip malformed files */ }
+        }
     }
 
     if (pendingItems.length === 0) return;
