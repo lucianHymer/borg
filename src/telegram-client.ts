@@ -538,10 +538,21 @@ bot.on("edited_message:text", async (ctx) => {
     if (fs.existsSync(processingFile)) {
         const pending = pendingMessages.get(queueMessageId);
         if (pending) {
+            // Read original text from processing file
+            let originalText = "";
+            try {
+                const raw = JSON.parse(fs.readFileSync(processingFile, "utf8"));
+                originalText = raw.message ?? "";
+            } catch { /* best effort */ }
+
+            const warning = originalText
+                ? `⚠️ Edit received but already processing. Original text was:\n\n${originalText}`
+                : `⚠️ Edit received but already processing.`;
+
             const threadOpt = getThreadOpt(pending);
             await bot.api.sendMessage(
                 pending.chatId,
-                `⚠️ Edit received but already processing. Original message is being handled.`,
+                warning,
                 {
                     message_thread_id: threadOpt,
                     reply_parameters: { message_id: telegramMsgId },
