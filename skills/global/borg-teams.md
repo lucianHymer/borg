@@ -47,6 +47,13 @@ All threads in a team share a single task list — tasks created in one thread a
 
 The Planner role is responsible for creating ALL tasks (both workflow scaffolding and implementation subtasks) at the start of a session.
 
+## Initial Messages
+
+When writing the `initialMessage` for `create_thread`, tell the agent their role and
+what they're working on, but do NOT repeat the workflow steps — the system prompt
+already instructs them to read the workflow file and follow their task list literally.
+Keep initial messages short: role, project context, team roster, and "wait for X".
+
 ## No Heartbeats
 Team threads don't have heartbeats. If periodic work is needed, ask a main
 thread to add it to their HEARTBEAT.md.
