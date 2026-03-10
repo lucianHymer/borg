@@ -186,6 +186,12 @@ export const canUseTool: CanUseTool = async (toolName, input) => {
             message: "No human is available. State what you need in your response text.",
         };
     }
+    if (toolName === "CronCreate" || toolName === "CronDelete" || toolName === "CronList") {
+        return {
+            behavior: "deny",
+            message: "Cron tools are session-only and won't survive restarts. Use the scheduled-opus-tasks pattern instead: add a @HH:MM timed task to your HEARTBEAT.md that fires a send_message with [use opus]. See ~/.claude/skills/scheduled-opus-tasks.md for details.",
+        };
+    }
     if (toolName === "EnterPlanMode" || toolName === "ExitPlanMode") {
         return {
             behavior: "deny",
