@@ -42,6 +42,22 @@ export interface OutgoingMessage {
     routingMetadata?: RoutingMetadata;
     replyToMessageId?: number; // Telegram message_id being replied to
     replyToVoice?: boolean;    // true if replying to a voice message
+    crossZonePending?: boolean; // true if this is a cross-zone message awaiting approval
+}
+
+// ─── Cross-Zone Pending Approval ───
+
+export interface PendingApproval {
+    id: string;                // unique ID for this pending message
+    sourceThreadId: number;    // sender's thread
+    targetThreadId: number;    // recipient's thread
+    sourceZone: string;        // sender's zone name
+    targetZone: string;        // recipient's zone name
+    senderName: string;        // human-readable sender name
+    targetName: string;        // human-readable target name
+    message: string;           // the actual message content
+    timestamp: number;         // when the message was sent
+    telegramMessageId?: number; // Telegram message_id of the approval keyboard message
 }
 
 // ─── Routing Metadata ───

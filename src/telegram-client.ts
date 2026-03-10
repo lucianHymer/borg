@@ -16,7 +16,7 @@ import {
     configureThread,
 } from "./session-manager.js";
 import type { ThreadConfig, ThreadsMap, Settings } from "./session-manager.js";
-import type { OutgoingMessage, TaskListMapping, MessageModelEntry } from "./types.js";
+import type { OutgoingMessage, TaskListMapping, MessageModelEntry, PendingApproval } from "./types.js";
 import { toErrorMessage, TASK_LISTS_FILENAME } from "./types.js";
 import { RoutingMetadataSchema } from "./types.js";
 import { logDecision, logCorrection, ROUTING_LOG } from "./routing-logger.js";
@@ -35,6 +35,7 @@ const LOG_FILE = path.join(SCRIPT_DIR, ".borg/logs/telegram.log");
 const MESSAGE_MODELS_FILE = path.join(SCRIPT_DIR, ".borg/message-models.json");
 const QUEUE_STATUS = path.join(SCRIPT_DIR, ".borg/status");
 const MARKDOWN_PARSE_FAILURES = path.join(SCRIPT_DIR, ".borg/markdown-parse-failures.jsonl");
+const QUEUE_PENDING = path.join(SCRIPT_DIR, ".borg/queue/pending");
 const DEDUP_WINDOW_MS = 10_000; // 10 seconds
 const TASK_LISTS_FILE = path.join(SCRIPT_DIR, ".borg", TASK_LISTS_FILENAME);
 const TASK_PINS_FILE = path.join(SCRIPT_DIR, ".borg/task-pins.json");
@@ -875,7 +876,48 @@ async function pollOutgoingQueue(): Promise<void> {
 
                 let firstSentId: number | undefined;
 
-                if (data.targetThreadId) {
+                if (data.crossZonePending && data.targetThreadId && data.sourceThreadId) {
+                    // Cross-zone message: show approval keyboard in master thread
+                    const chatId = settings.telegram_chat_id;
+                    const pendingId = data.messageId.replace(/_tg$/, "");
+                    const preview = data.message.length > 200
+                        ? data.message.substring(0, 200) + "..."
+                        : data.message;
+
+                    const approvalText = [
+                        `🔒 *Cross\\-zone message pending approval*`,
+                        ``,
+                        `*From:* ${escapeMarkdownV2(data.sender || "unknown")} \\(thread ${data.sourceThreadId}\\)`,
+                        `*To:* thread ${data.targetThreadId}`,
+                        ``,
+                        `${escapeMarkdownV2(preview)}`,
+                    ].join("\n");
+
+                    const keyboard = new InlineKeyboard()
+                        .text("✅ Approve", `zone_approve:${pendingId}`)
+                        .text("❌ Reject", `zone_reject:${pendingId}`);
+
+                    try {
+                        const sent = await bot.api.sendMessage(chatId, approvalText, {
+                            parse_mode: "MarkdownV2",
+                            reply_markup: keyboard,
+                        });
+
+                        // Update the pending file with the Telegram message ID (for reminder links)
+                        const pendingFile = path.join(QUEUE_PENDING, `${pendingId}.json`);
+                        try {
+                            const pendingData: PendingApproval = JSON.parse(fs.readFileSync(pendingFile, "utf8"));
+                            pendingData.telegramMessageId = sent.message_id;
+                            const tmp = pendingFile + ".tmp";
+                            fs.writeFileSync(tmp, JSON.stringify(pendingData));
+                            fs.renameSync(tmp, pendingFile);
+                        } catch { /* pending file may not exist if running in different container */ }
+
+                        log("INFO", `Cross-zone approval keyboard shown for ${pendingId}`);
+                    } catch (err) {
+                        log("ERROR", `Failed to show cross-zone approval: ${toErrorMessage(err)}`);
+                    }
+                } else if (data.targetThreadId) {
                     // Cross-thread message: post to the target topic
                     const chatId = settings.telegram_chat_id;
 
@@ -1575,6 +1617,112 @@ bot.on("callback_query:data", async (ctx) => {
             } catch { /* callback may have already been answered */ }
         } finally {
             voiceButtonsInFlight.delete(voiceMessageId);
+        }
+        return;
+    }
+
+    // ─── Cross-Zone Approval ───
+    if (data.startsWith("zone_approve:") || data.startsWith("zone_reject:")) {
+        const isApprove = data.startsWith("zone_approve:");
+        const pendingId = data.replace(/^zone_(approve|reject):/, "");
+        const pendingFile = path.join(QUEUE_PENDING, `${pendingId}.json`);
+
+        try {
+            if (!fs.existsSync(pendingFile)) {
+                await ctx.answerCallbackQuery({ text: "This approval has already been handled", show_alert: true });
+                return;
+            }
+
+            const pending: PendingApproval = JSON.parse(fs.readFileSync(pendingFile, "utf8"));
+
+            if (isApprove) {
+                // Deliver the message: write to incoming queue for the target thread
+                const incoming = {
+                    channel: "telegram",
+                    source: "cross-thread" as const,
+                    threadId: pending.targetThreadId,
+                    sourceThreadId: pending.sourceThreadId,
+                    sender: pending.senderName,
+                    message: pending.message,
+                    timestamp: Date.now(),
+                    messageId: pending.id,
+                };
+
+                fs.mkdirSync(QUEUE_INCOMING, { recursive: true });
+                const inTmp = path.join(QUEUE_INCOMING, `${pending.id}.json.tmp`);
+                const inFinal = path.join(QUEUE_INCOMING, `${pending.id}.json`);
+                fs.writeFileSync(inTmp, JSON.stringify(incoming));
+                fs.renameSync(inTmp, inFinal);
+
+                // Also write outgoing for display in target thread
+                const outgoing = {
+                    channel: "telegram",
+                    targetThreadId: pending.targetThreadId,
+                    sourceThreadId: pending.sourceThreadId,
+                    sender: pending.senderName,
+                    message: pending.message,
+                    originalMessage: "",
+                    timestamp: Date.now(),
+                    messageId: `${pending.id}_approved_tg`,
+                    model: "",
+                };
+
+                fs.mkdirSync(QUEUE_OUTGOING, { recursive: true });
+                const outTmp = path.join(QUEUE_OUTGOING, `${pending.id}_approved_tg.json.tmp`);
+                const outFinal = path.join(QUEUE_OUTGOING, `${pending.id}_approved_tg.json`);
+                fs.writeFileSync(outTmp, JSON.stringify(outgoing));
+                fs.renameSync(outTmp, outFinal);
+
+                // Remove pending file
+                fs.unlinkSync(pendingFile);
+
+                // Update the approval message
+                await ctx.answerCallbackQuery({ text: "Message approved and delivered" });
+                try {
+                    await ctx.editMessageText(
+                        `✅ *Approved* — message from ${escapeMarkdownV2(pending.senderName)} delivered to thread ${pending.targetThreadId}`,
+                        { parse_mode: "MarkdownV2" },
+                    );
+                } catch { /* best effort */ }
+
+                log("INFO", `Cross-zone message ${pendingId} approved: ${pending.sourceZone} → ${pending.targetZone}`);
+            } else {
+                // Reject: notify sender
+                const rejection = {
+                    channel: "telegram",
+                    source: "system" as const,
+                    threadId: pending.sourceThreadId,
+                    sender: "System",
+                    message: `Your cross-zone message to thread ${pending.targetThreadId} (${pending.targetName}) was rejected by a human reviewer.`,
+                    timestamp: Date.now(),
+                    messageId: `${pending.id}_rejected`,
+                };
+
+                fs.mkdirSync(QUEUE_INCOMING, { recursive: true });
+                const rejTmp = path.join(QUEUE_INCOMING, `${pending.id}_rejected.json.tmp`);
+                const rejFinal = path.join(QUEUE_INCOMING, `${pending.id}_rejected.json`);
+                fs.writeFileSync(rejTmp, JSON.stringify(rejection));
+                fs.renameSync(rejTmp, rejFinal);
+
+                // Remove pending file
+                fs.unlinkSync(pendingFile);
+
+                // Update the approval message
+                await ctx.answerCallbackQuery({ text: "Message rejected" });
+                try {
+                    await ctx.editMessageText(
+                        `❌ *Rejected* — message from ${escapeMarkdownV2(pending.senderName)} to thread ${pending.targetThreadId} was rejected`,
+                        { parse_mode: "MarkdownV2" },
+                    );
+                } catch { /* best effort */ }
+
+                log("INFO", `Cross-zone message ${pendingId} rejected: ${pending.sourceZone} → ${pending.targetZone}`);
+            }
+        } catch (err) {
+            log("ERROR", `Zone approval callback failed for ${pendingId}: ${toErrorMessage(err)}`);
+            try {
+                await ctx.answerCallbackQuery({ text: "Error processing approval", show_alert: true });
+            } catch { /* callback may have already been answered */ }
         }
         return;
     }
