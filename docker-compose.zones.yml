@@ -54,7 +54,7 @@ services:
     volumes:
       - ./.borg-core:/app/.borg
       - ./threads.json:/app/threads.json
-      - ./zone-config.json:/app/zone-config.json:ro
+      - ./zone-config.json:/app/zone-config.json  # writable: create_thread/delete_thread update zone assignments
       # Pending queue shared for cross-zone writes
       - ./.borg-infra/queue/pending:/app/.borg/queue/pending
       # Workspace access
@@ -95,7 +95,7 @@ services:
     volumes:
       - ./.borg-perimeter:/app/.borg
       - ./threads.json:/app/threads.json
-      - ./zone-config.json:/app/zone-config.json:ro
+      - ./zone-config.json:/app/zone-config.json  # writable: create_thread/delete_thread update zone assignments
       # Pending queue shared for cross-zone writes
       - ./.borg-infra/queue/pending:/app/.borg/queue/pending
       # Workspace access (sandboxed by Claude Code)

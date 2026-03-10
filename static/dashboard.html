@@ -829,9 +829,16 @@ tr.clickable { cursor: pointer; }
     <h3>Queue Status</h3>
     <div class="stat-grid" id="overview-queue"></div>
     <h3>Active Threads</h3>
+    <div id="zone-filter" style="margin-bottom:8px;display:none;">
+      <label style="font-size:12px;color:var(--text-secondary);">Zone: </label>
+      <select id="zone-filter-select" style="background:var(--bg-card);color:var(--text-primary);border:1px solid var(--border);border-radius:4px;padding:2px 6px;font-size:12px;">
+        <option value="">All</option>
+      </select>
+      <span id="zone-pending-count" style="margin-left:12px;font-size:12px;color:var(--accent-yellow);display:none;"></span>
+    </div>
     <table id="threads-table">
       <thead>
-        <tr><th>ID</th><th>Name</th><th>Model</th><th>Last Active</th><th>Session</th><th>CWD</th></tr>
+        <tr><th>ID</th><th>Name</th><th>Zone</th><th>Model</th><th>Last Active</th><th>Session</th><th>CWD</th></tr>
       </thead>
       <tbody id="threads-tbody"></tbody>
     </table>
@@ -1194,6 +1201,8 @@ tr.clickable { cursor: pointer; }
     fetchOverview();
     clearInterval_('overview');
     state.intervals.overview = setInterval(fetchOverview, 5000);
+    // Zone filter re-renders on change
+    document.getElementById('zone-filter-select').onchange = fetchOverview;
   }
 
   async function fetchOverview() {
@@ -1266,22 +1275,64 @@ tr.clickable { cursor: pointer; }
       '</div>';
   }
 
+  function zoneBadge(zone) {
+    if (!zone) return '';
+    var colors = { core: 'var(--accent-green)', perimeter: 'var(--accent-yellow)' };
+    var color = colors[zone] || 'var(--text-secondary)';
+    return '<span class="badge" style="background:' + color + ';color:#000;font-size:10px;">' + escapeHtml(zone) + '</span>';
+  }
+
   function renderOverviewThreads(data) {
     const threads = data.threads || [];
     const tbody = document.getElementById('threads-tbody');
+    const filterEl = document.getElementById('zone-filter');
+    const selectEl = document.getElementById('zone-filter-select');
     let rows = '';
+
+    // Show zone filter if zones are configured
+    if (data.zonesConfigured) {
+      filterEl.style.display = '';
+      // Populate zone filter options (keep selected value)
+      var currentFilter = selectEl.value;
+      var zones = {};
+      threads.forEach(function(t) { if (t.zone) zones[t.zone] = true; });
+      var opts = '<option value="">All</option>';
+      Object.keys(zones).sort().forEach(function(z) {
+        opts += '<option value="' + escapeHtml(z) + '"' + (z === currentFilter ? ' selected' : '') + '>' + escapeHtml(z) + '</option>';
+      });
+      selectEl.innerHTML = opts;
+      // Fetch pending approvals count
+      fetch('/api/zones/pending').then(function(r) { return r.json(); }).then(function(d) {
+        var countEl = document.getElementById('zone-pending-count');
+        if (d.pending && d.pending.length > 0) {
+          countEl.textContent = d.pending.length + ' pending approval(s)';
+          countEl.style.display = '';
+        } else {
+          countEl.style.display = 'none';
+        }
+      }).catch(function() {});
+    } else {
+      filterEl.style.display = 'none';
+    }
+
+    // Apply zone filter
+    var zoneFilter = selectEl.value;
 
     // threads is an array of { id, ...cfg } from /api/status
     const sorted = threads.slice().sort(function(a, b) {
       return (b.lastActive || 0) - (a.lastActive || 0);
     });
 
-    if (sorted.length === 0) {
-      rows = '<tr><td colspan="6" class="empty-state">No active threads</td></tr>';
+    var filtered = zoneFilter
+      ? sorted.filter(function(t) { return t.zone === zoneFilter; })
+      : sorted;
+
+    if (filtered.length === 0) {
+      rows = '<tr><td colspan="7" class="empty-state">No active threads</td></tr>';
     }
 
-    for (var i = 0; i < sorted.length; i++) {
-      var t = sorted[i];
+    for (var i = 0; i < filtered.length; i++) {
+      var t = filtered[i];
       var id = t.id || '';
       var sessionBadge = t.sessionId
         ? '<span class="badge badge-green" title="' + escapeHtml(t.sessionId) + '">active</span>'
@@ -1289,6 +1340,7 @@ tr.clickable { cursor: pointer; }
       rows += '<tr class="clickable" data-thread-id="' + escapeHtml(String(id)) + '">' +
         '<td>' + escapeHtml(String(id)) + '</td>' +
         '<td>' + escapeHtml(t.name || '') + (t.isMaster ? ' <span class="badge badge-yellow">master</span>' : '') + '</td>' +
+        '<td>' + zoneBadge(t.zone) + '</td>' +
         '<td>' + modelBadge(t.model) + '</td>' +
         '<td>' + relativeTime(t.lastActive) + '</td>' +
         '<td>' + sessionBadge + '</td>' +
@@ -1312,7 +1364,7 @@ tr.clickable { cursor: pointer; }
       '<div class="stat-card"><div class="label">Status</div><div class="value" style="color:var(--accent-red)">Offline</div></div>';
     document.getElementById('overview-queue').innerHTML = '';
     document.getElementById('threads-tbody').innerHTML =
-      '<tr><td colspan="6" class="empty-state">Cannot reach API server</td></tr>';
+      '<tr><td colspan="7" class="empty-state">Cannot reach API server</td></tr>';
   }
 
   // ─── View 2: Live Feed ───

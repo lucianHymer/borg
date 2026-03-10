@@ -777,8 +777,9 @@ app.post("/api/zones/move", (req, res) => {
             res.status(400).json({ error: `Zone "${zone}" does not exist` });
             return;
         }
-        addThreadToZone(config, threadId, zone);
-        saveZoneConfig(ZONE_CONFIG_PATH, config);
+        const updated = structuredClone(config);
+        addThreadToZone(updated, threadId, zone);
+        saveZoneConfig(ZONE_CONFIG_PATH, updated);
         res.json({ success: true, threadId, zone });
     } catch (err) {
         res.status(500).json({ error: toErrorMessage(err) });
