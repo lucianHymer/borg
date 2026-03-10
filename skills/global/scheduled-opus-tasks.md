@@ -4,57 +4,54 @@ Schedule a message to be sent to any thread at a specific time, forcing opus-lev
 
 ## When to Use
 
-When the user says things like:
+When the user or another thread says things like:
 - "Schedule an opus task for thread X at 3am"
 - "Send an opus message to the trading thread at midnight"
-- "Schedule a check-in with thread 1146 tomorrow morning"
+- "Can you check in with me at 3am with opus?"
 - "Have thread X do Y at Z time using opus"
 
 ## How It Works
 
-1. **Create a cron job** that writes a cross-thread message to the target thread at the scheduled time
-2. The message includes `[use opus]` prefix so the router upgrades to opus regardless of content complexity
-3. The target thread's session processes it like any other incoming message — but with opus
+The `[use opus]` prefix in any message triggers the router to upgrade to opus regardless of content complexity. This works on any message source — user, cross-thread, system, or heartbeat-triggered.
 
-## Implementation
+## The Pattern: Delegate to a Heartbeated Thread
 
-Use `CronCreate` to schedule a one-shot or recurring task that sends a message via the `send_message` MCP tool (or writes directly to the outgoing queue).
+Threads with heartbeats (main repo threads) already have a recurring ~8-minute check cycle with support for timed tasks via `@HH:MM` syntax in HEARTBEAT.md. This is the primary scheduling mechanism.
 
-The cron command should write a JSON file to `/app/.borg/queue/incoming/` with:
-```json
-{
-  "threadId": <TARGET_THREAD_ID>,
-  "message": "[use opus] <the actual task/instruction>",
-  "source": "system",
-  "timestamp": <epoch_ms>
-}
+### If you ARE a heartbeated thread (main thread)
+
+Add a timed task directly to your own HEARTBEAT.md:
+
+```markdown
+## Timed Tasks
+- @03:00 — Send `[use opus] Check portfolio status and report issues` to thread 1146 via send_message
 ```
 
-Example cron command:
-```bash
-echo '{"threadId":1146,"message":"[use opus] Check portfolio status, review overnight trades, and report any issues.","source":"system","timestamp":'$(date +%s%3N)'}' > /app/.borg/queue/incoming/scheduled_$(date +%s%3N).json
-```
+The heartbeat processor will fire this at the specified time. After execution, remove or update the entry.
+
+### If you are NOT a heartbeated thread (team worker, etc.)
+
+Ask a heartbeated thread to schedule it for you:
+
+1. Use `send_message` to the main thread for your repo
+2. Ask it to add a timed task to its HEARTBEAT.md
+3. The timed task should use `send_message` back to YOUR thread with `[use opus]` prefix
+
+Example message to send:
+> "Can you add a @03:00 timed task to your HEARTBEAT.md to send me (thread 482) this message via send_message: `[use opus] Review overnight trades and iterate on the strategy`"
+
+The main thread adds the entry, its heartbeat fires it at 3am, and your thread wakes up with an opus-routed message.
+
+### Immediate (no scheduling needed)
+
+Just use the `send_message` MCP tool directly with `[use opus]` in the message text:
+> `[use opus] Do a deep review of the current portfolio allocation`
 
 ## Key Details
 
-- `[use opus]` in the message text triggers the router override — no code changes needed
+- `[use opus]` in the message text triggers the router override — no new tools needed
 - The target thread must exist in threads.json
-- One-shot tasks: use `at`-style scheduling or a cron that removes itself
-- Recurring tasks: use standard cron expressions
-- The source thread doesn't need to be running — the queue system handles delivery
-- Messages appear in the target thread's Telegram topic with the opus 🔥 reaction
-
-## Examples
-
-**"Schedule an opus check-in with the trading thread at 3am":**
-```
-CronCreate: 0 3 * * * — write queue message to thread 1146 with [use opus] prefix
-```
-
-**"Have the trading bot review positions every 6 hours with opus":**
-```
-CronCreate: 0 */6 * * * — write queue message with [use opus] and review instructions
-```
-
-**"Send an opus message to thread 58 right now":**
-Just use `send_message` MCP tool directly with `[use opus]` in the message text. No scheduling needed.
+- HEARTBEAT.md `@HH:MM` tasks fire on the next heartbeat cycle after the specified time
+- One-shot tasks: remove the timed entry from HEARTBEAT.md after execution
+- Recurring tasks: keep the entry and let it fire each day
+- This pattern is pure conversation + existing infrastructure — no scripts or cron jobs needed
