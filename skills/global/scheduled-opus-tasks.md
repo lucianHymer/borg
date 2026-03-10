@@ -33,9 +33,9 @@ The heartbeat (haiku) just fires the send_message. The target thread receives it
 
 ### If you are NOT a heartbeated thread (team worker, etc.)
 
-Ask a heartbeated thread to schedule it for you:
+Ask your repo's main thread to schedule it for you:
 
-1. Use `send_message` to the main thread for your repo
+1. Use `send_message` to the main thread for your repo (check threads.json — it's the `mainThread: true` thread for your repo)
 2. Ask it to add a timed task to its HEARTBEAT.md
 3. The timed task should use `send_message` back to YOUR thread with `[use opus]` prefix
 
@@ -43,6 +43,8 @@ Example message to send:
 > "Can you add a @03:00 timed task to your HEARTBEAT.md to send me (thread 482) this message via send_message: `[use opus] Review overnight trades and iterate on the strategy`"
 
 The main thread's heartbeat (haiku) fires the send_message at 3am. Your thread receives it and processes with opus.
+
+If you can't determine your repo's main thread, you can ask the master thread (thread 43) as a last resort — it can route you to the right place.
 
 ### Immediate (no scheduling needed)
 
