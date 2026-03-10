@@ -11,6 +11,7 @@
 - @architecture/image-message-support-download-and-read-tool-pattern.md
 - @architecture/skills-directory-structure-global-vs-workflows.md
 - @architecture/broadcast-system-cross-repo-knowledge-sharing.md
+- @architecture/security-zones-container-isolation.md
 
 ## Patterns
 - @patterns/distillforspeech-uses-agent-sdk-query-not-raw-fetch.md
