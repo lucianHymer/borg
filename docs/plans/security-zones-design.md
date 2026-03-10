@@ -52,7 +52,14 @@ Agents can see ALL threads via `list_threads` regardless of zone. The whole poin
 
 ### 2.4 Pending Approval Reminders
 
-Infra runs a daily scan of the pending approval queue. Any unapproved cross-zone messages are summarized and posted to the master thread's Telegram topic with links to the original approval messages. This prevents approvals from getting lost in message history.
+Infra runs a daily scan of `.borg-infra/queue/pending/`. Any unapproved cross-zone messages are summarized and posted to the master thread's Telegram topic. Each entry includes:
+- Sender name/zone
+- Target name/zone
+- Message preview
+- Age (time pending)
+- **Telegram message link** to the original approval keyboard message
+
+This makes it easy to click through and approve/reject, preventing approvals from getting lost in message history.
 
 ### 2.5 Per-Zone Storage
 
@@ -219,7 +226,7 @@ All done in a single phase — containers, storage, and routing land together.
 
 1. Create `zone-config.json` schema and loader
 2. Cross-zone `send_message` hold + Telegram inline keyboard approval in infra
-3. Pending approval daily reminder to master thread
+3. Pending approval daily reminder to master thread (with Telegram message links for easy access)
 4. Broadcast fan-out filtered to core-zone `mainThread` threads
 5. Broadcast MCP tool only registered in core's queue-processor
 6. Per-zone storage directories (`.borg-core/`, `.borg-perimeter/`, `.borg-infra/`)
