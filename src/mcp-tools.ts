@@ -641,6 +641,8 @@ export function createBorgMcpServer(sourceThreadId: number) {
                 .describe("Team identifier (lowercase alphanumeric + hyphens)"),
             role: z.string().min(1).max(64).regex(/^[a-z][a-z0-9-]*$/).optional()
                 .describe("Agent role (lowercase alphanumeric + hyphens)"),
+            workflow: z.string().optional()
+                .describe("Path to workflow skill file (e.g., '.claude/skills/workflows/dev-team.md'). REQUIRED for team threads — tells the agent which workflow to follow."),
             cwd: z.string().optional()
                 .describe("Working directory for the thread. REQUIRED for team threads — set this to the absolute path of the team's git worktree (e.g., /absolute/path/.borg/worktrees/{team-name}). All team members must share the same cwd for proper isolation."),
             mainThread: z.boolean().optional()
@@ -648,7 +650,7 @@ export function createBorgMcpServer(sourceThreadId: number) {
             initialMessage: z.string().optional()
                 .describe("First message to send to the new thread"),
         },
-        async ({ name, team, role, cwd, mainThread, initialMessage }) => {
+        async ({ name, team, role, workflow, cwd, mainThread, initialMessage }) => {
             try {
                 const settings = loadSettings();
                 const threads = loadThreads();
@@ -720,6 +722,7 @@ export function createBorgMcpServer(sourceThreadId: number) {
                     lastActive: Date.now(),
                     ...(team ? { team } : {}),
                     ...(role ? { role } : {}),
+                    ...(workflow ? { workflow } : {}),
                     ...(mainThread ? { mainThread } : {}),
                 });
 
@@ -747,6 +750,7 @@ export function createBorgMcpServer(sourceThreadId: number) {
                 const parts = [`Created thread "${name}" (ID: ${threadId})`];
                 if (team) parts.push(`team=${team}`);
                 if (role) parts.push(`role=${role}`);
+                if (workflow) parts.push(`workflow=${workflow}`);
                 return { content: [textContent(parts.join(", "))] };
             } catch (err) {
                 return {
@@ -768,10 +772,12 @@ export function createBorgMcpServer(sourceThreadId: number) {
                 .describe("Team identifier"),
             role: z.string().min(1).max(64).regex(/^[a-z][a-z0-9-]*$/).optional()
                 .describe("Agent role"),
+            workflow: z.string().optional()
+                .describe("Path to workflow skill file (e.g., '.claude/skills/workflows/dev-team.md')"),
             mainThread: z.boolean().optional()
                 .describe("Mark as a main thread that receives broadcast fan-outs"),
         },
-        async ({ threadId, team, role, mainThread }) => {
+        async ({ threadId, team, role, workflow, mainThread }) => {
             try {
                 const threads = loadThreads();
                 if (!threads[String(threadId)]) {
@@ -780,9 +786,10 @@ export function createBorgMcpServer(sourceThreadId: number) {
                 configureThread(threadId, {
                     ...(team !== undefined ? { team } : {}),
                     ...(role !== undefined ? { role } : {}),
+                    ...(workflow !== undefined ? { workflow } : {}),
                     ...(mainThread !== undefined ? { mainThread } : {}),
                 });
-                return { content: [textContent(`Updated thread ${threadId}: team=${team ?? "(unchanged)"}, role=${role ?? "(unchanged)"}, mainThread=${mainThread ?? "(unchanged)"}`)] };
+                return { content: [textContent(`Updated thread ${threadId}: team=${team ?? "(unchanged)"}, role=${role ?? "(unchanged)"}, workflow=${workflow ?? "(unchanged)"}, mainThread=${mainThread ?? "(unchanged)"}`)] };
             } catch (err) {
                 return { content: [textContent(`Failed: ${toErrorMessage(err)}`)], isError: true };
             }

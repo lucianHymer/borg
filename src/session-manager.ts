@@ -18,6 +18,7 @@ export interface ThreadConfig {
     team?: string;          // Team identifier (e.g., "auth-feature")
     role?: string;          // Agent role (e.g., "planner", "reviewer")
     mainThread?: boolean;   // Receives broadcast fan-outs (only long-lived threads)
+    workflow?: string;      // Path to workflow skill file (e.g., ".claude/skills/workflows/dev-team.md")
 }
 
 export type ThreadsMap = Record<string, ThreadConfig>;
@@ -506,7 +507,11 @@ function buildTeamBlock(config: ThreadConfig, threadId: number): string {
     lines.push("You do not have heartbeats. If periodic scheduled work is needed,");
     lines.push("suggest that a main thread's HEARTBEAT.md be updated.");
     lines.push("");
-    lines.push("Your workflow is described in `.claude/skills/workflows/`. Read the relevant workflow skill when you need to understand coordination patterns.");
+    if (config.workflow) {
+        lines.push(`Your workflow is defined in \`${config.workflow}\`. Read it at the start of your session to understand your role and coordination patterns.`);
+    } else {
+        lines.push("Your workflow is described in `.claude/skills/workflows/`. Read the relevant workflow skill when you need to understand coordination patterns.");
+    }
     return lines.join("\n");
 }
 
@@ -687,6 +692,7 @@ export function configureThread(threadId: number, updates: Partial<ThreadConfig>
             lastActive: filtered.lastActive ?? Date.now(),
             ...(filtered.team ? { team: filtered.team } : {}),
             ...(filtered.role ? { role: filtered.role } : {}),
+            ...(filtered.workflow ? { workflow: filtered.workflow } : {}),
         };
     }
     saveThreads(threads);
