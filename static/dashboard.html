@@ -741,6 +741,66 @@ tr.clickable { cursor: pointer; }
   padding: 40px 20px;
   font-size: 13px;
 }
+
+/* ─── Heartbeats View ─── */
+
+.heartbeat-card {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  margin-bottom: 16px;
+  overflow: hidden;
+}
+
+.heartbeat-card-header {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 10px 14px;
+  background: var(--bg-tertiary);
+  border-bottom: 1px solid var(--border);
+}
+
+.heartbeat-card-header .thread-name {
+  font-weight: 700;
+  color: var(--accent-blue);
+  font-size: 13px;
+}
+
+.heartbeat-card-header .thread-id {
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
+.heartbeat-card-header .thread-cwd {
+  color: var(--text-secondary);
+  font-size: 11px;
+  margin-left: auto;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 400px;
+}
+
+.heartbeat-card-missing {
+  padding: 10px 14px;
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-style: italic;
+}
+
+.heartbeat-card pre {
+  margin: 0;
+  padding: 14px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text-primary);
+  max-height: 500px;
+  overflow-y: auto;
+}
 </style>
 </head>
 <body>
@@ -754,6 +814,7 @@ tr.clickable { cursor: pointer; }
   <a href="#metrics" data-view="metrics">Metrics</a>
   <a href="#logs" data-view="logs">Logs</a>
   <a href="#memory" data-view="memory">Memory</a>
+  <a href="#heartbeats" data-view="heartbeats">Heartbeats</a>
   <div id="conn-status">
     <div id="conn-dot" class="connecting"></div>
     <span id="conn-text">connecting</span>
@@ -866,6 +927,16 @@ tr.clickable { cursor: pointer; }
       <button id="memory-apply-btn" disabled>Apply Changes</button>
       <div id="memory-validation-msg">No changes pending</div>
     </div>
+  </div>
+
+  <!-- View: Heartbeats -->
+  <div id="view-heartbeats" class="view">
+    <h2 style="margin-bottom:12px;">Heartbeat Files</h2>
+    <div style="display:flex;gap:8px;margin-bottom:16px;align-items:center;">
+      <button id="heartbeats-refresh-btn">Refresh</button>
+      <span id="heartbeats-meta" style="color:var(--text-secondary);font-size:11px;"></span>
+    </div>
+    <div id="heartbeats-list"></div>
   </div>
 </div>
 
@@ -1084,6 +1155,7 @@ tr.clickable { cursor: pointer; }
       case 'metrics': initMetrics(); break;
       case 'logs': initLogs(); break;
       case 'memory': initMemory(); break;
+      case 'heartbeats': initHeartbeats(); break;
     }
   }
 
@@ -2311,6 +2383,58 @@ tr.clickable { cursor: pointer; }
     if (bytes >= 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(0) + ' MB';
     if (bytes >= 1024) return (bytes / 1024).toFixed(0) + ' KB';
     return bytes + ' B';
+  }
+
+  // ─── View: Heartbeats ───
+
+  function initHeartbeats() {
+    fetchHeartbeats();
+    document.getElementById('heartbeats-refresh-btn').onclick = fetchHeartbeats;
+  }
+
+  async function fetchHeartbeats() {
+    var meta = document.getElementById('heartbeats-meta');
+    meta.textContent = 'Loading...';
+    var data = await api('/api/heartbeats');
+    if (!data) { meta.textContent = 'Failed to load'; return; }
+    var found = data.filter(function(t) { return t.exists; }).length;
+    meta.textContent = found + ' of ' + data.length + ' threads have HEARTBEAT.md — refreshed ' + new Date().toLocaleTimeString();
+    renderHeartbeats(data);
+  }
+
+  function renderHeartbeats(threads) {
+    var list = document.getElementById('heartbeats-list');
+    list.innerHTML = '';
+    // Sort: threads with heartbeat first, then by threadId
+    threads.sort(function(a, b) {
+      if (a.exists !== b.exists) return a.exists ? -1 : 1;
+      return a.threadId - b.threadId;
+    });
+    threads.forEach(function(t) {
+      var card = document.createElement('div');
+      card.className = 'heartbeat-card';
+
+      var header = document.createElement('div');
+      header.className = 'heartbeat-card-header';
+      header.innerHTML =
+        '<span class="thread-name">' + escapeHtml(t.name) + '</span>' +
+        '<span class="thread-id">#' + t.threadId + '</span>' +
+        (t.cwd ? '<span class="thread-cwd">' + escapeHtml(t.cwd) + '</span>' : '');
+      card.appendChild(header);
+
+      if (!t.exists) {
+        var missing = document.createElement('div');
+        missing.className = 'heartbeat-card-missing';
+        missing.textContent = t.cwd ? 'No HEARTBEAT.md found' : 'No working directory configured';
+        card.appendChild(missing);
+      } else {
+        var pre = document.createElement('pre');
+        pre.textContent = t.content || '';
+        card.appendChild(pre);
+      }
+
+      list.appendChild(card);
+    });
   }
 
   // ─── Init ───
