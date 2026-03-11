@@ -986,6 +986,24 @@ tr.clickable { cursor: pointer; }
     </div>
     <h3 style="margin-top:16px;margin-bottom:8px;">By Source</h3>
     <div id="usage-by-source"></div>
+    <h3 style="margin-top:24px;margin-bottom:8px;">Recent Queries</h3>
+    <div style="display:flex;gap:8px;margin-bottom:8px;align-items:center;flex-wrap:wrap;">
+      <select id="usage-filter-thread" style="background:var(--bg-secondary);border:1px solid var(--border);color:var(--text-primary);padding:4px 8px;border-radius:4px;font-size:12px;">
+        <option value="">All Threads</option>
+      </select>
+      <select id="usage-filter-model" style="background:var(--bg-secondary);border:1px solid var(--border);color:var(--text-primary);padding:4px 8px;border-radius:4px;font-size:12px;">
+        <option value="">All Models</option>
+        <option value="haiku">Haiku</option>
+        <option value="sonnet">Sonnet</option>
+        <option value="opus">Opus</option>
+      </select>
+      <select id="usage-filter-source" style="background:var(--bg-secondary);border:1px solid var(--border);color:var(--text-primary);padding:4px 8px;border-radius:4px;font-size:12px;">
+        <option value="">All Sources</option>
+      </select>
+      <span id="usage-queries-meta" style="color:var(--text-secondary);font-size:11px;margin-left:4px;"></span>
+    </div>
+    <div id="usage-queries-table"></div>
+    <div id="usage-queries-pagination" style="display:flex;gap:8px;margin-top:8px;align-items:center;justify-content:center;"></div>
   </div>
 </div>
 
@@ -2618,6 +2636,7 @@ tr.clickable { cursor: pointer; }
   // ─── View: Usage ───
 
   var usageDays = 7;
+  var queryOffset = 0;
 
   function initUsage() {
     // Set up period buttons
@@ -2627,7 +2646,16 @@ tr.clickable { cursor: pointer; }
         for (var j = 0; j < btns.length; j++) btns[j].classList.remove('active');
         this.classList.add('active');
         usageDays = parseInt(this.getAttribute('data-days'), 10);
+        queryOffset = 0;
         fetchUsage();
+      };
+    }
+    // Filter change handlers
+    var filters = ['usage-filter-thread', 'usage-filter-model', 'usage-filter-source'];
+    for (var i = 0; i < filters.length; i++) {
+      document.getElementById(filters[i]).onchange = function() {
+        queryOffset = 0;
+        fetchQueries();
       };
     }
     fetchUsage();
@@ -2745,6 +2773,107 @@ tr.clickable { cursor: pointer; }
     }
     sourceHtml += '</tbody></table>';
     document.getElementById('usage-by-source').innerHTML = sourceHtml;
+
+    // Populate thread filter dropdown
+    var threadSel = document.getElementById('usage-filter-thread');
+    var curThread = threadSel.value;
+    threadSel.innerHTML = '<option value="">All Threads</option>';
+    if (data.byThread) {
+      for (var i = 0; i < data.byThread.length; i++) {
+        var t = data.byThread[i];
+        threadSel.innerHTML += '<option value="' + t.threadId + '">' + escapeHtml(t.threadName) + '</option>';
+      }
+    }
+    threadSel.value = curThread;
+
+    // Populate source filter dropdown
+    var sourceSel = document.getElementById('usage-filter-source');
+    var curSource = sourceSel.value;
+    sourceSel.innerHTML = '<option value="">All Sources</option>';
+    if (data.bySource) {
+      for (var i = 0; i < data.bySource.length; i++) {
+        sourceSel.innerHTML += '<option value="' + data.bySource[i].source + '">' + escapeHtml(data.bySource[i].source) + '</option>';
+      }
+    }
+    sourceSel.value = curSource;
+
+    fetchQueries();
+  }
+
+  function fmtDuration(ms) {
+    if (ms == null) return '-';
+    if (ms < 1000) return ms + 'ms';
+    return (ms / 1000).toFixed(1) + 's';
+  }
+
+  function fmtTime(ts) {
+    var d = new Date(ts);
+    var mo = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    return mo[d.getMonth()] + ' ' + d.getDate() + ' ' +
+      String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+  }
+
+  async function fetchQueries() {
+    var thread = document.getElementById('usage-filter-thread').value;
+    var model = document.getElementById('usage-filter-model').value;
+    var source = document.getElementById('usage-filter-source').value;
+
+    var url = '/api/usage/queries?days=' + usageDays + '&offset=' + queryOffset + '&limit=50';
+    if (thread) url += '&thread=' + thread;
+    if (model) url += '&model=' + encodeURIComponent(model);
+    if (source) url += '&source=' + encodeURIComponent(source);
+
+    var data = await api(url);
+    if (!data || !data.queries) {
+      document.getElementById('usage-queries-table').innerHTML =
+        '<div class="empty-state">No query data available</div>';
+      document.getElementById('usage-queries-pagination').innerHTML = '';
+      document.getElementById('usage-queries-meta').textContent = '';
+      return;
+    }
+
+    var meta = document.getElementById('usage-queries-meta');
+    meta.textContent = 'Showing ' + (data.offset + 1) + '-' + Math.min(data.offset + data.queries.length, data.total) + ' of ' + data.total;
+
+    var html = '<table><thead><tr>' +
+      '<th>Time</th><th>Thread</th><th>Model</th><th>Cost</th>' +
+      '<th>In Tokens</th><th>Out Tokens</th><th>Duration</th><th>Source</th><th>Preview</th>' +
+      '</tr></thead><tbody>';
+
+    for (var i = 0; i < data.queries.length; i++) {
+      var q = data.queries[i];
+      var preview = q.message ? escapeHtml(q.message) : '<span style="color:var(--text-secondary)">-</span>';
+      html += '<tr>' +
+        '<td style="white-space:nowrap;">' + fmtTime(q.ts) + '</td>' +
+        '<td title="ID: ' + q.threadId + '">' + escapeHtml(q.threadName) + '</td>' +
+        '<td class="' + modelColorClass(q.model) + '">' + escapeHtml(q.model) + '</td>' +
+        '<td>' + fmtUSD(q.costUSD) + '</td>' +
+        '<td>' + fmtTokens(q.inputTokens) + '</td>' +
+        '<td>' + fmtTokens(q.outputTokens) + '</td>' +
+        '<td>' + fmtDuration(q.durationMs) + '</td>' +
+        '<td>' + escapeHtml(q.source) + '</td>' +
+        '<td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text-secondary);font-size:11px;" title="' + (q.message ? escapeHtml(q.message) : '') + '">' + preview + '</td>' +
+        '</tr>';
+    }
+
+    if (data.queries.length === 0) {
+      html += '<tr><td colspan="9" class="empty-state">No queries match filters</td></tr>';
+    }
+    html += '</tbody></table>';
+    document.getElementById('usage-queries-table').innerHTML = html;
+
+    // Pagination
+    var pagHtml = '';
+    if (data.offset > 0) {
+      pagHtml += '<button class="usage-period-btn" onclick="window._queryPrev()">Prev</button>';
+    }
+    if (data.offset + data.queries.length < data.total) {
+      pagHtml += '<button class="usage-period-btn" onclick="window._queryNext()">Next</button>';
+    }
+    document.getElementById('usage-queries-pagination').innerHTML = pagHtml;
+
+    window._queryPrev = function() { queryOffset = Math.max(0, queryOffset - 50); fetchQueries(); };
+    window._queryNext = function() { queryOffset += 50; fetchQueries(); };
   }
 
   // ─── Init ───

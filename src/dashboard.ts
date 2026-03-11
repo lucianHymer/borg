@@ -1002,6 +1002,122 @@ app.get("/api/usage", (_req, res) => {
     });
 });
 
+// GET /api/usage/queries — individual query entries with pagination
+app.get("/api/usage/queries", (_req, res) => {
+    const days = Math.min(Math.max(parseInt(String(_req.query.days ?? "7"), 10) || 7, 1), 90);
+    const offset = Math.max(parseInt(String(_req.query.offset ?? "0"), 10) || 0, 0);
+    const limit = Math.min(Math.max(parseInt(String(_req.query.limit ?? "50"), 10) || 50, 1), 100);
+    const filterThread = _req.query.thread ? parseInt(String(_req.query.thread), 10) : null;
+    const filterModel = _req.query.model ? String(_req.query.model).toLowerCase() : null;
+    const filterSource = _req.query.source ? String(_req.query.source) : null;
+    const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+
+    const threads = readJsonSafe<Record<string, { name?: string }>>(THREADS_FILE, {});
+
+    // Collect history files from all zone directories (same as /api/usage)
+    const historyFiles: string[] = [];
+    const zoneDirs = [
+        BORG_DIR,
+        path.join(SCRIPT_DIR, ".borg-core"),
+        path.join(SCRIPT_DIR, ".borg-perimeter"),
+    ];
+    for (const dir of zoneDirs) {
+        const main = path.join(dir, "message-history.jsonl");
+        const backup = path.join(dir, "message-history.1.jsonl");
+        if (fs.existsSync(main)) historyFiles.push(main);
+        if (fs.existsSync(backup)) historyFiles.push(backup);
+    }
+
+    interface QueryEntry {
+        ts: number;
+        threadId: number;
+        model?: string;
+        source?: string;
+        costUSD?: number;
+        inputTokens?: number;
+        outputTokens?: number;
+        cacheReadInputTokens?: number;
+        cacheCreationInputTokens?: number;
+        durationMs?: number;
+        numTurns?: number;
+        message?: string;
+        direction?: string;
+        messageId?: string;
+    }
+
+    const entries: QueryEntry[] = [];
+    const seenIds = new Set<string>();
+
+    for (const file of historyFiles) {
+        try {
+            const content = fs.readFileSync(file, "utf8");
+            for (const line of content.split("\n")) {
+                if (!line.trim()) continue;
+                try {
+                    const entry = JSON.parse(line) as QueryEntry;
+                    if (
+                        entry.direction === "out" &&
+                        entry.costUSD !== undefined &&
+                        entry.ts >= cutoff
+                    ) {
+                        const dedup = entry.messageId
+                            ? `${entry.threadId}:${entry.messageId}`
+                            : `${entry.threadId}:${entry.ts}`;
+                        if (!seenIds.has(dedup)) {
+                            seenIds.add(dedup);
+                            entries.push(entry);
+                        }
+                    }
+                } catch { /* skip malformed */ }
+            }
+        } catch { /* file read error */ }
+    }
+
+    // Sort newest first
+    entries.sort((a, b) => b.ts - a.ts);
+
+    // Apply filters
+    function friendlyModelQ(model: string | undefined): string {
+        if (!model) return "Unknown";
+        const lower = model.toLowerCase();
+        if (lower.includes("haiku")) return "Haiku";
+        if (lower.includes("sonnet")) return "Sonnet";
+        if (lower.includes("opus")) return "Opus";
+        return model;
+    }
+
+    const filtered = entries.filter(e => {
+        if (filterThread !== null && e.threadId !== filterThread) return false;
+        if (filterModel && !friendlyModelQ(e.model).toLowerCase().includes(filterModel)) return false;
+        if (filterSource && (e.source ?? "user") !== filterSource) return false;
+        return true;
+    });
+
+    const total = filtered.length;
+    const page = filtered.slice(offset, offset + limit);
+
+    res.json({
+        queries: page.map(e => ({
+            ts: e.ts,
+            threadId: e.threadId,
+            threadName: threads[String(e.threadId)]?.name ?? `Thread ${e.threadId}`,
+            model: friendlyModelQ(e.model),
+            source: e.source ?? "user",
+            costUSD: e.costUSD ?? 0,
+            inputTokens: e.inputTokens ?? 0,
+            outputTokens: e.outputTokens ?? 0,
+            cacheReadInputTokens: e.cacheReadInputTokens ?? 0,
+            cacheCreationInputTokens: e.cacheCreationInputTokens ?? 0,
+            durationMs: e.durationMs,
+            numTurns: e.numTurns,
+            message: e.message ? e.message.slice(0, 120) : undefined,
+        })),
+        total,
+        offset,
+        limit,
+    });
+});
+
 // ─── Start Server ───
 
 const server = http.createServer(app);
