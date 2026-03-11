@@ -1286,7 +1286,11 @@ tr.clickable { cursor: pointer; }
   var _availableZones = []; // populated from /api/zones
 
   function zoneBadge(zone, threadId) {
-    if (!zone) return '';
+    if (!zone) {
+      return '<span class="zone-badge" style="color:var(--text-secondary);cursor:pointer;font-size:11px;" ' +
+        'data-thread-id="' + escapeHtml(String(threadId)) + '" data-zone="" ' +
+        'title="Click to assign zone">—</span>';
+    }
     var colors = { core: 'var(--accent-green)', perimeter: 'var(--accent-yellow)' };
     var color = colors[zone] || 'var(--text-secondary)';
     return '<span class="badge zone-badge" style="background:' + color + ';color:#000;font-size:10px;cursor:pointer;" ' +
@@ -1330,6 +1334,30 @@ tr.clickable { cursor: pointer; }
       dropdown.appendChild(item);
     });
 
+    // Add "remove from zone" option when thread is currently in a zone
+    if (currentZone) {
+      var sep = document.createElement('div');
+      sep.style.cssText = 'border-top:1px solid var(--border);margin:4px 0;';
+      dropdown.appendChild(sep);
+      var removeItem = document.createElement('div');
+      removeItem.textContent = 'Remove from zone';
+      removeItem.style.cssText = 'padding:4px 12px;cursor:pointer;font-size:12px;color:var(--accent-red);';
+      removeItem.onmouseenter = function() { removeItem.style.background = 'var(--bg-alt)'; };
+      removeItem.onmouseleave = function() { removeItem.style.background = ''; };
+      removeItem.onclick = function(e) {
+        e.stopPropagation();
+        dropdown.remove();
+        fetch('/api/zones/remove', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ threadId: Number(threadId) })
+        }).then(function(r) { return r.json(); }).then(function(d) {
+          if (d.success) fetchOverview();
+        });
+      };
+      dropdown.appendChild(removeItem);
+    }
+
     document.body.appendChild(dropdown);
     // Close on outside click
     setTimeout(function() {
@@ -1347,6 +1375,18 @@ tr.clickable { cursor: pointer; }
     const selectEl = document.getElementById('zone-filter-select');
     let rows = '';
 
+    // Always fetch available zones for the zone dropdown
+    fetch('/api/zones').then(function(r) { return r.json(); }).then(function(d) {
+      if (d.configured && d.config && d.config.zones) {
+        _availableZones = Object.keys(d.config.zones).sort();
+      } else {
+        // Default zones when no zone-config.json exists yet
+        _availableZones = ['core', 'perimeter'];
+      }
+    }).catch(function() {
+      _availableZones = ['core', 'perimeter'];
+    });
+
     // Show zone filter if zones are configured
     if (data.zonesConfigured) {
       filterEl.style.display = '';
@@ -1359,12 +1399,6 @@ tr.clickable { cursor: pointer; }
         opts += '<option value="' + escapeHtml(z) + '"' + (z === currentFilter ? ' selected' : '') + '>' + escapeHtml(z) + '</option>';
       });
       selectEl.innerHTML = opts;
-      // Fetch available zones for dropdown
-      fetch('/api/zones').then(function(r) { return r.json(); }).then(function(d) {
-        if (d.configured && d.config && d.config.zones) {
-          _availableZones = Object.keys(d.config.zones).sort();
-        }
-      }).catch(function() {});
       // Fetch pending approvals count
       fetch('/api/zones/pending').then(function(r) { return r.json(); }).then(function(d) {
         var countEl = document.getElementById('zone-pending-count');

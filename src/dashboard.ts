@@ -771,10 +771,14 @@ app.post("/api/zones/move", (req, res) => {
             return;
         }
         clearZoneConfigCache();
-        const config = loadZoneConfig(ZONE_CONFIG_PATH);
+        let config = loadZoneConfig(ZONE_CONFIG_PATH);
         if (!config) {
-            res.status(404).json({ error: "Zone config not found" });
-            return;
+            // Auto-create zone-config.json with default zones
+            config = {
+                zones: { core: { threads: [] }, perimeter: { threads: [] } },
+                defaults: { newThread: "perimeter" },
+            };
+            saveZoneConfig(ZONE_CONFIG_PATH, config);
         }
         if (!config.zones[zone]) {
             res.status(400).json({ error: `Zone "${zone}" does not exist` });
@@ -784,6 +788,28 @@ app.post("/api/zones/move", (req, res) => {
         addThreadToZone(updated, threadId, zone);
         saveZoneConfig(ZONE_CONFIG_PATH, updated);
         res.json({ success: true, threadId, zone });
+    } catch (err) {
+        res.status(500).json({ error: toErrorMessage(err) });
+    }
+});
+
+// POST /api/zones/remove — remove a thread from all zones
+app.post("/api/zones/remove", (req, res) => {
+    try {
+        const { threadId } = req.body as { threadId?: number };
+        if (!threadId) {
+            res.status(400).json({ error: "Missing threadId" });
+            return;
+        }
+        clearZoneConfigCache();
+        const config = loadZoneConfig(ZONE_CONFIG_PATH);
+        if (!config) {
+            res.json({ success: true, threadId, zone: null });
+            return;
+        }
+        const updated = removeThreadFromZones(structuredClone(config), threadId);
+        saveZoneConfig(ZONE_CONFIG_PATH, updated);
+        res.json({ success: true, threadId, zone: null });
     } catch (err) {
         res.status(500).json({ error: toErrorMessage(err) });
     }
