@@ -392,7 +392,9 @@ ${buildCommandsBlock()}
 When you receive a message prefixed with "📨 _From {sender} in {thread}_", this is a cross-thread message from another thread. To reply:
 - Use the MCP send_message tool to send your response back to the source thread
 - Do NOT respond in the current thread — the sender is in a different thread and won't see it
-- The visible indicator shows both the sender's name and their thread name for context`;
+- The visible indicator shows both the sender's name and their thread name for context
+
+**CRITICAL:** If your workflow step requires sending a cross-thread message, send it NOW in the same response — do not narrate it as a future intention ("I will send this to..."). Describing an action is not taking it. The user should never have to prompt you to execute a step you already described.`;
 }
 
 function buildWorkerCrossThreadBlock(): string {
@@ -407,7 +409,9 @@ ${buildCommandsBlock()}
 When you receive a message prefixed with "📨 _From {sender} in {thread}_", this is a cross-thread message from another thread. To reply:
 - Use the MCP send_message tool to send your response back to the source thread
 - Do NOT respond in the current thread — the sender is in a different thread and won't see it
-- The visible indicator shows both the sender's name and their thread name for context`;
+- The visible indicator shows both the sender's name and their thread name for context
+
+**CRITICAL:** If your workflow step requires sending a cross-thread message, send it NOW in the same response — do not narrate it as a future intention ("I will send this to..."). Describing an action is not taking it. The user should never have to prompt you to execute a step you already described.`;
 }
 
 function buildKnowledgeBaseBlock(): string {
