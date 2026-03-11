@@ -1184,6 +1184,16 @@ async function processMessage(messageFile: string): Promise<void> {
                     try { fs.unlinkSync(cancelFile); } catch { /* best effort */ }
                     try { await q.interrupt(); } catch { /* process may be gone */ }
                     log("INFO", `Cancelled processing for ${messageId}`);
+                    // Safety net: if collectQueryResponse doesn't return within 30s
+                    // after interrupt, force-clean the processing file to release the slot
+                    setTimeout(() => {
+                        if (fs.existsSync(processingFile)) {
+                            log("WARN", `Cancel cleanup timeout: force-removing processing file for ${messageId}`);
+                            try { fs.unlinkSync(processingFile); } catch { /* best effort */ }
+                            clearInterval(statusInterval);
+                            clearStatus(messageId);
+                        }
+                    }, 30_000);
                     return;
                 }
                 writeStatus(messageId, currentStatusLabel, statusStartTime, currentPreview);
