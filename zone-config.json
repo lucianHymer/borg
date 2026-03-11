@@ -1,0 +1,9 @@
+{
+  "zones": {
+    "core": { "threads": [1, 43, 58, 675, 677, 1146] },
+    "perimeter": { "threads": [676] }
+  },
+  "defaults": {
+    "newThread": "core"
+  }
+}
