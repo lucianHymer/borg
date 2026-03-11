@@ -23,7 +23,7 @@ import { logDecision, logCorrection, ROUTING_LOG } from "./routing-logger.js";
 import { AUDIO_INCOMING_DIR, cleanupAudioFile, startPeriodicCleanup, ensureModels, distillForSpeech, synthesize, isAvailable } from "./audio.js";
 import { IMAGES_INCOMING_DIR, startPeriodicCleanup as startImageCleanup } from "./images.js";
 import { toTelegramMarkdownV2, escapeMarkdownV2 } from "./markdown-v2.js";
-import { loadZoneConfig, getThreadZone } from "./zone-config.js";
+import { loadZoneConfig, getThreadZone, isSameZone } from "./zone-config.js";
 
 // ─── Constants ───
 
@@ -991,50 +991,102 @@ async function pollOutgoingQueue(): Promise<void> {
 
                 let firstSentId: number | undefined;
 
-                if (data.crossZonePending && data.targetThreadId && data.sourceThreadId) {
-                    // Cross-zone message: show approval keyboard in master thread
-                    const chatId = settings.telegram_chat_id;
-                    const pendingId = data.messageId.replace(/_tg$/, "");
-                    const preview = data.message.length > 200
-                        ? data.message.substring(0, 200) + "..."
-                        : data.message;
+                if (data.crossThread && data.targetThreadId && data.sourceThreadId) {
+                    // Cross-thread message: infra handles zone routing
+                    const zoneConfig = loadZoneConfig(ZONE_CONFIG_PATH);
+                    const crossZone = zoneConfig && !isSameZone(zoneConfig, data.sourceThreadId, data.targetThreadId);
 
-                    const approvalText = [
-                        `🔒 *Cross\\-zone message pending approval*`,
-                        ``,
-                        `*From:* ${escapeMarkdownV2(data.sender || "unknown")} \\(thread ${data.sourceThreadId}\\)`,
-                        `*To:* thread ${data.targetThreadId}`,
-                        ``,
-                        `${escapeMarkdownV2(preview)}`,
-                    ].join("\n");
+                    if (crossZone) {
+                        // Cross-zone: write to pending queue + show approval keyboard, then skip display
+                        const sourceZone = getThreadZone(zoneConfig!, data.sourceThreadId);
+                        const targetZone = getThreadZone(zoneConfig!, data.targetThreadId);
+                        const pendingId = data.messageId.replace(/_tg$/, "");
+                        const threads = loadThreads();
+                        const sourceName = data.sender || threads[String(data.sourceThreadId)]?.name || `Thread ${data.sourceThreadId}`;
+                        const targetName = threads[String(data.targetThreadId)]?.name || `Thread ${data.targetThreadId}`;
 
-                    const keyboard = new InlineKeyboard()
-                        .text("✅ Approve", `zone_approve:${pendingId}`)
-                        .text("❌ Reject", `zone_reject:${pendingId}`);
+                        const pending: PendingApproval = {
+                            id: pendingId,
+                            sourceThreadId: data.sourceThreadId,
+                            targetThreadId: data.targetThreadId,
+                            sourceZone,
+                            targetZone,
+                            senderName: sourceName,
+                            targetName,
+                            message: data.message,
+                            timestamp: data.timestamp,
+                        };
 
-                    try {
-                        const sent = await bot.api.sendMessage(chatId, approvalText, {
-                            parse_mode: "MarkdownV2",
-                            reply_markup: keyboard,
-                        });
+                        // Write pending file to infra's pending queue
+                        const pendingDir = path.join(SCRIPT_DIR, ".borg-infra/queue/pending");
+                        fs.mkdirSync(pendingDir, { recursive: true });
+                        const pendTmp = path.join(pendingDir, `${pendingId}.json.tmp`);
+                        const pendFinal = path.join(pendingDir, `${pendingId}.json`);
+                        fs.writeFileSync(pendTmp, JSON.stringify(pending));
+                        fs.renameSync(pendTmp, pendFinal);
 
-                        // Update the pending file with the Telegram message ID (for reminder links)
-                        const pendingFile = findPendingFile(pendingId);
-                        if (pendingFile) {
+                        // Show approval keyboard in master thread
+                        const chatId = settings.telegram_chat_id;
+                        const preview = data.message.length > 200
+                            ? data.message.substring(0, 200) + "..."
+                            : data.message;
+                        const approvalText = [
+                            `🔒 *Cross\\-zone message pending approval*`,
+                            ``,
+                            `*From:* ${escapeMarkdownV2(sourceName)} \\(thread ${data.sourceThreadId}\\)`,
+                            `*To:* thread ${data.targetThreadId}`,
+                            ``,
+                            `${escapeMarkdownV2(preview)}`,
+                        ].join("\n");
+                        const keyboard = new InlineKeyboard()
+                            .text("✅ Approve", `zone_approve:${pendingId}`)
+                            .text("❌ Reject", `zone_reject:${pendingId}`);
+
+                        try {
+                            const sent = await bot.api.sendMessage(chatId, approvalText, {
+                                parse_mode: "MarkdownV2",
+                                reply_markup: keyboard,
+                            });
                             try {
-                                const pendingData: PendingApproval = JSON.parse(fs.readFileSync(pendingFile, "utf8"));
-                                pendingData.telegramMessageId = sent.message_id;
-                                const tmp = pendingFile + ".tmp";
-                                fs.writeFileSync(tmp, JSON.stringify(pendingData));
-                                fs.renameSync(tmp, pendingFile);
-                            } catch { /* pending file may have been processed already */ }
+                                pending.telegramMessageId = sent.message_id;
+                                const tmp2 = pendFinal + ".tmp";
+                                fs.writeFileSync(tmp2, JSON.stringify(pending));
+                                fs.renameSync(tmp2, pendFinal);
+                            } catch { /* non-fatal */ }
+                            log("INFO", `Cross-zone approval keyboard shown for ${pendingId} (${sourceZone} → ${targetZone})`);
+                        } catch (err) {
+                            log("ERROR", `Failed to show cross-zone approval: ${toErrorMessage(err)}`);
                         }
 
-                        log("INFO", `Cross-zone approval keyboard shown for ${pendingId}`);
-                    } catch (err) {
-                        log("ERROR", `Failed to show cross-zone approval: ${toErrorMessage(err)}`);
+                        // Done — delete outgoing file and skip Telegram display
+                        try { fs.unlinkSync(filePath); } catch { /* already processed */ }
+                        continue;
                     }
-                } else if (data.targetThreadId) {
+
+                    // Same zone: deliver to target zone's incoming queue, then fall through to display
+                    const incomingId = data.messageId.replace(/_tg$/, "");
+                    const targetZone = zoneConfig ? getThreadZone(zoneConfig, data.targetThreadId) : "core";
+                    const targetIncoming = resolveZoneIncoming(targetZone);
+
+                    const incoming = {
+                        channel: "telegram",
+                        source: "cross-thread",
+                        threadId: data.targetThreadId,
+                        sourceThreadId: data.sourceThreadId,
+                        sender: data.sender,
+                        message: data.message,
+                        timestamp: data.timestamp,
+                        messageId: incomingId,
+                    };
+
+                    fs.mkdirSync(targetIncoming, { recursive: true });
+                    const inTmp = path.join(targetIncoming, `${incomingId}.json.tmp`);
+                    const inFinal = path.join(targetIncoming, `${incomingId}.json`);
+                    fs.writeFileSync(inTmp, JSON.stringify(incoming));
+                    fs.renameSync(inTmp, inFinal);
+                }
+
+                if (data.targetThreadId) {
                     // Cross-thread message: post to the target topic
                     const chatId = settings.telegram_chat_id;
 

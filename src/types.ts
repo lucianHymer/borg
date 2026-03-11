@@ -42,7 +42,6 @@ export interface OutgoingMessage {
     routingMetadata?: RoutingMetadata;
     replyToMessageId?: number; // Telegram message_id being replied to
     replyToVoice?: boolean;    // true if replying to a voice message
-    crossZonePending?: boolean; // true if this is a cross-zone message awaiting approval
     crossThread?: boolean;       // true if this outgoing message needs cross-thread routing by infra
 }
 
