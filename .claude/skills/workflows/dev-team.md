@@ -85,6 +85,7 @@ After the standard tasks, Planner creates the actual work subtasks (tasks #4–N
 - Captures learnings into CLAUDE.md and into the project knowledge system (use the `mim-ai:remember` skill if available — see Mim instructions for how knowledge is structured)
 - Keeps CLAUDE.md tight and token-efficient — every line costs tokens in every future session
 - Trims stale or redundant entries while adding new ones
+- **Commits and pushes all documentation changes** so they land in the PR — docs that aren't committed aren't shipped
 - Sends final summary to master thread — this is the team's "done" signal
 
 Note: model selection is handled by the message router, not per-role.
