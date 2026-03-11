@@ -72,6 +72,7 @@ services:
       - ./secrets/github-installations.json:/secrets/github-installations.json:ro
       - ${CLAUDE_CREDENTIALS}:/home/node/.claude/.credentials.json
       - ./skills/global:/home/node/.claude/skills:ro
+      - claude-plugins-core:/home/node/.claude/plugins
     environment:
       - NODE_ENV=production
       - BORG_ZONE=core
@@ -110,6 +111,7 @@ services:
       # Credentials (limited)
       - ./secrets/github-installations.json:/secrets/github-installations.json:ro
       - ${CLAUDE_CREDENTIALS}:/home/node/.claude/.credentials.json
+      - claude-plugins-perimeter:/home/node/.claude/plugins
       # NO SSH keys, NO docker-proxy access
     environment:
       - NODE_ENV=production
@@ -226,3 +228,5 @@ networks:
 
 volumes:
   speaches-cache:
+  claude-plugins-core:
+  claude-plugins-perimeter:
