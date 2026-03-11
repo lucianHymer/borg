@@ -35,6 +35,7 @@ services:
       - ./.borg:/app/.borg
       # Mount workspace at the same host path so threads.json cwd values work
       - ${WORKSPACE_ROOT}:${WORKSPACE_ROOT}
+      - ./zone-config.json:/app/zone-config.json:ro
       - ./secrets/github-installations.json:/secrets/github-installations.json:ro
       - ${CLAUDE_CREDENTIALS}:/home/node/.claude/.credentials.json
       - ./skills/global:/home/node/.claude/skills:ro
@@ -92,6 +93,7 @@ services:
         condition: service_healthy
     volumes:
       - ./.borg:/app/.borg:ro
+      - ./zone-config.json:/app/zone-config.json:ro
       - ${WORKSPACE_ROOT:-/home/lucian/workspace}:/home/lucian/workspace:ro
     ports:
       - "127.0.0.1:3100:3100"
