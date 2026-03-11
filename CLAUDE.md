@@ -18,13 +18,13 @@ Compound knowledge into repos. The repo should get smarter over time — workflo
 
 ## Security Zones
 
-Optional container-level isolation. Agents are separated into **Core** (trusted) and **Perimeter** (untrusted) zones, with **Infra** running telegram-client + routing only. Zones are invisible to agents — `send_message` works identically; cross-zone messages are held for human approval via Telegram inline keyboard. Activate with `docker compose -f docker-compose.yml -f docker-compose.zones.yml up`.
+Container-level isolation. Agents are separated into **Core** (trusted) and **Perimeter** (untrusted) zones, with **Infra** running telegram-client + routing only. Zones are invisible to agents — `send_message` works identically; cross-zone messages are held for human approval via Telegram inline keyboard.
 
 - `zone-config.json` — maps threads to zones, validated by Zod, mtime-cached via `loadZoneConfig()`
-- `BORG_ZONE` env var — `"core"`, `"perimeter"`, `"infra"`, or unset (single-container)
+- `BORG_ZONE` env var — always set: `"core"`, `"perimeter"`, or `"infra"`
 - `ZONE_CONFIG_PATH` env var — path to zone-config.json
 - Per-zone storage: `.borg-core/`, `.borg-perimeter/`, `.borg-infra/`
-- Broadcast filtered to core-zone `mainThread` threads when zones active
+- Broadcast filtered to core-zone `mainThread` threads
 
 ## Key Files
 
@@ -68,10 +68,8 @@ Cross-repo knowledge sharing via a shared Telegram group. The `broadcast` MCP to
 ## Build
 
 ```sh
-npm run build    # TypeScript compilation
-npm run telegram # Start Telegram client
-npm run queue    # Start queue processor
-./borg.sh start  # Start all via tmux
+npm run build        # TypeScript compilation
+docker compose up    # Start infra + core + perimeter containers
 ```
 
 
