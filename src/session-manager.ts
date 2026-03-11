@@ -352,8 +352,8 @@ function buildMasterCrossThreadBlock(): string {
     return `You can:
 - See all active threads and their status in ${BORG_DIR}/threads.json
 - Read any thread's history from ${BORG_DIR}/message-history.jsonl
-- Message any thread by writing to ${BORG_DIR}/queue/outgoing/ with targetThreadId
-- Broadcast to all threads by writing multiple outgoing messages
+- Message any thread using the \`send_message\` MCP tool with targetThreadId
+- Broadcast to all threads by sending multiple messages
 - Clear the dead letter queue: \`rm ${BORG_DIR}/queue/dead-letter/*\` (failed messages after 3 retries)
 ${buildCommandsBlock()}
 
@@ -369,7 +369,7 @@ function buildWorkerCrossThreadBlock(): string {
     return `Cross-thread communication:
 - Active threads: Read ${BORG_DIR}/threads.json
 - Other threads' history: Grep ${BORG_DIR}/message-history.jsonl for their threadId
-- Message another thread: Write JSON to ${BORG_DIR}/queue/outgoing/ with targetThreadId field
+- Message another thread: Use the \`send_message\` MCP tool with targetThreadId
 ${buildCommandsBlock()}
 
 ## Cross-Thread Message Pattern
