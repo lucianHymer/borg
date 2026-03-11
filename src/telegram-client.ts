@@ -20,8 +20,8 @@ import type { OutgoingMessage, TaskListMapping, MessageModelEntry, PendingApprov
 import { toErrorMessage, TASK_LISTS_FILENAME } from "./types.js";
 import { RoutingMetadataSchema } from "./types.js";
 import { logDecision, logCorrection, ROUTING_LOG } from "./routing-logger.js";
-import { AUDIO_INCOMING_DIR, cleanupAudioFile, startPeriodicCleanup, ensureModels, distillForSpeech, synthesize, isAvailable } from "./audio.js";
-import { IMAGES_INCOMING_DIR, startPeriodicCleanup as startImageCleanup } from "./images.js";
+import { cleanupAudioFile, startPeriodicCleanup, ensureModels, distillForSpeech, synthesize, isAvailable } from "./audio.js";
+import { startPeriodicCleanup as startImageCleanup } from "./images.js";
 import { toTelegramMarkdownV2, escapeMarkdownV2 } from "./markdown-v2.js";
 import { loadZoneConfig, getThreadZone, isSameZone } from "./zone-config.js";
 
@@ -115,6 +115,35 @@ function resolveZoneProcessingDir(threadId: number): string {
         return path.join(SCRIPT_DIR, `.borg-${zone}/queue/processing`);
     } catch {
         return path.join(SCRIPT_DIR, ".borg-core/queue/processing");
+    }
+}
+
+/**
+ * Resolve the audio incoming directory for a thread's zone.
+ * Voice/image files must be written to the target zone's dir so queue-processor can read them.
+ */
+function resolveZoneAudioIncoming(threadId: number): string {
+    try {
+        const config = loadZoneConfig(ZONE_CONFIG_PATH);
+        if (!config) return path.join(SCRIPT_DIR, ".borg-core/audio/incoming");
+        const zone = getThreadZone(config, threadId);
+        return path.join(SCRIPT_DIR, `.borg-${zone}/audio/incoming`);
+    } catch {
+        return path.join(SCRIPT_DIR, ".borg-core/audio/incoming");
+    }
+}
+
+/**
+ * Resolve the images incoming directory for a thread's zone.
+ */
+function resolveZoneImagesIncoming(threadId: number): string {
+    try {
+        const config = loadZoneConfig(ZONE_CONFIG_PATH);
+        if (!config) return path.join(SCRIPT_DIR, ".borg-core/images/incoming");
+        const zone = getThreadZone(config, threadId);
+        return path.join(SCRIPT_DIR, `.borg-${zone}/images/incoming`);
+    } catch {
+        return path.join(SCRIPT_DIR, ".borg-core/images/incoming");
     }
 }
 
@@ -702,10 +731,14 @@ bot.on("message:voice").filter(
             return;
         }
 
-        // Download the voice file
+        // Download the voice file — write to the target zone's audio dir so queue-processor can read it
         const fileUrl = `https://api.telegram.org/file/bot${settings.telegram_bot_token}/${file.file_path}`;
         const messageId = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-        const oggPath = path.join(AUDIO_INCOMING_DIR, `${messageId}.ogg`);
+        const zoneAudioDir = resolveZoneAudioIncoming(threadId);
+        if (!fs.existsSync(zoneAudioDir)) fs.mkdirSync(zoneAudioDir, { recursive: true });
+        const oggPath = path.join(zoneAudioDir, `${messageId}.ogg`);
+        // Queue-processor sees /app/.borg/audio/incoming/ (its own zone mount), not /app/.borg-{zone}/
+        const canonicalAudioPath = path.join(SCRIPT_DIR, ".borg/audio/incoming", `${messageId}.ogg`);
 
         try {
             const res = await fetch(fileUrl);
@@ -738,7 +771,7 @@ bot.on("message:voice").filter(
             sender: ctx.from.first_name,
             senderId: String(ctx.from.id),
             message: "",  // empty — queue-processor fills after STT
-            audioPath: oggPath,
+            audioPath: canonicalAudioPath,
             voiceDuration: duration,
             isReply: isReplyToBot,
             replyToText,
@@ -804,13 +837,17 @@ bot.on("message:photo").filter(
             return;
         }
 
-        // Download the image file
+        // Download the image file — write to the target zone's images dir so queue-processor can read it
         const fileUrl = `https://api.telegram.org/file/bot${settings.telegram_bot_token}/${file.file_path}`;
         const messageId = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
         // Determine file extension from path (e.g., "photos/file_123.jpg")
         const ext = path.extname(file.file_path || ".jpg") || ".jpg";
-        const imagePath = path.join(IMAGES_INCOMING_DIR, `${messageId}${ext}`);
+        const zoneImagesDir = resolveZoneImagesIncoming(threadId);
+        if (!fs.existsSync(zoneImagesDir)) fs.mkdirSync(zoneImagesDir, { recursive: true });
+        const imagePath = path.join(zoneImagesDir, `${messageId}${ext}`);
+        // Queue-processor sees /app/.borg/images/incoming/ (its own zone mount)
+        const canonicalImagePath = path.join(SCRIPT_DIR, ".borg/images/incoming", `${messageId}${ext}`);
 
         try {
             const res = await fetch(fileUrl);
@@ -846,7 +883,7 @@ bot.on("message:photo").filter(
             sender: ctx.from.first_name,
             senderId: String(ctx.from.id),
             message: caption,
-            imagePath,
+            imagePath: canonicalImagePath,
             isReply: isReplyToBot,
             replyToText,
             replyToModel,
