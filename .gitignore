@@ -7,6 +7,11 @@ dist/
 # Borg runtime data
 .borg/
 !.borg/worktrees/
+.borg-core/
+.borg-perimeter/
+.borg-infra/
+threads.json
+zone-config.json
 *.log
 
 # Docker / Secrets
