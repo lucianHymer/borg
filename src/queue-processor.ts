@@ -1231,8 +1231,10 @@ async function processMessage(messageFile: string): Promise<void> {
                 clearInterval(statusInterval);
 
                 if (cancelled) {
-                    // Cancelled — send short status, don't retry
-                    responseText = "🚫 Processing was cancelled.";
+                    // Cancelled — include partial response so user can see what was generated
+                    responseText = currentPreview
+                        ? `${currentPreview}\n\n---\n🚫 Processing was cancelled.`
+                        : "🚫 Processing was cancelled.";
                     clearStatus(messageId);
                     // Still persist session so resume works
                     if (newSessionId) {
@@ -1264,8 +1266,10 @@ async function processMessage(messageFile: string): Promise<void> {
                 clearInterval(statusInterval);
 
                 if (cancelled) {
-                    // Cancelled — treat as expected, send cancelled message
-                    responseText = "🚫 Processing was cancelled.";
+                    // Cancelled — include partial response so user can see what was generated
+                    responseText = currentPreview
+                        ? `${currentPreview}\n\n---\n🚫 Processing was cancelled.`
+                        : "🚫 Processing was cancelled.";
                     clearStatus(messageId);
                 } else {
                     const stderrOutput = stderrLines.join("").trim();
