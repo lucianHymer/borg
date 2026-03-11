@@ -42,10 +42,11 @@ import {
     deleteThreadField,
     buildThreadPrompt,
     buildHeartbeatPrompt,
+    parseHeartbeatSections,
     formatHumanTime,
     getTimedTasks,
 } from "./session-manager.js";
-import type { ThreadConfig, HeartbeatTier } from "./session-manager.js";
+import type { ThreadConfig, HeartbeatTier, HeartbeatSections } from "./session-manager.js";
 import { z } from "zod/v4";
 
 // ─── Zod Schemas for Queue Messages ───
@@ -738,27 +739,39 @@ async function processHeartbeat(msg: IncomingMessage): Promise<string> {
     const dueTier = getDueTier(threadKey);
     const state = loadHeartbeatState();
     const lastReport = state[threadKey]?.lastReport;
-    let heartbeatPrompt = buildHeartbeatPrompt(threadConfig, dueTier, lastReport);
 
-    // Inject timed tasks if any are due
+    // Parse HEARTBEAT.md sections and inject only relevant tiers into prompt
+    let sections: HeartbeatSections | null = null;
+    let heartbeatContent: string | null = null;
     try {
         const heartbeatPath = path.join(threadConfig.cwd, "HEARTBEAT.md");
-        const heartbeatContent = fs.readFileSync(heartbeatPath, "utf8");
-        const threadState = state[threadKey] || { quick: 0, hourly: 0, daily: 0 };
-        const lastRun = new Date(Math.max(threadState.quick, threadState.hourly, threadState.daily) || 0);
-        const now = new Date();
-        const settings = loadSettings();
-        const timedTasks = getTimedTasks(heartbeatContent, lastRun, now, settings.timezone);
-        if (timedTasks.length > 0) {
-            const timedSection = [
-                "",
-                "## Timed Tasks Due Now",
-                ...timedTasks.map(t => `- ${t}`),
-            ].join("\n");
-            heartbeatPrompt += timedSection;
-        }
+        heartbeatContent = fs.readFileSync(heartbeatPath, "utf8");
+        sections = parseHeartbeatSections(heartbeatContent);
     } catch {
-        // Timed task parsing is best-effort (ENOENT when no HEARTBEAT.md)
+        // ENOENT — no HEARTBEAT.md yet, prompt will tell agent to create one
+    }
+
+    let heartbeatPrompt = buildHeartbeatPrompt(threadConfig, dueTier, lastReport, sections);
+
+    // Inject timed tasks if any are due (parsed from HEARTBEAT.md in code, not by agent)
+    if (heartbeatContent) {
+        try {
+            const threadState = state[threadKey] || { quick: 0, hourly: 0, daily: 0 };
+            const lastRun = new Date(Math.max(threadState.quick, threadState.hourly, threadState.daily) || 0);
+            const now = new Date();
+            const settings = loadSettings();
+            const timedTasks = getTimedTasks(heartbeatContent, lastRun, now, settings.timezone);
+            if (timedTasks.length > 0) {
+                const timedSection = [
+                    "",
+                    "## Timed Tasks Due Now",
+                    ...timedTasks.map(t => `- ${t}`),
+                ].join("\n");
+                heartbeatPrompt += timedSection;
+            }
+        } catch {
+            // Timed task parsing is best-effort
+        }
     }
 
     log("INFO", `Heartbeat one-shot for thread ${msg.threadId} (tier: ${dueTier})`);

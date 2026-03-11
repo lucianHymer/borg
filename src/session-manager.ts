@@ -232,6 +232,36 @@ export function sanitizeHeartbeatContent(raw: string): string {
 
 export type HeartbeatTier = "quick" | "hourly" | "daily";
 
+export interface HeartbeatSections {
+    quick?: string;
+    hourly?: string;
+    daily?: string;
+    urgentFlags?: string;
+    notes?: string;
+}
+
+/**
+ * Parse HEARTBEAT.md into named sections.
+ * Returns content under each ## header, stripped of the header itself.
+ * Timed Tasks section is intentionally excluded — handled by getTimedTasks() in code.
+ */
+export function parseHeartbeatSections(content: string): HeartbeatSections {
+    const extract = (name: string): string | undefined => {
+        const regex = new RegExp(`^## ${name}[^\\n]*\\n([\\s\\S]*?)(?=\\n## |\\s*$)`, "m");
+        const match = content.match(regex);
+        const text = match?.[1]?.trim();
+        return text || undefined;
+    };
+
+    return {
+        quick: extract("Quick Tasks"),
+        hourly: extract("Hourly Tasks"),
+        daily: extract("Daily Tasks"),
+        urgentFlags: extract("Urgent Flags"),
+        notes: extract("Notes"),
+    };
+}
+
 // ─── Timed Tasks ───
 
 /**
@@ -408,20 +438,25 @@ When asked about project status, read active-projects.md first.`;
 function buildHeartbeatBlock(): string {
     return `## Heartbeat Self-Management
 
-You receive periodic heartbeat messages (~8 min interval). Your working directory has a
-HEARTBEAT.md file — your complete operational playbook for this repo.
+You receive periodic heartbeat messages. Your working directory has a
+HEARTBEAT.md file — your operational playbook for this repo.
 
-HEARTBEAT.md has per-tier task sections (Quick Tasks, Hourly Tasks, Daily Tasks).
-Every check the heartbeat performs is listed explicitly in this file.
+During heartbeats, the system parses HEARTBEAT.md and injects only the task sections
+relevant to the current tier (quick/hourly/daily). You do NOT need to read HEARTBEAT.md
+yourself during heartbeats — just execute the tasks shown in the prompt.
 
-You own this file. Evolve it as you learn about this repo:
+Timed Tasks (\`@HH:MM\` annotations in HEARTBEAT.md) are scheduled automatically by the
+system. When a timed task is due, it appears as "## Timed Tasks Due Now" in the heartbeat
+prompt. Do NOT independently check times or decide when timed tasks should fire.
+
+You own HEARTBEAT.md. Evolve it as you learn about this repo:
 - Add tasks when you notice recurring issues or patterns specific to this repo
 - Check off completed tasks, remove irrelevant ones
 - Put the right tasks in the right tier:
   - Quick Tasks: fast checks (< 10 seconds) — git status, file existence, flag checks
   - Hourly Tasks: moderate checks — git fetch, CI status, upstream changes
   - Daily Tasks: thorough checks — PR reviews, stale branch cleanup, daily summaries
-  - Timed Tasks: tasks with \`@HH:MM\` annotations that fire at specific times (e.g., \`- @09:00 — Check overnight alerts\`)
+  - Timed Tasks: \`@HH:MM\` annotations for scheduled tasks (system handles timing)
 - Use "Urgent Flags" for anything needing human attention (blockers, broken CI, security)
 - Keep "Notes" as scratch space for context between heartbeats
 
@@ -583,6 +618,7 @@ export function buildHeartbeatPrompt(
     config: ThreadConfig,
     dueTier: HeartbeatTier = "quick",
     lastReport?: { ts: number; summary: string },
+    sections?: HeartbeatSections | null,
 ): string {
     const settings = loadSettings();
     const now = formatHumanTime(settings.timezone);
@@ -597,20 +633,55 @@ export function buildHeartbeatPrompt(
         `Current time: ${now}`,
         `Heartbeat tier: **${dueTier.toUpperCase()}**`,
         tierDirective,
-        "",
-        `Read HEARTBEAT.md from your working directory (${config.cwd}).`,
-        `If it doesn't exist, create it with sections: Quick Tasks, Hourly Tasks, Daily Tasks, Urgent Flags, Notes.`,
-        "",
-        `Your heartbeat timing state is in \`${BORG_DIR}/heartbeat-state.json\` (read-only — timing is managed automatically).`,
-        "If your HEARTBEAT.md has a `## Timestamps` section, remove it — timing is now managed automatically.",
+    ];
+
+    // Inject parsed HEARTBEAT.md sections (only tiers relevant to this run)
+    if (sections) {
+        parts.push("");
+        const taskBlocks: string[] = [];
+        if (sections.quick) {
+            taskBlocks.push(`## Quick Tasks\n${sections.quick}`);
+        }
+        if ((dueTier === "hourly" || dueTier === "daily") && sections.hourly) {
+            taskBlocks.push(`## Hourly Tasks\n${sections.hourly}`);
+        }
+        if (dueTier === "daily" && sections.daily) {
+            taskBlocks.push(`## Daily Tasks\n${sections.daily}`);
+        }
+        if (sections.urgentFlags) {
+            taskBlocks.push(`## Urgent Flags\n${sections.urgentFlags}`);
+        }
+        if (sections.notes) {
+            taskBlocks.push(`## Notes\n${sections.notes}`);
+        }
+        if (taskBlocks.length > 0) {
+            parts.push("Your tasks for this heartbeat (from HEARTBEAT.md):", "");
+            parts.push(taskBlocks.join("\n\n"));
+        } else {
+            parts.push("HEARTBEAT.md has no tasks for this tier. Consider adding relevant tasks.");
+        }
+        parts.push(
+            "",
+            `HEARTBEAT.md path: ${path.join(config.cwd, "HEARTBEAT.md")}`,
+            "You can edit this file to add/remove/reorder tasks. Do NOT add timestamp tracking — timing is managed automatically.",
+        );
+    } else {
+        // No HEARTBEAT.md found — tell agent to create one
+        parts.push(
+            "",
+            `No HEARTBEAT.md found in ${config.cwd}.`,
+            "Create it with sections: Quick Tasks, Hourly Tasks, Daily Tasks, Timed Tasks, Urgent Flags, Notes.",
+            "Add tasks relevant to this repo. Quick Tasks should be fast (< 10s), Hourly moderate, Daily thorough.",
+        );
+    }
+
+    parts.push(
         "",
         "After executing your tasks:",
         "- If nothing needs human attention, reply with exactly `[NO_UPDATES]`",
         "- If something is actionable, describe ONLY the actionable items",
         "- Do NOT narrate your process (no \"Let me check...\", \"I'll read the file...\", \"Time to run heartbeat...\"). Jump straight to findings.",
-        "",
-        "You may evolve your HEARTBEAT.md over time — add tasks relevant to this repo, remove irrelevant ones, reorder by priority. But do NOT add any timestamp tracking.",
-    ];
+    );
 
     // Inject last report to prevent repetitive notifications
     if (lastReport) {
