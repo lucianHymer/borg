@@ -580,6 +580,27 @@ function buildQueryOptions(
     return opts;
 }
 
+// ─── Usage data from SDK result messages ───
+
+interface QueryUsageData {
+    totalCostUSD: number;
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadInputTokens: number;
+    cacheCreationInputTokens: number;
+    durationMs: number;
+    durationApiMs: number;
+    numTurns: number;
+    modelUsage: Record<string, {
+        inputTokens: number;
+        outputTokens: number;
+        cacheReadInputTokens: number;
+        cacheCreationInputTokens: number;
+        costUSD: number;
+        webSearchRequests: number;
+    }>;
+}
+
 // ─── Collect full response text from query stream ───
 
 interface QueryEventObserver {
@@ -601,9 +622,10 @@ const POST_END_TURN_POLL_MS = 5_000; // 5 seconds per event poll
 async function collectQueryResponse(
     q: Query,
     observer?: QueryEventObserver,
-): Promise<{ text: string; sessionId: string | undefined; stallRecovered: boolean }> {
+): Promise<{ text: string; sessionId: string | undefined; stallRecovered: boolean; usage?: QueryUsageData }> {
     const parts: string[] = [];
     let capturedSessionId: string | undefined;
+    let usageData: QueryUsageData | undefined;
 
     // ─── Stall detection state ───
     let sawEndTurn = false;
@@ -711,6 +733,28 @@ async function collectQueryResponse(
                     parts.push(result.result);
                 }
             }
+
+            // Capture usage data from both success and error result subtypes
+            usageData = {
+                totalCostUSD: result.total_cost_usd,
+                inputTokens: result.usage.input_tokens,
+                outputTokens: result.usage.output_tokens,
+                cacheReadInputTokens: result.usage.cache_read_input_tokens ?? 0,
+                cacheCreationInputTokens: result.usage.cache_creation_input_tokens ?? 0,
+                durationMs: result.duration_ms,
+                durationApiMs: result.duration_api_ms,
+                numTurns: result.num_turns,
+                modelUsage: Object.fromEntries(
+                    Object.entries(result.modelUsage).map(([model, mu]) => [model, {
+                        inputTokens: mu.inputTokens,
+                        outputTokens: mu.outputTokens,
+                        cacheReadInputTokens: mu.cacheReadInputTokens,
+                        cacheCreationInputTokens: mu.cacheCreationInputTokens,
+                        costUSD: mu.costUSD,
+                        webSearchRequests: mu.webSearchRequests,
+                    }]),
+                ),
+            };
         }
     }
 
@@ -723,17 +767,17 @@ async function collectQueryResponse(
         }
     }
 
-    return { text: parts.join("\n\n"), sessionId: capturedSessionId, stallRecovered: stallDetected };
+    return { text: parts.join("\n\n"), sessionId: capturedSessionId, stallRecovered: stallDetected, usage: usageData };
 }
 
 // ─── Heartbeat Processing (one-shot, no persistent session) ───
 
-async function processHeartbeat(msg: IncomingMessage): Promise<string> {
+async function processHeartbeat(msg: IncomingMessage): Promise<{ text: string; usage?: QueryUsageData }> {
     const threads = loadThreads();
     const threadKey = String(msg.threadId);
     const threadConfig = threads[threadKey];
     if (!threadConfig) {
-        return "[NO_UPDATES]";
+        return { text: "[NO_UPDATES]" };
     }
 
     const dueTier = getDueTier(threadKey);
@@ -799,7 +843,7 @@ async function processHeartbeat(msg: IncomingMessage): Promise<string> {
     });
 
     try {
-        const { text, stallRecovered } = await collectQueryResponse(q);
+        const { text, stallRecovered, usage } = await collectQueryResponse(q);
         if (stallRecovered) {
             log("WARN", `Heartbeat stall recovered for thread ${msg.threadId}`);
         }
@@ -813,7 +857,7 @@ async function processHeartbeat(msg: IncomingMessage): Promise<string> {
             saveLastReport(threadKey, response);
         }
 
-        return response;
+        return { text: response, usage };
     } catch (err) {
         const stderrOutput = stderrLines.join("").trim();
         log(
@@ -992,6 +1036,7 @@ async function processMessage(messageFile: string): Promise<void> {
     let responseText: string;
     let effectiveModel: string;
     let routingResult: { effectiveModel: string; decision: RoutingDecision } | undefined;
+    let usageData: QueryUsageData | undefined;
 
     try {
         // ─── Heartbeat: one-shot, skip router and session ───
@@ -1008,7 +1053,9 @@ async function processMessage(messageFile: string): Promise<void> {
                 return;
             }
             effectiveModel = "haiku";
-            responseText = await processHeartbeat(msg);
+            const heartbeatResult = await processHeartbeat(msg);
+            responseText = heartbeatResult.text;
+            usageData = heartbeatResult.usage;
 
             // Suppress heartbeat responses with no actionable content
             if (responseText.includes("[NO_UPDATES]")) {
@@ -1016,6 +1063,29 @@ async function processMessage(messageFile: string): Promise<void> {
                     "INFO",
                     `Heartbeat suppressed for thread=${threadId} (no updates)`,
                 );
+                // Still track usage for suppressed heartbeats
+                if (usageData) {
+                    appendHistory({
+                        ts: Date.now(),
+                        threadId,
+                        channel,
+                        sender: "assistant",
+                        direction: "out",
+                        message: "[heartbeat:suppressed]",
+                        model: effectiveModel,
+                        source: "heartbeat",
+                        messageId,
+                        costUSD: usageData.totalCostUSD,
+                        inputTokens: usageData.inputTokens,
+                        outputTokens: usageData.outputTokens,
+                        cacheReadInputTokens: usageData.cacheReadInputTokens,
+                        cacheCreationInputTokens: usageData.cacheCreationInputTokens,
+                        durationMs: usageData.durationMs,
+                        durationApiMs: usageData.durationApiMs,
+                        numTurns: usageData.numTurns,
+                        modelUsage: usageData.modelUsage,
+                    });
+                }
                 clearStatus(messageId);
                 if (fs.existsSync(processingFile)) {
                     fs.unlinkSync(processingFile);
@@ -1143,10 +1213,11 @@ async function processMessage(messageFile: string): Promise<void> {
             };
 
             try {
-                const { text, sessionId: newSessionId, stallRecovered } = await collectQueryResponse(
+                const { text, sessionId: newSessionId, stallRecovered, usage } = await collectQueryResponse(
                     q,
                     observer,
                 );
+                usageData = usage;
                 clearInterval(statusInterval);
 
                 if (cancelled) {
@@ -1218,6 +1289,17 @@ async function processMessage(messageFile: string): Promise<void> {
             model: effectiveModel,
             source: source ?? "user",
             messageId,
+            ...(usageData ? {
+                costUSD: usageData.totalCostUSD,
+                inputTokens: usageData.inputTokens,
+                outputTokens: usageData.outputTokens,
+                cacheReadInputTokens: usageData.cacheReadInputTokens,
+                cacheCreationInputTokens: usageData.cacheCreationInputTokens,
+                durationMs: usageData.durationMs,
+                durationApiMs: usageData.durationApiMs,
+                numTurns: usageData.numTurns,
+                modelUsage: usageData.modelUsage,
+            } : {}),
         });
 
         // ─── Write response to outgoing queue ───

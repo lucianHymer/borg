@@ -1,6 +1,7 @@
 # Knowledge Map (Claude Reference)
 
 ## Architecture
+- @architecture/usage-tracking-data-in-message-history-jsonl.md
 - @architecture/telegram-bot-commands-vs-queue-processor-command-handling.md
 - @architecture/team-mcp-tools-only-create-thread-configure-thread-disband-team.md
 - @architecture/team-commands-use-simple-queue-messages-not-custom-command-handlers.md
@@ -15,6 +16,7 @@
 - @architecture/security-zones-container-isolation.md
 
 ## Patterns
+- @patterns/sdk-result-union-type-usage-extraction.md
 - @patterns/distillforspeech-uses-agent-sdk-query-not-raw-fetch.md
 - @patterns/routing-feedback-emoji-reactions-pattern-analysis.md
 - @patterns/emoji-reactions-for-model-visibility-in-telegram.md
@@ -35,6 +37,7 @@
 - @config/tts-voice-and-speed-settings-in-borg-settings-json.md
 
 ## Gotchas
+- @gotchas/narrating-cross-thread-action-is-not-sending-it.md
 - @gotchas/speaches-container-handles-request-queuing-internally.md
 - @gotchas/stall-detection-must-use-absolute-time-not-per-event.md
 - @gotchas/message-history-dedup-must-check-direction.md

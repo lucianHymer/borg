@@ -224,7 +224,7 @@ tr.clickable { cursor: pointer; }
   align-items: center;
 }
 
-.feed-controls button, .feed-controls input, .tab-btn {
+.feed-controls button, .feed-controls input, .tab-btn, .usage-period-btn {
   background: var(--bg-tertiary);
   border: 1px solid var(--border);
   color: var(--text-primary);
@@ -235,8 +235,8 @@ tr.clickable { cursor: pointer; }
   cursor: pointer;
 }
 
-.feed-controls button:hover, .tab-btn:hover { border-color: var(--text-secondary); }
-.feed-controls button.active, .tab-btn.active { border-color: var(--accent-blue); color: var(--accent-blue); }
+.feed-controls button:hover, .tab-btn:hover, .usage-period-btn:hover { border-color: var(--text-secondary); }
+.feed-controls button.active, .tab-btn.active, .usage-period-btn.active { border-color: var(--accent-blue); color: var(--accent-blue); }
 
 .feed-controls input {
   flex: 1;
@@ -815,6 +815,7 @@ tr.clickable { cursor: pointer; }
   <a href="#logs" data-view="logs">Logs</a>
   <a href="#memory" data-view="memory">Memory</a>
   <a href="#heartbeats" data-view="heartbeats">Heartbeats</a>
+  <a href="#usage" data-view="usage">Usage</a>
   <div id="conn-status">
     <div id="conn-dot" class="connecting"></div>
     <span id="conn-text">connecting</span>
@@ -944,6 +945,32 @@ tr.clickable { cursor: pointer; }
       <span id="heartbeats-meta" style="color:var(--text-secondary);font-size:11px;"></span>
     </div>
     <div id="heartbeats-list"></div>
+  </div>
+
+  <!-- View: Usage -->
+  <div id="view-usage" class="view">
+    <h2 style="margin-bottom:12px;">Token Usage & Cost</h2>
+    <div style="display:flex;gap:8px;margin-bottom:16px;align-items:center;">
+      <button class="usage-period-btn" data-days="1">Today</button>
+      <button class="usage-period-btn active" data-days="7">7d</button>
+      <button class="usage-period-btn" data-days="30">30d</button>
+      <span id="usage-meta" style="color:var(--text-secondary);font-size:11px;margin-left:8px;"></span>
+    </div>
+    <div class="stat-grid" id="usage-stats"></div>
+    <h3 style="margin-bottom:8px;">Daily Cost Trend</h3>
+    <div id="usage-daily"></div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:16px;">
+      <div>
+        <h3 style="margin-bottom:8px;">By Thread</h3>
+        <div id="usage-by-thread"></div>
+      </div>
+      <div>
+        <h3 style="margin-bottom:8px;">By Model</h3>
+        <div id="usage-by-model"></div>
+      </div>
+    </div>
+    <h3 style="margin-top:16px;margin-bottom:8px;">By Source</h3>
+    <div id="usage-by-source"></div>
   </div>
 </div>
 
@@ -1163,6 +1190,7 @@ tr.clickable { cursor: pointer; }
       case 'logs': initLogs(); break;
       case 'memory': initMemory(); break;
       case 'heartbeats': initHeartbeats(); break;
+      case 'usage': initUsage(); break;
     }
   }
 
@@ -2597,6 +2625,138 @@ tr.clickable { cursor: pointer; }
 
       list.appendChild(card);
     });
+  }
+
+  // ─── View: Usage ───
+
+  var usageDays = 7;
+
+  function initUsage() {
+    // Set up period buttons
+    var btns = document.querySelectorAll('.usage-period-btn');
+    for (var i = 0; i < btns.length; i++) {
+      btns[i].onclick = function() {
+        for (var j = 0; j < btns.length; j++) btns[j].classList.remove('active');
+        this.classList.add('active');
+        usageDays = parseInt(this.getAttribute('data-days'), 10);
+        fetchUsage();
+      };
+    }
+    fetchUsage();
+  }
+
+  function fmtUSD(n) { return '$' + n.toFixed(2); }
+
+  function fmtTokens(n) {
+    if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+    if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+    return String(n);
+  }
+
+  function modelColorClass(model) {
+    var m = model.toLowerCase();
+    if (m.includes('haiku')) return 'model-haiku';
+    if (m.includes('sonnet')) return 'model-sonnet';
+    if (m.includes('opus')) return 'model-opus';
+    return '';
+  }
+
+  async function fetchUsage() {
+    var data = await api('/api/usage?days=' + usageDays);
+    if (!data) {
+      document.getElementById('usage-stats').innerHTML =
+        '<div class="empty-state">No usage data available</div>';
+      return;
+    }
+
+    var meta = document.getElementById('usage-meta');
+    meta.textContent = data.totalQueries + ' queries in period';
+
+    // Summary stat cards
+    var avgCost = data.totalQueries > 0 ? data.totalCostUSD / data.totalQueries : 0;
+    document.getElementById('usage-stats').innerHTML =
+      '<div class="stat-card"><div class="label">Total Cost</div><div class="value" style="color:var(--accent-green)">' + fmtUSD(data.totalCostUSD) + '</div></div>' +
+      '<div class="stat-card"><div class="label">Total Tokens</div><div class="value">' + fmtTokens(data.totalInputTokens + data.totalOutputTokens) + '</div></div>' +
+      '<div class="stat-card"><div class="label">Avg Cost/Query</div><div class="value">' + fmtUSD(avgCost) + '</div></div>' +
+      '<div class="stat-card"><div class="label">Total Queries</div><div class="value" style="color:var(--accent-blue)">' + data.totalQueries + '</div></div>';
+
+    // Daily cost trend (horizontal bar chart)
+    var dailyHtml = '';
+    if (data.daily && data.daily.length > 0) {
+      var maxDayCost = 0;
+      for (var i = 0; i < data.daily.length; i++) {
+        if (data.daily[i].costUSD > maxDayCost) maxDayCost = data.daily[i].costUSD;
+      }
+      if (maxDayCost === 0) maxDayCost = 1;
+
+      for (var i = 0; i < data.daily.length; i++) {
+        var d = data.daily[i];
+        var pct = (d.costUSD / maxDayCost * 100).toFixed(1);
+        dailyHtml +=
+          '<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;">' +
+            '<span style="width:80px;color:var(--text-secondary);font-size:12px;">' + d.date.slice(5) + '</span>' +
+            '<div class="bar-container" style="flex:1;height:20px;">' +
+              '<div class="bar-fill" style="width:' + pct + '%;background:var(--accent-green);"></div>' +
+              '<span class="bar-label">' + fmtUSD(d.costUSD) + ' · ' + d.queries + 'q</span>' +
+            '</div>' +
+          '</div>';
+      }
+    } else {
+      dailyHtml = '<div class="empty-state">No daily data</div>';
+    }
+    document.getElementById('usage-daily').innerHTML = dailyHtml;
+
+    // By Thread table
+    var threadHtml = '<table><thead><tr><th>Thread</th><th>Cost</th><th>Tokens</th><th>Queries</th></tr></thead><tbody>';
+    if (data.byThread && data.byThread.length > 0) {
+      for (var i = 0; i < data.byThread.length; i++) {
+        var t = data.byThread[i];
+        threadHtml += '<tr>' +
+          '<td title="ID: ' + t.threadId + '">' + escapeHtml(t.threadName) + '</td>' +
+          '<td>' + fmtUSD(t.costUSD) + '</td>' +
+          '<td>' + fmtTokens(t.inputTokens + t.outputTokens) + '</td>' +
+          '<td>' + t.queries + '</td></tr>';
+      }
+    } else {
+      threadHtml += '<tr><td colspan="4" class="empty-state">No thread data</td></tr>';
+    }
+    threadHtml += '</tbody></table>';
+    document.getElementById('usage-by-thread').innerHTML = threadHtml;
+
+    // By Model table
+    var modelHtml = '<table><thead><tr><th>Model</th><th>Cost</th><th>Tokens</th><th>Queries</th></tr></thead><tbody>';
+    if (data.byModel && data.byModel.length > 0) {
+      for (var i = 0; i < data.byModel.length; i++) {
+        var m = data.byModel[i];
+        modelHtml += '<tr>' +
+          '<td class="' + modelColorClass(m.model) + '">' + escapeHtml(m.model) + '</td>' +
+          '<td>' + fmtUSD(m.costUSD) + '</td>' +
+          '<td>' + fmtTokens(m.inputTokens + m.outputTokens) + '</td>' +
+          '<td>' + m.queries + '</td></tr>';
+      }
+    } else {
+      modelHtml += '<tr><td colspan="4" class="empty-state">No model data</td></tr>';
+    }
+    modelHtml += '</tbody></table>';
+    document.getElementById('usage-by-model').innerHTML = modelHtml;
+
+    // By Source table
+    var sourceHtml = '<table><thead><tr><th>Source</th><th>Cost</th><th>Queries</th><th>% of Total</th></tr></thead><tbody>';
+    if (data.bySource && data.bySource.length > 0) {
+      for (var i = 0; i < data.bySource.length; i++) {
+        var s = data.bySource[i];
+        var pctTotal = data.totalQueries > 0 ? (s.queries / data.totalQueries * 100).toFixed(0) : '0';
+        sourceHtml += '<tr>' +
+          '<td>' + escapeHtml(s.source) + '</td>' +
+          '<td>' + fmtUSD(s.costUSD) + '</td>' +
+          '<td>' + s.queries + '</td>' +
+          '<td>' + pctTotal + '%</td></tr>';
+      }
+    } else {
+      sourceHtml += '<tr><td colspan="4" class="empty-state">No source data</td></tr>';
+    }
+    sourceHtml += '</tbody></table>';
+    document.getElementById('usage-by-source').innerHTML = sourceHtml;
   }
 
   // ─── Init ───

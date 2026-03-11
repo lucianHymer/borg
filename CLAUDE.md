@@ -12,7 +12,7 @@ Compound knowledge into repos. The repo should get smarter over time — workflo
 - **Queue Processor** (`src/queue-processor.ts`) — SDK v2 sessions, routing, history injection
 - **Session Manager** (`src/session-manager.ts`) — threadId → session lifecycle, threads.json
 - **Router** (`src/router/`) — 14-dimension weighted scoring engine, model selection
-- **Message History** (`src/message-history.ts`) — shared JSONL log, tagged by threadId
+- **Message History** (`src/message-history.ts`) — shared JSONL log, tagged by threadId; carries optional token usage + cost fields on outgoing entries
 - **Routing Logger** (`src/routing-logger.ts`) — JSONL log of routing decisions
 - **Zone Config** (`src/zone-config.ts`) — zone-config.json loader, validation, mtime caching
 

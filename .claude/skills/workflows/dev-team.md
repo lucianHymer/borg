@@ -57,7 +57,7 @@ After the standard tasks, Planner creates the actual work subtasks (tasks #4–N
 - Creates ALL tasks (standard + dynamic) upfront with correct blockers
 - Uses `/compound-engineering:workflows:plan` to produce a structured plan with research, spec analysis, and acceptance criteria
 - Creates or overwrites the GitHub issue body with the full plan
-- Sends plan to master thread for approval before Worker begins
+- Posts plan in the planner thread and waits for user approval before Worker begins
 - Answers Worker questions if plan is unclear
 - Validates Reviewer's "does this match the plan?" check at the end
 
@@ -85,6 +85,7 @@ After the standard tasks, Planner creates the actual work subtasks (tasks #4–N
 - Captures learnings into CLAUDE.md and into the project knowledge system (use the `mim-ai:remember` skill if available — see Mim instructions for how knowledge is structured)
 - Keeps CLAUDE.md tight and token-efficient — every line costs tokens in every future session
 - Trims stale or redundant entries while adding new ones
+- **Commits and pushes all documentation changes** so they land in the PR — docs that aren't committed aren't shipped
 - Sends final summary to master thread — this is the team's "done" signal
 
 Note: model selection is handled by the message router, not per-role.
@@ -108,6 +109,8 @@ This is rare — most tasks are better served by a single Worker using parallel 
 ## Message Discipline
 
 **The #1 rule: only send a message if the recipient needs to act on it.**
+
+**The #2 rule: if the step says to send, send it NOW — in the same response.** Do not narrate cross-thread actions as future intentions ("I will send this to...", "once you confirm..."). The step is done when `send_message` has been called, not when you've described that you intend to call it.
 
 Every cross-thread message triggers a response (and burns tokens). So:
 
@@ -133,8 +136,8 @@ When you finish a workflow step, update the task status — don't message teamma
 1. Create a thread for each role
 2. Give the Planner the task (issue, description, context)
 3. Planner runs `/compound-engineering:workflows:plan`, creates all tasks with blockers, creates/updates GitHub issue
-4. Planner sends plan to **master thread for approval**
-5. Master/user approves or rejects the plan
+4. Planner posts plan summary in its own thread and **waits for user approval** (the user can read and respond directly in the planner thread)
+5. User approves or requests changes in the planner thread
 6. If approved, Planner sends plan to Worker: "implement tasks #4–N"
 7. Worker claims task #3, reviews plan, asks Planner if unclear, marks #3 done
 8. Worker runs `/compound-engineering:workflows:work` with the plan file, implements tasks, opens PR; **messages Reviewer: "PR ready for review: #N"**
