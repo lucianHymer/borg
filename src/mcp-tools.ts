@@ -71,7 +71,7 @@ function textContent(text: string) {
 export function createBorgMcpServer(sourceThreadId: number) {
     const sendMessage = tool(
         "send_message",
-        "Send a message to another Borg thread (Telegram forum topic). The message will appear in that thread and be processed by its agent.",
+        "Send a message to another Borg thread (Telegram forum topic). The message will appear in that thread and be processed by its agent. Messages to threads in a different security zone require human approval before delivery and may be rejected.",
         { targetThreadId: z.number(), message: z.string() },
         async ({ targetThreadId, message }) => {
             if (targetThreadId === sourceThreadId) {
@@ -127,11 +127,13 @@ export function createBorgMcpServer(sourceThreadId: number) {
 
     const listThreads = tool(
         "list_threads",
-        "List all active Borg threads (Telegram forum topics) with their IDs and names.",
+        "List all active Borg threads (Telegram forum topics) with their IDs, names, and zone membership. Cross-zone messages require human approval in the target zone and may be rejected — check zone fields before calling send_message.",
         {},
         async () => {
             try {
                 const threads = loadThreads();
+                let zoneConfig: ReturnType<typeof loadZoneConfig> = null;
+                try { zoneConfig = loadZoneConfig(ZONE_CONFIG_PATH); } catch { /* non-fatal */ }
                 const lines = Object.entries(threads).map(([id, t]) => {
                     const parts = [`Thread ${id}: ${t.name}`];
                     if (t.isMaster) parts.push("(master)");
@@ -139,6 +141,8 @@ export function createBorgMcpServer(sourceThreadId: number) {
                     if (t.team) parts.push(`team=${t.team}`);
                     if (t.role) parts.push(`role=${t.role}`);
                     if (t.cwd) parts.push(`cwd=${t.cwd}`);
+                    const zone = zoneConfig ? getThreadZone(zoneConfig, Number(id)) : null;
+                    if (zone) parts.push(`zone=${zone}`);
                     if (Number(id) === sourceThreadId) parts.push("(you)");
                     return parts.join(" ");
                 });
@@ -712,9 +716,8 @@ export function createBorgMcpServer(sourceThreadId: number) {
                 try {
                     const zoneConfig = loadZoneConfig(ZONE_CONFIG_PATH);
                     if (zoneConfig) {
-                        const updated = structuredClone(zoneConfig);
-                        const creatorZone = getThreadZone(updated, sourceThreadId);
-                        addThreadToZone(updated, threadId, creatorZone);
+                        const creatorZone = getThreadZone(zoneConfig, sourceThreadId);
+                        const updated = addThreadToZone(zoneConfig, threadId, creatorZone);
                         saveZoneConfig(ZONE_CONFIG_PATH, updated);
                     }
                 } catch { /* zone config may not exist yet — non-fatal */ }
@@ -871,8 +874,7 @@ export function createBorgMcpServer(sourceThreadId: number) {
                 try {
                     const zoneConfig = loadZoneConfig(ZONE_CONFIG_PATH);
                     if (zoneConfig) {
-                        const updated = structuredClone(zoneConfig);
-                        removeThreadFromZones(updated, threadId);
+                        const updated = removeThreadFromZones(zoneConfig, threadId);
                         saveZoneConfig(ZONE_CONFIG_PATH, updated);
                     }
                 } catch { /* zone config may not exist — non-fatal */ }

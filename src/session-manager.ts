@@ -355,7 +355,11 @@ ${buildCommandsBlock()}
 When you receive a message prefixed with "📨 _From {sender} in {thread}_", this is a cross-thread message from another thread. To reply:
 - Use the MCP send_message tool to send your response back to the source thread
 - Do NOT respond in the current thread — the sender is in a different thread and won't see it
-- The visible indicator shows both the sender's name and their thread name for context`;
+- The visible indicator shows both the sender's name and their thread name for context
+
+## Zone Approval
+
+Messages sent to threads in a different security zone require human approval before delivery. If your message is rejected, you will receive a system message notifying you of the rejection — treat this as a signal to escalate to a human or adjust your approach.`;
 }
 
 function buildWorkerCrossThreadBlock(): string {
@@ -370,7 +374,11 @@ ${buildCommandsBlock()}
 When you receive a message prefixed with "📨 _From {sender} in {thread}_", this is a cross-thread message from another thread. To reply:
 - Use the MCP send_message tool to send your response back to the source thread
 - Do NOT respond in the current thread — the sender is in a different thread and won't see it
-- The visible indicator shows both the sender's name and their thread name for context`;
+- The visible indicator shows both the sender's name and their thread name for context
+
+## Zone Approval
+
+Messages sent to threads in a different security zone require human approval before delivery. If your message is rejected, you will receive a system message notifying you of the rejection — treat this as a signal to escalate to a human or adjust your approach.`;
 }
 
 function buildKnowledgeBaseBlock(): string {

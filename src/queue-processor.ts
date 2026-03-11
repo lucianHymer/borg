@@ -1496,10 +1496,17 @@ function runHeartbeatCycle(): void {
         const threads = loadThreads();
         const zoneConfig = loadZoneConfig(ZONE_CONFIG_PATH);
 
-        // Get threads assigned to this zone
-        const zoneThreadIds = zoneConfig
-            ? getThreadsInZone(zoneConfig, BORG_ZONE)
-            : Object.keys(threads).map(Number);
+        // Get threads assigned to this zone.
+        // If BORG_ZONE is set but zoneConfig is null (zone-config.json missing/invalid),
+        // we skip heartbeats entirely rather than falling back to all threads. In zones-only
+        // mode, multiple queue-processor instances run (one per zone), so a null fallback
+        // would cause every instance to heartbeat every thread — double/triple-firing.
+        // Missing zone-config.json is always a misconfiguration, not a normal operating mode.
+        if (!zoneConfig) {
+            log("ERROR", `Heartbeat skipped: BORG_ZONE=${BORG_ZONE} is set but zone-config.json could not be loaded from ${ZONE_CONFIG_PATH}. Fix: ensure zone-config.json exists and is valid JSON.`);
+            return;
+        }
+        const zoneThreadIds = getThreadsInZone(zoneConfig, BORG_ZONE);
 
         // Filter to non-team threads in this zone
         const eligibleThreads = zoneThreadIds.filter((id) => {

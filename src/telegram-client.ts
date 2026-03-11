@@ -30,27 +30,26 @@ import { loadZoneConfig, getThreadZone, isSameZone } from "./zone-config.js";
 const SCRIPT_DIR = path.resolve(__dirname, "..");
 const ZONE_CONFIG_PATH = process.env.ZONE_CONFIG_PATH || path.join(SCRIPT_DIR, "zone-config.json");
 
+// Zone names — single source of truth for all zone-derived paths
+const ZONE_NAMES = ["core", "perimeter"] as const;
+
 // Infra's own storage — telegram-client always runs in the infra container
 const BORG_INFRA_DIR = path.join(SCRIPT_DIR, ".borg-infra");
 const QUEUE_DEAD_LETTER = path.join(BORG_INFRA_DIR, "queue/dead-letter");
+const INFRA_PENDING_DIR = path.join(BORG_INFRA_DIR, "queue/pending");
 const LOG_FILE = path.join(BORG_INFRA_DIR, "logs/telegram.log");
 const MESSAGE_MODELS_FILE = path.join(BORG_INFRA_DIR, "message-models.json");
 const MARKDOWN_PARSE_FAILURES = path.join(BORG_INFRA_DIR, "markdown-parse-failures.jsonl");
 
 // Zone status directories — queue-processors write status files to their zone's dir
-const ZONE_STATUS_DIRS = [
-    path.join(SCRIPT_DIR, ".borg-core/status"),
-    path.join(SCRIPT_DIR, ".borg-perimeter/status"),
-];
+const ZONE_STATUS_DIRS = ZONE_NAMES.map(z => path.join(SCRIPT_DIR, `.borg-${z}/status`));
 
 /**
- * Get all pending queue directories to scan (one per zone).
+ * Get all pending queue directories to scan.
+ * Pending approval files are always written to and read from infra's pending dir.
  */
 function getPendingQueueDirs(): string[] {
-    return [
-        path.join(SCRIPT_DIR, ".borg-core/queue/pending"),
-        path.join(SCRIPT_DIR, ".borg-perimeter/queue/pending"),
-    ];
+    return [INFRA_PENDING_DIR];
 }
 
 /**
@@ -66,9 +65,20 @@ function findPendingFile(pendingId: string): string | null {
 }
 
 /**
+ * Validate that a zone name is safe for use in path construction.
+ * Zone names must match /^[a-z0-9-]+$/ to prevent path traversal.
+ */
+function assertSafeZoneName(zoneName: string): void {
+    if (!/^[a-z0-9-]+$/.test(zoneName)) {
+        throw new Error(`Invalid zone name: "${zoneName}"`);
+    }
+}
+
+/**
  * Resolve the incoming queue path for a target zone.
  */
 function resolveZoneIncoming(targetZone: string): string {
+    assertSafeZoneName(targetZone);
     return path.join(SCRIPT_DIR, `.borg-${targetZone}/queue/incoming`);
 }
 
@@ -76,6 +86,7 @@ function resolveZoneIncoming(targetZone: string): string {
  * Resolve the outgoing queue path for a target zone.
  */
 function resolveZoneOutgoing(targetZone: string): string {
+    assertSafeZoneName(targetZone);
     return path.join(SCRIPT_DIR, `.borg-${targetZone}/queue/outgoing`);
 }
 
@@ -97,10 +108,7 @@ function resolveIncomingForThread(threadId: number): string {
  * Get all outgoing queue directories to poll (one per zone).
  */
 function getOutgoingQueueDirs(): string[] {
-    return [
-        path.join(SCRIPT_DIR, ".borg-core/queue/outgoing"),
-        path.join(SCRIPT_DIR, ".borg-perimeter/queue/outgoing"),
-    ];
+    return ZONE_NAMES.map(z => path.join(SCRIPT_DIR, `.borg-${z}/queue/outgoing`));
 }
 const DEDUP_WINDOW_MS = 10_000; // 10 seconds
 const TASK_LISTS_FILE = path.join(SCRIPT_DIR, ".borg", TASK_LISTS_FILENAME);
@@ -577,7 +585,7 @@ bot.on("message:text").filter(
             if (zoneConfig) {
                 return getThreadZone(zoneConfig, Number(id)) === "core";
             }
-            return true; // no zone config = all mainThread threads
+            return true; // zone-config missing (misconfiguration) — fall back to all mainThread threads
         });
 
         if (mainThreads.length === 0) {
@@ -863,7 +871,7 @@ async function pollOutgoingQueue(): Promise<void> {
     if (outgoingPollActive) return;
     outgoingPollActive = true;
     try {
-        // In infra mode, poll all zone outgoing queues; in single-container, just one
+        // Poll all zone outgoing queues
         const outgoingDirs = getOutgoingQueueDirs();
         const allFiles: Array<{ file: string; filePath: string }> = [];
         for (const dir of outgoingDirs) {
@@ -908,10 +916,9 @@ async function pollOutgoingQueue(): Promise<void> {
                         };
 
                         // Write pending file to infra's pending queue
-                        const pendingDir = path.join(SCRIPT_DIR, ".borg-infra/queue/pending");
-                        fs.mkdirSync(pendingDir, { recursive: true });
-                        const pendTmp = path.join(pendingDir, `${pendingId}.json.tmp`);
-                        const pendFinal = path.join(pendingDir, `${pendingId}.json`);
+                        fs.mkdirSync(INFRA_PENDING_DIR, { recursive: true });
+                        const pendTmp = path.join(INFRA_PENDING_DIR, `${pendingId}.json.tmp`);
+                        const pendFinal = path.join(INFRA_PENDING_DIR, `${pendingId}.json`);
                         fs.writeFileSync(pendTmp, JSON.stringify(pending));
                         fs.renameSync(pendTmp, pendFinal);
 
@@ -1666,6 +1673,13 @@ bot.on("callback_query:data", async (ctx) => {
     if (data.startsWith("zone_approve:") || data.startsWith("zone_reject:")) {
         const isApprove = data.startsWith("zone_approve:");
         const pendingId = data.replace(/^zone_(approve|reject):/, "");
+
+        // Validate pendingId before any filesystem operation — callback_data is user-controlled
+        if (!/^[a-zA-Z0-9_-]+$/.test(pendingId)) {
+            await ctx.answerCallbackQuery({ text: "Invalid approval ID", show_alert: true });
+            return;
+        }
+
         const pendingFile = findPendingFile(pendingId);
         if (!pendingFile) {
             await ctx.answerCallbackQuery({ text: "This approval has already been handled", show_alert: true });

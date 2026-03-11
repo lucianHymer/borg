@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Initialize per-zone storage directories for security zones.
-# Run once before first `docker compose -f docker-compose.yml -f docker-compose.zones.yml up`.
+# Run once before first `docker compose up`.
 
 set -euo pipefail
 
@@ -41,4 +41,4 @@ fi
 # Set ownership to node user (uid 1000) for Docker containers
 chown -R 1000:1000 .borg-core .borg-perimeter .borg-infra 2>/dev/null || true
 
-echo "Zone storage initialized. Ready for: docker compose -f docker-compose.yml -f docker-compose.zones.yml up"
+echo "Zone storage initialized. Ready for: docker compose up"

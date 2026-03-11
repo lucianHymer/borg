@@ -11,7 +11,7 @@ import { z } from "zod/v4";
 
 export const ZoneConfigSchema = z.object({
     zones: z.record(
-        z.string(), // zone name (e.g. "core", "perimeter")
+        z.string().regex(/^[a-z0-9-]+$/, "Zone name must match /^[a-z0-9-]+$/"), // e.g. "core", "perimeter"
         z.object({ threads: z.array(z.number().int().positive()) }),
     ),
     defaults: z.object({
@@ -20,6 +20,7 @@ export const ZoneConfigSchema = z.object({
 });
 
 export type ZoneConfig = z.infer<typeof ZoneConfigSchema>;
+// Documentation alias only — not a branded type; any string satisfies ZoneName at compile time.
 export type ZoneName = string;
 
 // ─── Cache ───
@@ -102,31 +103,36 @@ export function getThreadsInZone(config: ZoneConfig, zoneName: ZoneName): number
 
 /**
  * Add a thread to a zone. Removes it from any other zone first.
- * Returns the updated config (does NOT save to disk).
+ * Returns a new config object — does NOT mutate the input.
+ * Does NOT save to disk.
  */
 export function addThreadToZone(config: ZoneConfig, threadId: number, zoneName: ZoneName): ZoneConfig {
     if (!config.zones[zoneName]) {
         throw new Error(`Zone "${zoneName}" does not exist`);
     }
 
+    const next = structuredClone(config);
+
     // Remove from all zones first
-    for (const zone of Object.values(config.zones)) {
+    for (const zone of Object.values(next.zones)) {
         zone.threads = zone.threads.filter(id => id !== threadId);
     }
 
-    config.zones[zoneName].threads.push(threadId);
-    return config;
+    next.zones[zoneName].threads.push(threadId);
+    return next;
 }
 
 /**
  * Remove a thread from all zones (e.g. on thread deletion).
- * Returns the updated config (does NOT save to disk).
+ * Returns a new config object — does NOT mutate the input.
+ * Does NOT save to disk.
  */
 export function removeThreadFromZones(config: ZoneConfig, threadId: number): ZoneConfig {
-    for (const zone of Object.values(config.zones)) {
+    const next = structuredClone(config);
+    for (const zone of Object.values(next.zones)) {
         zone.threads = zone.threads.filter(id => id !== threadId);
     }
-    return config;
+    return next;
 }
 
 /**
@@ -136,9 +142,9 @@ export function saveZoneConfig(configPath: string, config: ZoneConfig): void {
     const tmpPath = configPath + ".tmp";
     fs.writeFileSync(tmpPath, JSON.stringify(config, null, 2) + "\n");
     fs.renameSync(tmpPath, configPath);
-    // Invalidate cache so next load picks up the new file
-    cachedConfig = null;
-    cachedMtime = 0;
+    // Warm the cache with the saved config to avoid a redundant disk read on next access
+    cachedConfig = config;
+    cachedMtime = fs.statSync(configPath).mtimeMs;
 }
 
 /** Clear the in-memory cache (useful for tests). */
