@@ -1081,6 +1081,7 @@ async function processMessage(messageFile: string): Promise<void> {
                         cacheReadInputTokens: usageData.cacheReadInputTokens,
                         cacheCreationInputTokens: usageData.cacheCreationInputTokens,
                         durationMs: usageData.durationMs,
+                        durationApiMs: usageData.durationApiMs,
                         numTurns: usageData.numTurns,
                         modelUsage: usageData.modelUsage,
                     });
@@ -1295,6 +1296,7 @@ async function processMessage(messageFile: string): Promise<void> {
                 cacheReadInputTokens: usageData.cacheReadInputTokens,
                 cacheCreationInputTokens: usageData.cacheCreationInputTokens,
                 durationMs: usageData.durationMs,
+                durationApiMs: usageData.durationApiMs,
                 numTurns: usageData.numTurns,
                 modelUsage: usageData.modelUsage,
             } : {}),

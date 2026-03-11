@@ -34,6 +34,7 @@ export interface MessageHistoryEntry {
     cacheReadInputTokens?: number;
     cacheCreationInputTokens?: number;
     durationMs?: number;
+    durationApiMs?: number;
     numTurns?: number;
     modelUsage?: Record<string, {
         inputTokens: number;
