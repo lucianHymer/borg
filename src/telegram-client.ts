@@ -44,13 +44,10 @@ const ZONE_STATUS_DIRS = [
 ];
 
 /**
- * Get all pending queue directories to scan (one per zone).
+ * Get the pending queue directory (infra owns all cross-zone approvals).
  */
 function getPendingQueueDirs(): string[] {
-    return [
-        path.join(SCRIPT_DIR, ".borg-core/queue/pending"),
-        path.join(SCRIPT_DIR, ".borg-perimeter/queue/pending"),
-    ];
+    return [path.join(SCRIPT_DIR, ".borg-infra/queue/pending")];
 }
 
 /**
@@ -923,8 +920,8 @@ async function pollOutgoingQueue(): Promise<void> {
                         const approvalText = [
                             `🔒 *Cross\\-zone message pending approval*`,
                             ``,
-                            `*From:* ${escapeMarkdownV2(sourceName)} \\(thread ${data.sourceThreadId}\\)`,
-                            `*To:* thread ${data.targetThreadId}`,
+                            `*From:* ${escapeMarkdownV2(sourceName)}`,
+                            `*To:* ${escapeMarkdownV2(targetName)}`,
                             ``,
                             `${escapeMarkdownV2(preview)}`,
                         ].join("\n");
@@ -1733,7 +1730,7 @@ bot.on("callback_query:data", async (ctx) => {
                 await ctx.answerCallbackQuery({ text: "Message approved and delivered" });
                 try {
                     await ctx.editMessageText(
-                        `✅ *Approved* — message from ${escapeMarkdownV2(pending.senderName)} delivered to thread ${pending.targetThreadId}`,
+                        `✅ *Approved* — message from ${escapeMarkdownV2(pending.senderName)} delivered to ${escapeMarkdownV2(pending.targetName)}`,
                         { parse_mode: "MarkdownV2" },
                     );
                 } catch { /* best effort */ }
@@ -1767,7 +1764,7 @@ bot.on("callback_query:data", async (ctx) => {
                 await ctx.answerCallbackQuery({ text: "Message rejected" });
                 try {
                     await ctx.editMessageText(
-                        `❌ *Rejected* — message from ${escapeMarkdownV2(pending.senderName)} to thread ${pending.targetThreadId} was rejected`,
+                        `❌ *Rejected* — message from ${escapeMarkdownV2(pending.senderName)} to ${escapeMarkdownV2(pending.targetName)} was rejected`,
                         { parse_mode: "MarkdownV2" },
                     );
                 } catch { /* best effort */ }

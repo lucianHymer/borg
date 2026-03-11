@@ -46,6 +46,19 @@ export function route(
     };
   }
 
+  // Override: explicit "use sonnet" → force MEDIUM
+  if (/\buse sonnet\b/i.test(prompt)) {
+    return {
+      model: config.tiers.MEDIUM,
+      tier: "MEDIUM",
+      confidence: 0.99,
+      method: "rules",
+      reasoning: "Explicit 'use sonnet' override",
+      signals: ["explicit-sonnet"],
+      estimatedTokens,
+    };
+  }
+
   // Override: large context → force COMPLEX
   if (estimatedTokens > config.overrides.maxTokensForceComplex) {
     return {
