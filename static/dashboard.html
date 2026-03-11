@@ -1437,7 +1437,7 @@ tr.clickable { cursor: pointer; }
         : '<span class="badge badge-red">none</span>';
       rows += '<tr class="clickable" data-thread-id="' + escapeHtml(String(id)) + '">' +
         '<td>' + escapeHtml(String(id)) + '</td>' +
-        '<td>' + escapeHtml(t.name || '') + (t.isMaster ? ' <span class="badge badge-yellow">master</span>' : '') + '</td>' +
+        '<td>' + escapeHtml(t.name || '') + (t.isMaster ? ' <span class="badge badge-yellow">master</span>' : '') + (t.mainThread ? ' <span class="badge" style="background:var(--accent-blue);color:#000;font-size:10px;" title="Receives broadcast fan-outs">main</span>' : '') + '</td>' +
         '<td>' + teamRoleBadge(t.team, t.role) + '</td>' +
         '<td>' + zoneBadge(t.zone, id) + '</td>' +
         '<td>' + modelBadge(t.model) + '</td>' +
@@ -1605,6 +1605,7 @@ tr.clickable { cursor: pointer; }
       '<div class="field"><span class="label">CWD</span><span class="val">' + escapeHtml(config.cwd || 'N/A') + '</span></div>' +
       '<div class="field"><span class="label">Last Active</span><span class="val">' + relativeTime(config.lastActive) + '</span></div>' +
       (config.isMaster ? '<div class="field"><span class="label">Role</span><span class="val"><span class="badge badge-yellow">master</span></span></div>' : '') +
+      (config.mainThread ? '<div class="field"><span class="label">Broadcast</span><span class="val"><span class="badge" style="background:var(--accent-blue);color:#000;font-size:10px;" title="Receives broadcast fan-outs">main</span></span></div>' : '') +
       (config.team ? '<div class="field"><span class="label">Team</span><span class="val"><span class="badge" style="background:var(--accent-blue);color:#000;font-size:10px;">' + escapeHtml(config.team) + '</span></span></div>' : '') +
       (config.role ? '<div class="field"><span class="label">Team Role</span><span class="val">' + escapeHtml(config.role) + '</span></div>' : '');
 
