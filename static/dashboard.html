@@ -838,7 +838,7 @@ tr.clickable { cursor: pointer; }
     </div>
     <table id="threads-table">
       <thead>
-        <tr><th>ID</th><th>Name</th><th>Zone</th><th>Model</th><th>Last Active</th><th>Session</th><th>CWD</th></tr>
+        <tr><th>ID</th><th>Name</th><th>Team / Role</th><th>Zone</th><th>Model</th><th>Last Active</th><th>Session</th><th>CWD</th></tr>
       </thead>
       <tbody id="threads-tbody"></tbody>
     </table>
@@ -1275,11 +1275,69 @@ tr.clickable { cursor: pointer; }
       '</div>';
   }
 
-  function zoneBadge(zone) {
+  function teamRoleBadge(team, role) {
+    if (!team && !role) return '';
+    var parts = [];
+    if (team) parts.push('<span class="badge" style="background:var(--accent-blue);color:#000;font-size:10px;">' + escapeHtml(team) + '</span>');
+    if (role) parts.push('<span class="badge" style="background:var(--bg-alt);color:var(--text-secondary);font-size:10px;border:1px solid var(--border);">' + escapeHtml(role) + '</span>');
+    return parts.join(' ');
+  }
+
+  var _availableZones = []; // populated from /api/zones
+
+  function zoneBadge(zone, threadId) {
     if (!zone) return '';
     var colors = { core: 'var(--accent-green)', perimeter: 'var(--accent-yellow)' };
     var color = colors[zone] || 'var(--text-secondary)';
-    return '<span class="badge" style="background:' + color + ';color:#000;font-size:10px;">' + escapeHtml(zone) + '</span>';
+    return '<span class="badge zone-badge" style="background:' + color + ';color:#000;font-size:10px;cursor:pointer;" ' +
+      'data-thread-id="' + escapeHtml(String(threadId)) + '" data-zone="' + escapeHtml(zone) + '" ' +
+      'title="Click to change zone">' + escapeHtml(zone) + '</span>';
+  }
+
+  function showZoneDropdown(badge) {
+    // Remove any existing dropdown
+    var existing = document.getElementById('zone-dropdown');
+    if (existing) existing.remove();
+
+    var threadId = badge.dataset.threadId;
+    var currentZone = badge.dataset.zone;
+    var rect = badge.getBoundingClientRect();
+
+    var dropdown = document.createElement('div');
+    dropdown.id = 'zone-dropdown';
+    dropdown.style.cssText = 'position:fixed;z-index:1000;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;padding:4px 0;box-shadow:0 4px 12px rgba(0,0,0,0.3);' +
+      'top:' + (rect.bottom + 4) + 'px;left:' + rect.left + 'px;min-width:100px;';
+
+    _availableZones.forEach(function(z) {
+      var item = document.createElement('div');
+      item.textContent = z;
+      item.style.cssText = 'padding:4px 12px;cursor:pointer;font-size:12px;color:var(--text-primary);';
+      if (z === currentZone) item.style.color = 'var(--text-secondary)';
+      item.onmouseenter = function() { if (z !== currentZone) item.style.background = 'var(--bg-alt)'; };
+      item.onmouseleave = function() { item.style.background = ''; };
+      item.onclick = function(e) {
+        e.stopPropagation();
+        dropdown.remove();
+        if (z === currentZone) return;
+        fetch('/api/zones/move', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ threadId: Number(threadId), zone: z })
+        }).then(function(r) { return r.json(); }).then(function(d) {
+          if (d.success) fetchOverview();
+        });
+      };
+      dropdown.appendChild(item);
+    });
+
+    document.body.appendChild(dropdown);
+    // Close on outside click
+    setTimeout(function() {
+      document.addEventListener('click', function closeDropdown() {
+        dropdown.remove();
+        document.removeEventListener('click', closeDropdown);
+      }, { once: true });
+    }, 0);
   }
 
   function renderOverviewThreads(data) {
@@ -1301,6 +1359,12 @@ tr.clickable { cursor: pointer; }
         opts += '<option value="' + escapeHtml(z) + '"' + (z === currentFilter ? ' selected' : '') + '>' + escapeHtml(z) + '</option>';
       });
       selectEl.innerHTML = opts;
+      // Fetch available zones for dropdown
+      fetch('/api/zones').then(function(r) { return r.json(); }).then(function(d) {
+        if (d.configured && d.config && d.config.zones) {
+          _availableZones = Object.keys(d.config.zones).sort();
+        }
+      }).catch(function() {});
       // Fetch pending approvals count
       fetch('/api/zones/pending').then(function(r) { return r.json(); }).then(function(d) {
         var countEl = document.getElementById('zone-pending-count');
@@ -1328,7 +1392,7 @@ tr.clickable { cursor: pointer; }
       : sorted;
 
     if (filtered.length === 0) {
-      rows = '<tr><td colspan="7" class="empty-state">No active threads</td></tr>';
+      rows = '<tr><td colspan="8" class="empty-state">No active threads</td></tr>';
     }
 
     for (var i = 0; i < filtered.length; i++) {
@@ -1340,7 +1404,8 @@ tr.clickable { cursor: pointer; }
       rows += '<tr class="clickable" data-thread-id="' + escapeHtml(String(id)) + '">' +
         '<td>' + escapeHtml(String(id)) + '</td>' +
         '<td>' + escapeHtml(t.name || '') + (t.isMaster ? ' <span class="badge badge-yellow">master</span>' : '') + '</td>' +
-        '<td>' + zoneBadge(t.zone) + '</td>' +
+        '<td>' + teamRoleBadge(t.team, t.role) + '</td>' +
+        '<td>' + zoneBadge(t.zone, id) + '</td>' +
         '<td>' + modelBadge(t.model) + '</td>' +
         '<td>' + relativeTime(t.lastActive) + '</td>' +
         '<td>' + sessionBadge + '</td>' +
@@ -1357,6 +1422,14 @@ tr.clickable { cursor: pointer; }
         location.hash = '#thread/' + tid;
       };
     });
+
+    // Click handlers for zone badges (stop propagation to prevent row click)
+    tbody.querySelectorAll('.zone-badge').forEach(function(badge) {
+      badge.onclick = function(e) {
+        e.stopPropagation();
+        showZoneDropdown(badge);
+      };
+    });
   }
 
   function renderOverviewEmpty() {
@@ -1364,7 +1437,7 @@ tr.clickable { cursor: pointer; }
       '<div class="stat-card"><div class="label">Status</div><div class="value" style="color:var(--accent-red)">Offline</div></div>';
     document.getElementById('overview-queue').innerHTML = '';
     document.getElementById('threads-tbody').innerHTML =
-      '<tr><td colspan="7" class="empty-state">Cannot reach API server</td></tr>';
+      '<tr><td colspan="8" class="empty-state">Cannot reach API server</td></tr>';
   }
 
   // ─── View 2: Live Feed ───
@@ -1497,7 +1570,9 @@ tr.clickable { cursor: pointer; }
       '<div class="field"><span class="label">Model</span><span class="val">' + modelBadge(config.model) + '</span></div>' +
       '<div class="field"><span class="label">CWD</span><span class="val">' + escapeHtml(config.cwd || 'N/A') + '</span></div>' +
       '<div class="field"><span class="label">Last Active</span><span class="val">' + relativeTime(config.lastActive) + '</span></div>' +
-      (config.isMaster ? '<div class="field"><span class="label">Role</span><span class="val"><span class="badge badge-yellow">master</span></span></div>' : '');
+      (config.isMaster ? '<div class="field"><span class="label">Role</span><span class="val"><span class="badge badge-yellow">master</span></span></div>' : '') +
+      (config.team ? '<div class="field"><span class="label">Team</span><span class="val"><span class="badge" style="background:var(--accent-blue);color:#000;font-size:10px;">' + escapeHtml(config.team) + '</span></span></div>' : '') +
+      (config.role ? '<div class="field"><span class="label">Team Role</span><span class="val">' + escapeHtml(config.role) + '</span></div>' : '');
 
     // Chat bubbles
     var chat = document.getElementById('thread-chat');
