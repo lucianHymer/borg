@@ -27,16 +27,14 @@ import {
 import { parseMeminfo, parseCpuPercent, getDiskUsage, countQueueFiles } from "./host-metrics.js";
 import { loadThreads, loadSettings, formatHumanTime, configureThread, saveThreads } from "./session-manager.js";
 import { toErrorMessage, parseSSHPublicKey, parseDevEmail } from "./types.js";
-import type { PendingApproval } from "./types.js";
 import { logCorrection, ROUTING_LOG, mergeCorrectionsOntoDecisions } from "./routing-logger.js";
 import { readRecentJsonl } from "./jsonl-reader.js";
-import { loadZoneConfig, getThreadZone, isSameZone, addThreadToZone, removeThreadFromZones, saveZoneConfig } from "./zone-config.js";
+import { loadZoneConfig, getThreadZone, addThreadToZone, removeThreadFromZones, saveZoneConfig } from "./zone-config.js";
 
 const PROJECT_DIR = path.resolve(__dirname, "..");
 const BORG_DIR = path.join(PROJECT_DIR, ".borg");
 const QUEUE_INCOMING = path.join(BORG_DIR, "queue/incoming");
 const QUEUE_OUTGOING = path.join(BORG_DIR, "queue/outgoing");
-const QUEUE_PENDING = path.join(BORG_DIR, "queue/pending");
 const ZONE_CONFIG_PATH = process.env.ZONE_CONFIG_PATH || path.join(PROJECT_DIR, "zone-config.json");
 const DOCKER_PROXY_URL = process.env.DOCKER_PROXY_URL || "http://docker-proxy:2375";
 const PUBLIC_HOST = process.env.PUBLIC_HOST || "localhost";
@@ -103,79 +101,7 @@ export function createBorgMcpServer(sourceThreadId: number) {
             const sourceName = threads[String(sourceThreadId)]?.name ?? `Thread ${sourceThreadId}`;
             const targetName = threads[String(targetThreadId)].name;
 
-            // Check zone configuration for cross-zone routing
-            const zoneConfig = loadZoneConfig(ZONE_CONFIG_PATH);
-            const crossZone = zoneConfig && !isSameZone(zoneConfig, sourceThreadId, targetThreadId);
-
-            if (crossZone) {
-                // Cross-zone: write to pending queue for human approval
-                const sourceZone = getThreadZone(zoneConfig!, sourceThreadId);
-                const targetZone = getThreadZone(zoneConfig!, targetThreadId);
-
-                const pending: PendingApproval = {
-                    id,
-                    sourceThreadId,
-                    targetThreadId,
-                    sourceZone,
-                    targetZone,
-                    senderName: sourceName,
-                    targetName,
-                    message,
-                    timestamp: ts,
-                };
-
-                fs.mkdirSync(QUEUE_PENDING, { recursive: true });
-                const pendTmp = path.join(QUEUE_PENDING, `${id}.json.tmp`);
-                const pendFinal = path.join(QUEUE_PENDING, `${id}.json`);
-                fs.writeFileSync(pendTmp, JSON.stringify(pending));
-                fs.renameSync(pendTmp, pendFinal);
-
-                // Write to outgoing queue with crossZonePending flag
-                // telegram-client will show an inline keyboard for approval
-                const outgoing = {
-                    channel: "telegram",
-                    targetThreadId,
-                    sourceThreadId,
-                    sender: sourceName,
-                    message,
-                    originalMessage: "",
-                    timestamp: ts,
-                    messageId: `${id}_tg`,
-                    model: "",
-                    crossZonePending: true,
-                };
-
-                fs.mkdirSync(QUEUE_OUTGOING, { recursive: true });
-                const outTmp = path.join(QUEUE_OUTGOING, `${id}_tg.json.tmp`);
-                const outFinal = path.join(QUEUE_OUTGOING, `${id}_tg.json`);
-                fs.writeFileSync(outTmp, JSON.stringify(outgoing));
-                fs.renameSync(outTmp, outFinal);
-
-                return { content: [textContent(
-                    `Cross-zone message held for approval (${sourceZone} → ${targetZone}). ` +
-                    `Target: thread ${targetThreadId} (${targetName}). A human must approve delivery.`
-                )] };
-            }
-
-            // Same zone (or no zone config): deliver directly as today
-            const incoming = {
-                channel: "telegram",
-                source: "cross-thread",
-                threadId: targetThreadId,
-                sourceThreadId,
-                sender: sourceName,
-                message,
-                timestamp: ts,
-                messageId: id,
-            };
-
-            fs.mkdirSync(QUEUE_INCOMING, { recursive: true });
-            const inTmp = path.join(QUEUE_INCOMING, `${id}.json.tmp`);
-            const inFinal = path.join(QUEUE_INCOMING, `${id}.json`);
-            fs.writeFileSync(inTmp, JSON.stringify(incoming));
-            fs.renameSync(inTmp, inFinal);
-
-            // Write to outgoing queue so it appears in the Telegram topic
+            // Write to outgoing queue with crossThread flag — infra handles routing
             const outgoing = {
                 channel: "telegram",
                 targetThreadId,
@@ -186,6 +112,7 @@ export function createBorgMcpServer(sourceThreadId: number) {
                 timestamp: ts,
                 messageId: `${id}_tg`,
                 model: "",
+                crossThread: true,
             };
 
             fs.mkdirSync(QUEUE_OUTGOING, { recursive: true });
@@ -1047,9 +974,8 @@ export function createBorgMcpServer(sourceThreadId: number) {
         getCurrentTime, getElapsedTime,
         createThread, configureThreadTool, disbandTeam, deleteThread,
     ];
-    // Broadcast tool only available in core zone (or when no zone config / single container)
-    const borgZone = process.env.BORG_ZONE;
-    if (!borgZone || borgZone === "core") {
+    // Broadcast tool only available in core zone
+    if (process.env.BORG_ZONE === "core") {
         tools.push(broadcastTool);
     }
     if (sourceThreadId === 1) {
