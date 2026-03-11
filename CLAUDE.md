@@ -14,6 +14,17 @@ Compound knowledge into repos. The repo should get smarter over time — workflo
 - **Router** (`src/router/`) — 14-dimension weighted scoring engine, model selection
 - **Message History** (`src/message-history.ts`) — shared JSONL log, tagged by threadId
 - **Routing Logger** (`src/routing-logger.ts`) — JSONL log of routing decisions
+- **Zone Config** (`src/zone-config.ts`) — zone-config.json loader, validation, mtime caching
+
+## Security Zones
+
+Optional container-level isolation. Agents are separated into **Core** (trusted) and **Perimeter** (untrusted) zones, with **Infra** running telegram-client + routing only. Zones are invisible to agents — `send_message` works identically; cross-zone messages are held for human approval via Telegram inline keyboard. Activate with `docker compose -f docker-compose.yml -f docker-compose.zones.yml up`.
+
+- `zone-config.json` — maps threads to zones, validated by Zod, mtime-cached via `loadZoneConfig()`
+- `BORG_ZONE` env var — `"core"`, `"perimeter"`, `"infra"`, or unset (single-container)
+- `ZONE_CONFIG_PATH` env var — path to zone-config.json
+- Per-zone storage: `.borg-core/`, `.borg-perimeter/`, `.borg-infra/`
+- Broadcast filtered to core-zone `mainThread` threads when zones active
 
 ## Key Files
 
@@ -22,6 +33,7 @@ Compound knowledge into repos. The repo should get smarter over time — workflo
 - `.borg/routing-log.jsonl` — routing decision audit trail
 - `.borg/message-models.json` — Telegram messageId → model mapping for reply routing
 - `.borg/settings.json` — bot token, chat ID, timezone, intervals
+- `zone-config.json` — thread-to-zone mapping (see Security Zones)
 - `HEARTBEAT.md` — living task list for heartbeat checks (per-repo)
 
 ## Cross-Thread Communication

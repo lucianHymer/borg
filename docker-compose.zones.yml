@@ -1,0 +1,128 @@
+# Zone-aware override — use with:
+#   docker compose -f docker-compose.yml -f docker-compose.zones.yml up
+#
+# Replaces the single "bot" service with infra + core + perimeter containers.
+# The base docker-compose.yml provides broker, docker-proxy, dashboard, speaches, cloudflared.
+
+services:
+  # ── Remove the single-container bot ──
+  bot:
+    profiles: ["disabled"]  # effectively removes it when zones are active
+
+  # ── Infra: telegram-client + routing (no SDK, no agent sessions) ──
+  infra:
+    build:
+      context: .
+      dockerfile: Dockerfile.infra
+    restart: on-failure
+    init: true
+    stop_grace_period: 30s
+    depends_on:
+      broker:
+        condition: service_healthy
+      speaches:
+        condition: service_started
+    volumes:
+      - ./.borg-infra:/app/.borg-infra
+      - ./.borg-core:/app/.borg-core
+      - ./.borg-perimeter:/app/.borg-perimeter
+      - ./threads.json:/app/threads.json
+      - ./zone-config.json:/app/zone-config.json
+    environment:
+      - NODE_ENV=production
+      - BORG_ZONE=infra
+      - ZONE_CONFIG_PATH=/app/zone-config.json
+    networks:
+      - internal
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '1.0'
+
+  # ── Core: agent SDK sessions for trusted threads ──
+  core:
+    build: .
+    restart: on-failure
+    init: true
+    stop_grace_period: 30s
+    depends_on:
+      broker:
+        condition: service_healthy
+      infra:
+        condition: service_started
+    volumes:
+      - ./.borg-core:/app/.borg
+      - ./threads.json:/app/threads.json
+      - ./zone-config.json:/app/zone-config.json  # writable: create_thread/delete_thread update zone assignments
+      # Workspace access
+      - ${WORKSPACE_ROOT}:${WORKSPACE_ROOT}
+      # Credentials
+      - ./secrets/github-installations.json:/secrets/github-installations.json:ro
+      - ${CLAUDE_CREDENTIALS}:/home/node/.claude/.credentials.json
+      - ./skills/global:/home/node/.claude/skills:ro
+    environment:
+      - NODE_ENV=production
+      - BORG_ZONE=core
+      - ZONE_CONFIG_PATH=/app/zone-config.json
+      - DEFAULT_CWD=${WORKSPACE_ROOT}
+      - CREDENTIAL_BROKER_URL=http://broker:3000
+      - BROKER_SECRET=${BROKER_SECRET}
+      - PUBLIC_HOST=${PUBLIC_HOST}
+      - DEV_NETWORK=borg_dev
+      - DOCKER_PROXY_URL=http://docker-proxy:2375/v1.47
+    networks:
+      - internal
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '2.0'
+
+  # ── Perimeter: agent SDK sessions for untrusted threads ──
+  perimeter:
+    build: .
+    restart: on-failure
+    init: true
+    stop_grace_period: 30s
+    depends_on:
+      broker:
+        condition: service_healthy
+      infra:
+        condition: service_started
+    volumes:
+      - ./.borg-perimeter:/app/.borg
+      - ./threads.json:/app/threads.json
+      - ./zone-config.json:/app/zone-config.json  # writable: create_thread/delete_thread update zone assignments
+      # Workspace access (sandboxed by Claude Code)
+      - ${WORKSPACE_ROOT}:${WORKSPACE_ROOT}
+      # Credentials (limited)
+      - ./secrets/github-installations.json:/secrets/github-installations.json:ro
+      - ${CLAUDE_CREDENTIALS}:/home/node/.claude/.credentials.json
+      # NO SSH keys, NO docker-proxy access
+    environment:
+      - NODE_ENV=production
+      - BORG_ZONE=perimeter
+      - ZONE_CONFIG_PATH=/app/zone-config.json
+      - DEFAULT_CWD=${WORKSPACE_ROOT}
+      - CREDENTIAL_BROKER_URL=http://broker:3000
+      - BROKER_SECRET=${BROKER_SECRET}
+    networks:
+      - internal
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '1.0'
+
+  # ── Dashboard: mounts all zone dirs read-only ──
+  dashboard:
+    volumes:
+      - ./.borg-core:/app/.borg-core:ro
+      - ./.borg-perimeter:/app/.borg-perimeter:ro
+      - ./.borg-infra:/app/.borg-infra:ro
+      - ./zone-config.json:/app/zone-config.json:ro
+
+networks:
+  internal:
+    driver: bridge

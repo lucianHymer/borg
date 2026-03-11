@@ -18,8 +18,10 @@ import {
 } from "./docker-client.js";
 import { parseMeminfo, parseCpuPercent, getDiskUsage, countQueueFiles, PROC_BASE } from "./host-metrics.js";
 import { toErrorMessage, isValidSessionId, ValidationError } from "./types.js";
+import type { PendingApproval } from "./types.js";
 import { mergeCorrectionsOntoDecisions } from "./routing-logger.js";
 import { readRecentJsonl } from "./jsonl-reader.js";
+import { loadZoneConfig, getThreadZone, addThreadToZone, removeThreadFromZones, saveZoneConfig, clearZoneConfigCache } from "./zone-config.js";
 
 const SCRIPT_DIR = path.resolve(__dirname, "..");
 const BORG_DIR = path.join(SCRIPT_DIR, ".borg");
@@ -132,6 +134,10 @@ app.get("/api/status", (_req, res) => {
         availableMB: Math.round(memBytes.availableBytes / 1024 / 1024),
     };
 
+    // Add zone labels to each thread
+    let zoneConfig: ReturnType<typeof loadZoneConfig> = null;
+    try { zoneConfig = loadZoneConfig(ZONE_CONFIG_PATH); } catch { /* no zone config */ }
+
     res.json({
         status: "ok",
         timestamp: Date.now(),
@@ -143,8 +149,10 @@ app.get("/api/status", (_req, res) => {
         threads: Object.entries(threads).map(([id, cfg]) => ({
             id,
             ...(cfg as Record<string, unknown>),
+            zone: zoneConfig ? getThreadZone(zoneConfig, Number(id)) : undefined,
         })),
         threadCount: Object.keys(threads).length,
+        zonesConfigured: !!zoneConfig,
         metrics: { cpu, mem, load, disk },
     });
 });
@@ -718,6 +726,90 @@ app.get("/api/logs/:type", (req, res) => {
         logFeedClients[type]?.delete(client);
         stopLogFeedIfIdle(type);
     });
+});
+
+// ─── Zone Management API ───
+
+const ZONE_CONFIG_PATH = process.env.ZONE_CONFIG_PATH || path.join(SCRIPT_DIR, "zone-config.json");
+const PENDING_DIRS = [
+    path.join(SCRIPT_DIR, ".borg-core/queue/pending"),
+    path.join(SCRIPT_DIR, ".borg-perimeter/queue/pending"),
+];
+
+// GET /api/zones — zone configuration with thread-to-zone mapping
+app.get("/api/zones", (_req, res) => {
+    try {
+        clearZoneConfigCache();
+        const config = loadZoneConfig(ZONE_CONFIG_PATH);
+        if (!config) {
+            res.json({ configured: false, config: null, threadZones: {} });
+            return;
+        }
+
+        // Build thread-to-zone lookup from threads.json
+        const threads = readJsonSafe<Record<string, { name?: string }>>(
+            path.join(BORG_DIR, "threads.json"),
+            {},
+        );
+        const threadZones: Record<string, string> = {};
+        for (const id of Object.keys(threads)) {
+            threadZones[id] = getThreadZone(config, Number(id));
+        }
+
+        res.json({ configured: true, config, threadZones });
+    } catch (err) {
+        res.status(500).json({ error: toErrorMessage(err) });
+    }
+});
+
+// POST /api/zones/move — move a thread to a different zone
+app.post("/api/zones/move", (req, res) => {
+    try {
+        const { threadId, zone } = req.body as { threadId?: number; zone?: string };
+        if (!threadId || !zone) {
+            res.status(400).json({ error: "Missing threadId or zone" });
+            return;
+        }
+        clearZoneConfigCache();
+        const config = loadZoneConfig(ZONE_CONFIG_PATH);
+        if (!config) {
+            res.status(404).json({ error: "Zone config not found" });
+            return;
+        }
+        if (!config.zones[zone]) {
+            res.status(400).json({ error: `Zone "${zone}" does not exist` });
+            return;
+        }
+        const updated = structuredClone(config);
+        addThreadToZone(updated, threadId, zone);
+        saveZoneConfig(ZONE_CONFIG_PATH, updated);
+        res.json({ success: true, threadId, zone });
+    } catch (err) {
+        res.status(500).json({ error: toErrorMessage(err) });
+    }
+});
+
+// GET /api/zones/pending — list pending cross-zone approvals
+app.get("/api/zones/pending", (_req, res) => {
+    try {
+        const pending: Array<PendingApproval & { ageMs: number }> = [];
+        for (const dir of PENDING_DIRS) {
+            if (!fs.existsSync(dir)) continue;
+            const files = fs.readdirSync(dir).filter(f => f.endsWith(".json"));
+            for (const file of files) {
+                try {
+                    const data: PendingApproval = JSON.parse(
+                        fs.readFileSync(path.join(dir, file), "utf8"),
+                    );
+                    pending.push({ ...data, ageMs: Date.now() - data.timestamp });
+                } catch { /* skip malformed */ }
+            }
+        }
+        pending.sort((a, b) => a.timestamp - b.timestamp);
+        res.json({ pending });
+    } catch (err) {
+        res.status(500).json({ error: toErrorMessage(err) });
+    }
 });
 
 // ─── Start Server ───

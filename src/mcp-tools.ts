@@ -27,13 +27,17 @@ import {
 import { parseMeminfo, parseCpuPercent, getDiskUsage, countQueueFiles } from "./host-metrics.js";
 import { loadThreads, loadSettings, formatHumanTime, configureThread, saveThreads } from "./session-manager.js";
 import { toErrorMessage, parseSSHPublicKey, parseDevEmail } from "./types.js";
+import type { PendingApproval } from "./types.js";
 import { logCorrection, ROUTING_LOG, mergeCorrectionsOntoDecisions } from "./routing-logger.js";
 import { readRecentJsonl } from "./jsonl-reader.js";
+import { loadZoneConfig, getThreadZone, isSameZone, addThreadToZone, removeThreadFromZones, saveZoneConfig } from "./zone-config.js";
 
 const PROJECT_DIR = path.resolve(__dirname, "..");
 const BORG_DIR = path.join(PROJECT_DIR, ".borg");
 const QUEUE_INCOMING = path.join(BORG_DIR, "queue/incoming");
 const QUEUE_OUTGOING = path.join(BORG_DIR, "queue/outgoing");
+const QUEUE_PENDING = path.join(BORG_DIR, "queue/pending");
+const ZONE_CONFIG_PATH = process.env.ZONE_CONFIG_PATH || path.join(PROJECT_DIR, "zone-config.json");
 const DOCKER_PROXY_URL = process.env.DOCKER_PROXY_URL || "http://docker-proxy:2375";
 const PUBLIC_HOST = process.env.PUBLIC_HOST || "localhost";
 const DEV_NETWORK = process.env.DEV_NETWORK || "borg_dev";
@@ -97,8 +101,63 @@ export function createBorgMcpServer(sourceThreadId: number) {
             const ts = Date.now();
             const id = `cross_${ts}_${Math.random().toString(36).slice(2, 6)}`;
             const sourceName = threads[String(sourceThreadId)]?.name ?? `Thread ${sourceThreadId}`;
+            const targetName = threads[String(targetThreadId)].name;
 
-            // Write to incoming queue so the target agent processes it
+            // Check zone configuration for cross-zone routing
+            const zoneConfig = loadZoneConfig(ZONE_CONFIG_PATH);
+            const crossZone = zoneConfig && !isSameZone(zoneConfig, sourceThreadId, targetThreadId);
+
+            if (crossZone) {
+                // Cross-zone: write to pending queue for human approval
+                const sourceZone = getThreadZone(zoneConfig!, sourceThreadId);
+                const targetZone = getThreadZone(zoneConfig!, targetThreadId);
+
+                const pending: PendingApproval = {
+                    id,
+                    sourceThreadId,
+                    targetThreadId,
+                    sourceZone,
+                    targetZone,
+                    senderName: sourceName,
+                    targetName,
+                    message,
+                    timestamp: ts,
+                };
+
+                fs.mkdirSync(QUEUE_PENDING, { recursive: true });
+                const pendTmp = path.join(QUEUE_PENDING, `${id}.json.tmp`);
+                const pendFinal = path.join(QUEUE_PENDING, `${id}.json`);
+                fs.writeFileSync(pendTmp, JSON.stringify(pending));
+                fs.renameSync(pendTmp, pendFinal);
+
+                // Write to outgoing queue with crossZonePending flag
+                // telegram-client will show an inline keyboard for approval
+                const outgoing = {
+                    channel: "telegram",
+                    targetThreadId,
+                    sourceThreadId,
+                    sender: sourceName,
+                    message,
+                    originalMessage: "",
+                    timestamp: ts,
+                    messageId: `${id}_tg`,
+                    model: "",
+                    crossZonePending: true,
+                };
+
+                fs.mkdirSync(QUEUE_OUTGOING, { recursive: true });
+                const outTmp = path.join(QUEUE_OUTGOING, `${id}_tg.json.tmp`);
+                const outFinal = path.join(QUEUE_OUTGOING, `${id}_tg.json`);
+                fs.writeFileSync(outTmp, JSON.stringify(outgoing));
+                fs.renameSync(outTmp, outFinal);
+
+                return { content: [textContent(
+                    `Cross-zone message held for approval (${sourceZone} → ${targetZone}). ` +
+                    `Target: thread ${targetThreadId} (${targetName}). A human must approve delivery.`
+                )] };
+            }
+
+            // Same zone (or no zone config): deliver directly as today
             const incoming = {
                 channel: "telegram",
                 source: "cross-thread",
@@ -135,7 +194,6 @@ export function createBorgMcpServer(sourceThreadId: number) {
             fs.writeFileSync(outTmp, JSON.stringify(outgoing));
             fs.renameSync(outTmp, outFinal);
 
-            const targetName = threads[String(targetThreadId)].name;
             return { content: [textContent(`Message sent to thread ${targetThreadId} (${targetName})`)] };
         },
     );
@@ -726,6 +784,17 @@ export function createBorgMcpServer(sourceThreadId: number) {
                     ...(mainThread ? { mainThread } : {}),
                 });
 
+                // Register in zone-config.json — new thread goes into creator's zone
+                try {
+                    const zoneConfig = loadZoneConfig(ZONE_CONFIG_PATH);
+                    if (zoneConfig) {
+                        const updated = structuredClone(zoneConfig);
+                        const creatorZone = getThreadZone(updated, sourceThreadId);
+                        addThreadToZone(updated, threadId, creatorZone);
+                        saveZoneConfig(ZONE_CONFIG_PATH, updated);
+                    }
+                } catch { /* zone config may not exist yet — non-fatal */ }
+
                 // Send initial message if provided
                 if (initialMessage) {
                     const ts = Date.now();
@@ -897,6 +966,16 @@ export function createBorgMcpServer(sourceThreadId: number) {
                 delete threads[String(threadId)];
                 saveThreads(threads);
 
+                // Remove from zone-config.json
+                try {
+                    const zoneConfig = loadZoneConfig(ZONE_CONFIG_PATH);
+                    if (zoneConfig) {
+                        const updated = structuredClone(zoneConfig);
+                        removeThreadFromZones(updated, threadId);
+                        saveZoneConfig(ZONE_CONFIG_PATH, updated);
+                    }
+                } catch { /* zone config may not exist — non-fatal */ }
+
                 return {
                     content: [textContent(`Deleted thread ${threadId} ("${threadName}") from Telegram and unregistered from Borg`)],
                 };
@@ -993,8 +1072,12 @@ export function createBorgMcpServer(sourceThreadId: number) {
         getRoutingDecisions,
         getCurrentTime, getElapsedTime,
         createThread, configureThreadTool, disbandTeam, deleteThread,
-        broadcastTool,
     ];
+    // Broadcast tool only available in core zone (or when no zone config / single container)
+    const borgZone = process.env.BORG_ZONE;
+    if (!borgZone || borgZone === "core") {
+        tools.push(broadcastTool);
+    }
     if (sourceThreadId === 1) {
         tools.push(
             updateContainerMemory,

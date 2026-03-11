@@ -509,6 +509,12 @@ function buildTeamBlock(config: ThreadConfig, threadId: number): string {
         lines.push("- No other teammates found yet");
     }
     lines.push("");
+    lines.push("### How to Work on This Team");
+    lines.push("1. **Read your workflow** at `.claude/skills/workflows/` BEFORE doing anything. Your role has specific steps — they are not optional.");
+    lines.push("2. **Check the task list** (`TaskList`) at the start of every session and after completing any task. Your task description is a work order — follow it literally, step by step.");
+    lines.push("3. **Do not improvise or shortcut.** If your task says to run a specific skill or command, run it. Do not substitute your own approach, even if it feels faster.");
+    lines.push("4. **Do not skip prescribed steps.** Every step in your role's workflow exists for a reason. Skipping steps (e.g. doing a manual review instead of running the multi-agent review skill) produces worse results.");
+    lines.push("");
     lines.push("### Note");
     lines.push("You do not have heartbeats. If periodic scheduled work is needed,");
     lines.push("suggest that a main thread's HEARTBEAT.md be updated.");
