@@ -454,6 +454,13 @@ for (const cmd of ["clear_team", "compact_team"] as const) {
         const teamThreads = Object.entries(threads).filter(([, t]) => t.team === config.team);
         for (const [id] of teamThreads) {
             resetThread(Number(id));
+            // Send notification to each team thread (except the invoking thread)
+            const tid = Number(id);
+            if (tid !== threadId && tid !== 1) {
+                bot.api.sendMessage(settings.telegram_chat_id, `🔄 Session cleared by /${cmd}`, {
+                    message_thread_id: tid,
+                }).catch(() => {});
+            }
         }
         await ctx.reply(toTelegramMarkdownV2(`Reset ${teamThreads.length} session(s) in team **${config.team}**. Recent history available on next message.`), {
             message_thread_id: ctx.msg?.message_thread_id,
@@ -462,6 +469,27 @@ for (const cmd of ["clear_team", "compact_team"] as const) {
         log("INFO", `Team ${config.team} ${cmd} by ${ctx.from?.first_name ?? "unknown"} (${teamThreads.length} threads)`);
     });
 }
+
+// /clear_all resets all thread sessions.
+bot.command("clear_all", async (ctx) => {
+    if (String(ctx.chat?.id) !== settings.telegram_chat_id) return;
+    const invokerThreadId = ctx.msg?.message_thread_id ?? 1;
+    const threads = loadThreads();
+    const allThreadIds = Object.keys(threads).map(Number);
+    for (const tid of allThreadIds) {
+        resetThread(tid);
+        // Send notification to each thread (except the invoking thread)
+        if (tid !== invokerThreadId && tid !== 1) {
+            bot.api.sendMessage(settings.telegram_chat_id, `🔄 Session cleared by /clear_all`, {
+                message_thread_id: tid,
+            }).catch(() => {});
+        }
+    }
+    await ctx.reply(`Reset ${allThreadIds.length} session(s). Recent history available on next message.`, {
+        message_thread_id: ctx.msg?.message_thread_id,
+    });
+    log("INFO", `clear_all by ${ctx.from?.first_name ?? "unknown"} (${allThreadIds.length} threads)`);
+});
 
 bot.command("status", async (ctx) => {
     if (String(ctx.chat?.id) !== settings.telegram_chat_id) return;
@@ -1981,6 +2009,7 @@ bot.start({
             { command: "status", description: "Show all active threads and their status" },
             { command: "clear_team", description: "Reset all team member sessions" },
             { command: "compact_team", description: "Reset all team member sessions" },
+            { command: "clear_all", description: "Reset all thread sessions" },
         ]);
         // Start task watcher
         setInterval(() => { pollTaskUpdates().catch(() => {}); }, TASK_POLL_INTERVAL);
