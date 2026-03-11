@@ -447,6 +447,28 @@ tr.clickable { cursor: pointer; }
   border-radius: 3px;
 }
 
+/* ─── Routing expandable rows ─── */
+
+#routing-table .routing-row { cursor: pointer; }
+#routing-table .routing-row:hover { background: var(--bg-tertiary); }
+#routing-table .routing-row .expand-arrow {
+  color: var(--text-secondary);
+  transition: transform 0.2s;
+  font-size: 10px;
+  display: inline-block;
+}
+#routing-table .routing-row.expanded .expand-arrow { transform: rotate(90deg); }
+#routing-table .routing-detail-row td {
+  padding: 10px 12px;
+  border-top: none;
+  background: var(--bg-primary);
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 12px;
+  max-height: 400px;
+  overflow-y: auto;
+}
+
 /* ─── Log View ─── */
 
 .log-line {
@@ -810,7 +832,6 @@ tr.clickable { cursor: pointer; }
   <a href="#overview" data-view="overview">Overview</a>
   <a href="#feed" data-view="feed">Feed</a>
   <a href="#routing" data-view="routing">Routing</a>
-  <a href="#prompts" data-view="prompts">Prompts</a>
   <a href="#metrics" data-view="metrics">Metrics</a>
   <a href="#logs" data-view="logs">Logs</a>
   <a href="#memory" data-view="memory">Memory</a>
@@ -879,16 +900,10 @@ tr.clickable { cursor: pointer; }
     <div class="tier-summary" id="routing-summary"></div>
     <table id="routing-table">
       <thead>
-        <tr><th>Time</th><th>Tier</th><th>Model</th><th>Confidence</th><th>Tokens</th><th>Prompt</th><th>Correction</th><th>Signals</th></tr>
+        <tr><th></th><th>Time</th><th>Tier</th><th>Model</th><th>Confidence</th><th>Tokens</th><th>Prompt</th><th>Correction</th><th>Signals</th></tr>
       </thead>
       <tbody id="routing-tbody"></tbody>
     </table>
-  </div>
-
-  <!-- View: Prompts -->
-  <div id="view-prompts" class="view">
-    <h2>Prompt Inspector</h2>
-    <div id="prompts-list"></div>
   </div>
 
   <!-- View: Metrics -->
@@ -1185,7 +1200,6 @@ tr.clickable { cursor: pointer; }
       case 'feed': initFeed(); break;
       case 'thread': initThread(param); break;
       case 'routing': initRouting(); break;
-      case 'prompts': initPrompts(); break;
       case 'metrics': initMetrics(); break;
       case 'logs': initLogs(); break;
       case 'memory': initMemory(); break;
@@ -1819,7 +1833,7 @@ tr.clickable { cursor: pointer; }
     // Table
     var tbody = document.getElementById('routing-tbody');
     if (entries.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="8" class="empty-state">No routing decisions recorded</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="9" class="empty-state">No routing decisions recorded</td></tr>';
       return;
     }
 
@@ -1827,13 +1841,14 @@ tr.clickable { cursor: pointer; }
     for (var i = 0; i < entries.length; i++) {
       var e = entries[i];
       var promptDisplay = e.prompt ? truncate(e.prompt, 80) : (e.promptHash ? '[hashed]' : '\u2014');
-      html += '<tr data-msg-id="' + (e.messageId || '') + '">' +
+      html += '<tr class="routing-row" data-msg-id="' + (e.messageId || '') + '" data-idx="' + i + '">' +
+        '<td><span class="expand-arrow">&#9654;</span></td>' +
         '<td>' + formatTimestamp(e.ts) + '</td>' +
         '<td>' + tierBadge(e.tier) + '</td>' +
         '<td>' + modelBadge(e.model) + '</td>' +
         '<td>' + ((e.confidence || 0) * 100).toFixed(0) + '%</td>' +
         '<td>' + (e.tokens || e.estimatedTokens || '?') + '</td>' +
-        '<td style="max-width:250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="' + escapeAttr(e.prompt || '') + '">' +
+        '<td style="max-width:250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' +
           escapeHtml(promptDisplay) + '</td>' +
         '<td class="correction-cell">' +
           (e.userCorrection ? modelBadge(e.userCorrection) : '') + '</td>' +
@@ -1841,55 +1856,28 @@ tr.clickable { cursor: pointer; }
           escapeHtml((e.signals || []).join(', ')) +
         '</td>' +
       '</tr>';
+      // Hidden detail row with full prompt
+      html += '<tr class="routing-detail-row" data-detail-for="' + i + '" style="display:none">' +
+        '<td colspan="9">' + escapeHtml(e.prompt || 'No prompt data') + '</td>' +
+      '</tr>';
     }
 
     tbody.innerHTML = html;
-  }
 
-  // ─── View 5: Prompt Inspector ───
-
-  async function initPrompts() {
-    var data = await api('/api/prompts/recent?n=20');
-    var container = document.getElementById('prompts-list');
-
-    if (!data || !Array.isArray(data) || data.length === 0) {
-      container.innerHTML = '<div class="empty-state">No prompt data available</div>';
-      return;
-    }
-
-    var maxLen = Math.max.apply(null, data.map(function(p) { return p.promptLength || p.length || 0; })) || 1;
-
-    var html = '';
-    for (var i = data.length - 1; i >= 0; i--) {
-      var p = data[i];
-      var pLen = p.promptLength || p.length || 0;
-      var pct = (pLen / maxLen * 100).toFixed(0);
-      var injected = p.historyInjected;
-
-      html += '<div class="prompt-card" data-idx="' + i + '">' +
-        '<div class="prompt-header">' +
-          '<span class="arrow">&#9654;</span>' +
-          '<span>' + formatTimestamp(p.ts || p.timestamp || 0) + '</span>' +
-          '<span class="badge badge-blue">t/' + (p.threadId || '?') + '</span>' +
-          modelBadge(p.model || '') +
-          '<span style="color:var(--text-secondary)">' + pLen + ' chars</span>' +
-          (injected ? '<span class="badge badge-green">history</span>' : '') +
-          '<div class="prompt-length-bar"><div class="prompt-length-fill" style="width:' + pct + '%;background:var(--accent-blue)"></div></div>' +
-        '</div>' +
-        '<div class="prompt-body">' + escapeHtml(p.prompt || p.content || p.text || JSON.stringify(p, null, 2)) + '</div>' +
-      '</div>';
-    }
-
-    container.innerHTML = html;
-
-    container.querySelectorAll('.prompt-card').forEach(function(card) {
-      card.querySelector('.prompt-header').onclick = function() {
-        card.classList.toggle('expanded');
+    // Click to expand/collapse
+    tbody.querySelectorAll('.routing-row').forEach(function(row) {
+      row.onclick = function() {
+        var idx = row.getAttribute('data-idx');
+        var detail = tbody.querySelector('[data-detail-for="' + idx + '"]');
+        if (detail) {
+          var isExpanded = row.classList.toggle('expanded');
+          detail.style.display = isExpanded ? '' : 'none';
+        }
       };
     });
   }
 
-  // ─── View 6: Metrics ───
+  // ─── View 5: Metrics ───
 
   function initMetrics() {
     fetchMetrics();

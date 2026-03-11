@@ -1,4 +1,12 @@
 services:
+  # ── Init: ensure zone directories, config files, and migrations ──
+  init:
+    image: node:22-slim
+    volumes:
+      - .:/project
+    entrypoint: ["bash", "/project/scripts/init-zones.sh", "/project"]
+    restart: "no"
+
   broker:
     build: ./broker
     restart: always
@@ -29,12 +37,15 @@ services:
     init: true
     stop_grace_period: 30s
     depends_on:
+      init:
+        condition: service_completed_successfully
       broker:
         condition: service_healthy
       speaches:
         condition: service_started
     volumes:
       - ./.borg-infra:/app/.borg-infra
+      - ./.borg-infra:/app/.borg
       - ./.borg-core:/app/.borg-core
       - ./.borg-perimeter:/app/.borg-perimeter
       - ./threads.json:/app/threads.json
@@ -58,6 +69,8 @@ services:
     init: true
     stop_grace_period: 30s
     depends_on:
+      init:
+        condition: service_completed_successfully
       broker:
         condition: service_healthy
       infra:
@@ -98,6 +111,8 @@ services:
     init: true
     stop_grace_period: 30s
     depends_on:
+      init:
+        condition: service_completed_successfully
       broker:
         condition: service_healthy
       infra:
@@ -160,14 +175,18 @@ services:
       dockerfile: Dockerfile.dashboard
     restart: always
     depends_on:
+      init:
+        condition: service_completed_successfully
       infra:
         condition: service_started
       docker-proxy:
         condition: service_healthy
     volumes:
+      - ./.borg-core:/app/.borg:ro
       - ./.borg-core:/app/.borg-core:ro
       - ./.borg-perimeter:/app/.borg-perimeter:ro
       - ./.borg-infra:/app/.borg-infra:ro
+      - ./threads.json:/app/threads.json:ro
       - ./zone-config.json:/app/zone-config.json:ro
       - ${WORKSPACE_ROOT:-/home/lucian/workspace}:/home/lucian/workspace:ro
     ports:

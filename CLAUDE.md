@@ -72,6 +72,8 @@ npm run build        # TypeScript compilation
 docker compose up    # Start infra + core + perimeter containers
 ```
 
+The `init` service runs automatically before other containers, creating zone directories, config files, and migrating data from old single-container `.borg/` if present. No manual `init-zones.sh` run needed.
+
 
 ## Mim Knowledge
 

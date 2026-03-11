@@ -53,7 +53,8 @@ export interface Settings {
 
 const SCRIPT_DIR = path.resolve(__dirname, "..");
 const BORG_DIR = path.join(SCRIPT_DIR, ".borg");
-const THREADS_FILE = path.join(BORG_DIR, "threads.json");
+// threads.json is at project root (shared across all zone containers via bind-mount)
+const THREADS_FILE = path.join(SCRIPT_DIR, "threads.json");
 const SETTINGS_FILE = path.join(BORG_DIR, "settings.json");
 const DEFAULT_CWD = process.env.DEFAULT_CWD || process.cwd();
 export const MAX_CONCURRENT_SESSIONS = 2;
@@ -85,9 +86,9 @@ export function saveThreads(threads: ThreadsMap): void {
     if (!fs.existsSync(dir)) {
         fs.mkdirSync(dir, { recursive: true });
     }
-    const tmp = THREADS_FILE + ".tmp";
-    fs.writeFileSync(tmp, JSON.stringify(threads, null, 2));
-    fs.renameSync(tmp, THREADS_FILE);
+    // Write directly — threads.json is a Docker bind-mounted file,
+    // so atomic tmp+rename fails with EBUSY on the mount point.
+    fs.writeFileSync(THREADS_FILE, JSON.stringify(threads, null, 2));
     threadsCache = threads;
     threadsMtime = fs.statSync(THREADS_FILE).mtimeMs;
 }
@@ -112,9 +113,7 @@ export function updateThread(threadId: number, updates: Partial<ThreadConfig>): 
     ) as Partial<ThreadConfig>;
     Object.assign(threads[key], filtered);
 
-    const tmp = THREADS_FILE + ".tmp";
-    fs.writeFileSync(tmp, JSON.stringify(threads, null, 2));
-    fs.renameSync(tmp, THREADS_FILE);
+    fs.writeFileSync(THREADS_FILE, JSON.stringify(threads, null, 2));
     threadsCache = threads;
     threadsMtime = fs.statSync(THREADS_FILE).mtimeMs;
 }
@@ -135,9 +134,7 @@ export function deleteThreadField(threadId: number, field: keyof ThreadConfig): 
 
     delete threads[key][field];
 
-    const tmp = THREADS_FILE + ".tmp";
-    fs.writeFileSync(tmp, JSON.stringify(threads, null, 2));
-    fs.renameSync(tmp, THREADS_FILE);
+    fs.writeFileSync(THREADS_FILE, JSON.stringify(threads, null, 2));
     threadsCache = threads;
     threadsMtime = fs.statSync(THREADS_FILE).mtimeMs;
 }

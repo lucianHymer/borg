@@ -25,8 +25,11 @@ import { loadZoneConfig, getThreadZone, addThreadToZone, removeThreadFromZones, 
 
 const SCRIPT_DIR = path.resolve(__dirname, "..");
 const BORG_DIR = path.join(SCRIPT_DIR, ".borg");
+const BORG_INFRA_DIR = path.join(SCRIPT_DIR, ".borg-infra");
 const STATIC_DIR = path.join(SCRIPT_DIR, "static");
 const SESSIONS_DIR = path.join(BORG_DIR, "sessions");
+// threads.json is at project root (shared across all zone containers)
+const THREADS_FILE = path.join(SCRIPT_DIR, "threads.json");
 const PORT = parseInt(process.env.DASHBOARD_PORT || "3100", 10);
 const DOCKER_PROXY_URL = process.env.DOCKER_PROXY_URL || "http://localhost:2375";
 const COMPOSE_PROJECT = process.env.COMPOSE_PROJECT || "";
@@ -118,7 +121,7 @@ app.get("/health", (_req, res) => {
 // GET /api/status — service health, queue depth, thread summary, host metrics
 app.get("/api/status", (_req, res) => {
     const threads = readJsonSafe<Record<string, unknown>>(
-        path.join(BORG_DIR, "threads.json"),
+        THREADS_FILE,
         {},
     );
     const queueIncoming = countQueueFiles(path.join(BORG_DIR, "queue/incoming"));
@@ -159,14 +162,14 @@ app.get("/api/status", (_req, res) => {
 
 // GET /api/threads — full threads.json
 app.get("/api/threads", (_req, res) => {
-    const threads = readJsonSafe(path.join(BORG_DIR, "threads.json"), {});
+    const threads = readJsonSafe(THREADS_FILE, {});
     res.json(threads);
 });
 
 // GET /api/heartbeats — all threads' HEARTBEAT.md contents
 app.get("/api/heartbeats", (_req, res) => {
     const threads = readJsonSafe<Record<string, { name?: string; cwd?: string }>>(
-        path.join(BORG_DIR, "threads.json"),
+        THREADS_FILE,
         {},
     );
     const results = Object.entries(threads).map(([id, cfg]) => {
@@ -241,7 +244,7 @@ app.get("/api/routing/feed", (_req, res) => {
     });
     res.write(":\n\n");
 
-    const routingFile = path.join(BORG_DIR, "logs/routing.jsonl");
+    const routingFile = path.join(BORG_INFRA_DIR, "logs/routing.jsonl");
     const tailState: TailState = { offset: 0 };
 
     if (fs.existsSync(routingFile)) {
@@ -262,16 +265,9 @@ app.get("/api/routing/feed", (_req, res) => {
 // GET /api/routing/recent?n=50
 app.get("/api/routing/recent", (req, res) => {
     const n = Math.min(parseInt(String(req.query.n ?? "50"), 10) || 50, 200);
-    const raw = readRecentJsonl<Record<string, unknown>>(path.join(BORG_DIR, "logs/routing.jsonl"), n);
+    const raw = readRecentJsonl<Record<string, unknown>>(path.join(BORG_INFRA_DIR, "logs/routing.jsonl"), n);
     const decisions = mergeCorrectionsOntoDecisions(raw);
     res.json(decisions);
-});
-
-// GET /api/prompts/recent?n=20
-app.get("/api/prompts/recent", (req, res) => {
-    const n = Math.min(parseInt(String(req.query.n ?? "20"), 10) || 20, 200);
-    const entries = readRecentJsonl(path.join(BORG_DIR, "logs/prompts.jsonl"), n);
-    res.json(entries);
 });
 
 // GET /api/metrics — CPU, RAM, disk, load
@@ -361,7 +357,7 @@ let routingFeedInterval: ReturnType<typeof setInterval> | null = null;
 
 function startRoutingFeed(): void {
     if (routingFeedInterval) return;
-    const routingFile = path.join(BORG_DIR, "logs/routing.jsonl");
+    const routingFile = path.join(BORG_INFRA_DIR, "logs/routing.jsonl");
     routingFeedInterval = setInterval(() => {
         if (routingFeedClients.size === 0) return;
         for (const client of routingFeedClients) {
@@ -394,8 +390,9 @@ const logFeedClients: Record<string, Set<FeedClient>> = {};
 const logFeedIntervals: Record<string, ReturnType<typeof setInterval>> = {};
 
 function getLogFilePath(type: string): string {
+    // telegram.log is in infra, queue.log is in core
     return type === "telegram"
-        ? path.join(BORG_DIR, "logs/telegram.log")
+        ? path.join(BORG_INFRA_DIR, "logs/telegram.log")
         : path.join(BORG_DIR, "logs/queue.log");
 }
 
@@ -646,7 +643,7 @@ app.get("/api/threads/:id/session-logs", (req, res) => {
     const n = Math.min(parseInt(String(req.query.n ?? "20"), 10) || 20, 200);
 
     const threads = readJsonSafe<Record<string, { sessionId?: string; cwd?: string }>>(
-        path.join(BORG_DIR, "threads.json"),
+        THREADS_FILE,
         {},
     );
 
@@ -671,7 +668,7 @@ app.get("/api/session-logs", (req, res) => {
     const n = Math.min(parseInt(String(req.query.n ?? "20"), 10) || 20, 200);
 
     const threads = readJsonSafe<Record<string, { sessionId?: string; name?: string }>>(
-        path.join(BORG_DIR, "threads.json"),
+        THREADS_FILE,
         {},
     );
 
@@ -748,7 +745,7 @@ app.get("/api/zones", (_req, res) => {
 
         // Build thread-to-zone lookup from threads.json
         const threads = readJsonSafe<Record<string, { name?: string }>>(
-            path.join(BORG_DIR, "threads.json"),
+            THREADS_FILE,
             {},
         );
         const threadZones: Record<string, string> = {};
@@ -845,7 +842,7 @@ app.get("/api/usage", (_req, res) => {
 
     // Read threads.json for name resolution
     const threads = readJsonSafe<Record<string, { name?: string }>>(
-        path.join(BORG_DIR, "threads.json"),
+        THREADS_FILE,
         {},
     );
 
