@@ -28,39 +28,29 @@ import { loadZoneConfig, getThreadZone, isSameZone } from "./zone-config.js";
 // ─── Constants ───
 
 const SCRIPT_DIR = path.resolve(__dirname, "..");
-const BORG_ZONE = process.env.BORG_ZONE || "";
 const ZONE_CONFIG_PATH = process.env.ZONE_CONFIG_PATH || path.join(SCRIPT_DIR, "zone-config.json");
 
-// In infra mode, .borg dirs are at /app/.borg-{zone}. In single-container, at /app/.borg.
-const BORG_DIR = path.join(SCRIPT_DIR, ".borg");
-const QUEUE_INCOMING = path.join(BORG_DIR, "queue/incoming");
-const QUEUE_OUTGOING = path.join(BORG_DIR, "queue/outgoing");
-const QUEUE_DEAD_LETTER = path.join(BORG_DIR, "queue/dead-letter");
-const LOG_FILE = BORG_ZONE === "infra"
-    ? path.join(SCRIPT_DIR, ".borg-infra/logs/telegram.log")
-    : path.join(BORG_DIR, "logs/telegram.log");
-const MESSAGE_MODELS_FILE = BORG_ZONE === "infra"
-    ? path.join(SCRIPT_DIR, ".borg-infra/message-models.json")
-    : path.join(BORG_DIR, "message-models.json");
-const QUEUE_STATUS = path.join(BORG_DIR, "status");
-const MARKDOWN_PARSE_FAILURES = BORG_ZONE === "infra"
-    ? path.join(SCRIPT_DIR, ".borg-infra/markdown-parse-failures.jsonl")
-    : path.join(BORG_DIR, "markdown-parse-failures.jsonl");
-const QUEUE_PENDING = path.join(BORG_DIR, "queue/pending");
+// Infra's own storage — telegram-client always runs in the infra container
+const BORG_INFRA_DIR = path.join(SCRIPT_DIR, ".borg-infra");
+const QUEUE_DEAD_LETTER = path.join(BORG_INFRA_DIR, "queue/dead-letter");
+const LOG_FILE = path.join(BORG_INFRA_DIR, "logs/telegram.log");
+const MESSAGE_MODELS_FILE = path.join(BORG_INFRA_DIR, "message-models.json");
+const MARKDOWN_PARSE_FAILURES = path.join(BORG_INFRA_DIR, "markdown-parse-failures.jsonl");
+
+// Zone status directories — queue-processors write status files to their zone's dir
+const ZONE_STATUS_DIRS = [
+    path.join(SCRIPT_DIR, ".borg-core/status"),
+    path.join(SCRIPT_DIR, ".borg-perimeter/status"),
+];
 
 /**
- * Get all pending queue directories to scan.
- * In infra mode, pending files live in each zone's own dir (written by zone MCP tools).
- * In single-container mode, there's just one pending dir.
+ * Get all pending queue directories to scan (one per zone).
  */
 function getPendingQueueDirs(): string[] {
-    if (BORG_ZONE === "infra") {
-        return [
-            path.join(SCRIPT_DIR, ".borg-core/queue/pending"),
-            path.join(SCRIPT_DIR, ".borg-perimeter/queue/pending"),
-        ];
-    }
-    return [QUEUE_PENDING];
+    return [
+        path.join(SCRIPT_DIR, ".borg-core/queue/pending"),
+        path.join(SCRIPT_DIR, ".borg-perimeter/queue/pending"),
+    ];
 }
 
 /**
@@ -76,59 +66,41 @@ function findPendingFile(pendingId: string): string | null {
 }
 
 /**
- * Resolve the incoming queue path for a target thread's zone.
- * In infra mode, routes to /app/.borg-{zone}/queue/incoming/.
- * In single-container mode, routes to /app/.borg/queue/incoming/.
+ * Resolve the incoming queue path for a target zone.
  */
 function resolveZoneIncoming(targetZone: string): string {
-    if (BORG_ZONE === "infra") {
-        return path.join(SCRIPT_DIR, `.borg-${targetZone}/queue/incoming`);
-    }
-    return QUEUE_INCOMING;
+    return path.join(SCRIPT_DIR, `.borg-${targetZone}/queue/incoming`);
 }
 
 /**
- * Resolve the outgoing queue path for a target thread's zone.
- * In infra mode, routes to /app/.borg-{zone}/queue/outgoing/.
- * In single-container mode, routes to /app/.borg/queue/outgoing/.
+ * Resolve the outgoing queue path for a target zone.
  */
 function resolveZoneOutgoing(targetZone: string): string {
-    if (BORG_ZONE === "infra") {
-        return path.join(SCRIPT_DIR, `.borg-${targetZone}/queue/outgoing`);
-    }
-    return QUEUE_OUTGOING;
+    return path.join(SCRIPT_DIR, `.borg-${targetZone}/queue/outgoing`);
 }
 
 /**
- * Resolve the incoming queue path for a specific thread.
- * Loads zone config to determine which zone the thread belongs to.
- * In single-container mode, always returns the default QUEUE_INCOMING.
+ * Resolve the incoming queue path for a specific thread by looking up its zone.
  */
 function resolveIncomingForThread(threadId: number): string {
-    if (BORG_ZONE !== "infra") return QUEUE_INCOMING;
     try {
         const config = loadZoneConfig(ZONE_CONFIG_PATH);
-        if (!config) return QUEUE_INCOMING;
+        if (!config) return resolveZoneIncoming("core");
         const zone = getThreadZone(config, threadId);
         return resolveZoneIncoming(zone);
     } catch {
-        return QUEUE_INCOMING;
+        return resolveZoneIncoming("core");
     }
 }
 
 /**
- * Get all outgoing queue directories to poll.
- * In infra mode, returns both zone outgoing queues.
- * In single-container mode, returns just the default.
+ * Get all outgoing queue directories to poll (one per zone).
  */
 function getOutgoingQueueDirs(): string[] {
-    if (BORG_ZONE === "infra") {
-        return [
-            path.join(SCRIPT_DIR, ".borg-core/queue/outgoing"),
-            path.join(SCRIPT_DIR, ".borg-perimeter/queue/outgoing"),
-        ];
-    }
-    return [QUEUE_OUTGOING];
+    return [
+        path.join(SCRIPT_DIR, ".borg-core/queue/outgoing"),
+        path.join(SCRIPT_DIR, ".borg-perimeter/queue/outgoing"),
+    ];
 }
 const DEDUP_WINDOW_MS = 10_000; // 10 seconds
 const TASK_LISTS_FILE = path.join(SCRIPT_DIR, ".borg", TASK_LISTS_FILENAME);
@@ -157,7 +129,7 @@ function isDuplicate(threadId: number, senderId: string, text: string): boolean 
 
 // ─── Ensure Directories Exist ───
 
-[QUEUE_INCOMING, QUEUE_OUTGOING, QUEUE_DEAD_LETTER, QUEUE_STATUS, path.dirname(LOG_FILE), path.dirname(MESSAGE_MODELS_FILE)].forEach(
+[QUEUE_DEAD_LETTER, ...ZONE_STATUS_DIRS, path.dirname(LOG_FILE), path.dirname(MESSAGE_MODELS_FILE)].forEach(
     (dir) => {
         if (!fs.existsSync(dir)) {
             fs.mkdirSync(dir, { recursive: true });
@@ -598,14 +570,14 @@ bot.on("message:text").filter(
 
         // Fan-out to mainThread:true threads in core zone only
         const threads = loadThreads();
-        const zoneConfig = loadZoneConfig(path.join(SCRIPT_DIR, "zone-config.json"));
+        const zoneConfig = loadZoneConfig(ZONE_CONFIG_PATH);
         const mainThreads = Object.entries(threads).filter(([id, t]) => {
             if (!t.mainThread) return false;
-            // If zone config exists, only include core zone threads
+            // Only include core zone threads for broadcast
             if (zoneConfig) {
                 return getThreadZone(zoneConfig, Number(id)) === "core";
             }
-            return true; // no zone config = all mainThread threads (backward compatible)
+            return true; // no zone config = all mainThread threads
         });
 
         if (mainThreads.length === 0) {
@@ -1074,8 +1046,8 @@ async function pollOutgoingQueue(): Promise<void> {
                     if (pending) {
                         // Delete status file FIRST to prevent pollStatusFiles from overwriting final response
                         try {
-                            const statusFile = path.join(QUEUE_STATUS, `${data.messageId}.json`);
-                            fs.unlinkSync(statusFile);
+                            const statusFile = findStatusFile(data.messageId);
+                            if (statusFile) fs.unlinkSync(statusFile);
                         } catch { /* may not exist */ }
 
                         // Convert Claude's GFM output to Telegram MarkdownV2
@@ -1312,14 +1284,26 @@ function cleanupPendingMessages(): void {
             }
             // Delete status file if it exists
             try {
-                const statusFile = path.join(QUEUE_STATUS, `${messageId}.json`);
-                if (fs.existsSync(statusFile)) fs.unlinkSync(statusFile);
+                const statusFile = findStatusFile(messageId);
+                if (statusFile) fs.unlinkSync(statusFile);
             } catch { /* best effort */ }
 
             pendingMessages.delete(messageId);
             log("DEBUG", `Cleaned up stale pending message: ${messageId}`);
         }
     }
+}
+
+/**
+ * Find a status file by messageId across all zone status directories.
+ * Returns the full path if found, null otherwise.
+ */
+function findStatusFile(messageId: string): string | null {
+    for (const dir of ZONE_STATUS_DIRS) {
+        const filePath = path.join(dir, `${messageId}.json`);
+        if (fs.existsSync(filePath)) return filePath;
+    }
+    return null;
 }
 
 // ─── Status File Polling ───
@@ -1329,11 +1313,11 @@ async function pollStatusFiles(): Promise<void> {
     statusPollActive = true;
     try {
     for (const [messageId, pending] of pendingMessages) {
-        const statusFile = path.join(QUEUE_STATUS, `${messageId}.json`);
+        const statusFile = findStatusFile(messageId);
 
         let statusData: { label: string; ts: number; startTs: number; preview?: string };
         try {
-            if (!fs.existsSync(statusFile)) continue;
+            if (!statusFile) continue;
             statusData = JSON.parse(fs.readFileSync(statusFile, "utf8"));
             if (!statusData.label || !statusData.startTs) continue; // invalid format
         } catch {
