@@ -1514,10 +1514,10 @@ async function pollStatusFiles(): Promise<void> {
         const previewText = statusData.preview;
         let displayText: string;
         if (previewText) {
-            // Truncate preview for Telegram message limits and readability
-            const maxPreview = 300;
+            // Truncate preview for Telegram message limits — show tail (latest text)
+            const maxPreview = 500;
             const truncated = previewText.length > maxPreview
-                ? previewText.slice(0, maxPreview) + "…"
+                ? "…" + previewText.slice(-maxPreview)
                 : previewText;
             displayText = `${statusLine}\n\n💬 ${truncated}\n\n[still processing...]`;
         } else {

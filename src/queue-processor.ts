@@ -1173,8 +1173,17 @@ async function processMessage(messageFile: string): Promise<void> {
             // and to pick up label changes and preview text from the observer callbacks.
             // Also checks for cancel signal files written by telegram-client.
             let currentPreview: string | undefined;
+            let fullAccumulatedText = "";
             let cancelled = false;
             const cancelFile = path.join(QUEUE_CANCEL, `${messageId}.json`);
+
+            // Cancel-aware: race collectQueryResponse against a cancel timeout
+            // so we're guaranteed to resolve even if the SDK hangs after interrupt()
+            let cancelTimeoutResolve: (() => void) | undefined;
+            const cancelTimeoutPromise = new Promise<"cancel-timeout">((resolve) => {
+                cancelTimeoutResolve = () => resolve("cancel-timeout");
+            });
+
             const statusInterval = setInterval(async () => {
                 // Check for cancel signal
                 if (!cancelled && fs.existsSync(cancelFile)) {
@@ -1185,14 +1194,9 @@ async function processMessage(messageFile: string): Promise<void> {
                     try { await q.interrupt(); } catch { /* process may be gone */ }
                     log("INFO", `Cancelled processing for ${messageId}`);
                     // Safety net: if collectQueryResponse doesn't return within 30s
-                    // after interrupt, force-clean the processing file to release the slot
+                    // after interrupt, resolve the cancel timeout to unblock the race
                     setTimeout(() => {
-                        if (fs.existsSync(processingFile)) {
-                            log("WARN", `Cancel cleanup timeout: force-removing processing file for ${messageId}`);
-                            try { fs.unlinkSync(processingFile); } catch { /* best effort */ }
-                            clearInterval(statusInterval);
-                            clearStatus(messageId);
-                        }
+                        cancelTimeoutResolve?.();
                     }, 30_000);
                     return;
                 }
@@ -1216,50 +1220,61 @@ async function processMessage(messageFile: string): Promise<void> {
                     currentStatusLabel = "Stall recovered";
                 },
                 onTextContent(text: string) {
-                    // Accumulate text blocks as preview (growing preview)
-                    const accumulated = currentPreview ? currentPreview + "\n\n" + text : text;
-                    currentPreview = accumulated.length > 500 ? "…" + accumulated.slice(-500) : accumulated;
+                    // Full text for cancel responses; truncated preview for status display
+                    fullAccumulatedText += (fullAccumulatedText ? "\n\n" : "") + text;
+                    currentPreview = fullAccumulatedText.length > 500
+                        ? "…" + fullAccumulatedText.slice(-500)
+                        : fullAccumulatedText;
                 },
             };
 
             try {
-                const { text, sessionId: newSessionId, stallRecovered, usage } = await collectQueryResponse(
-                    q,
-                    observer,
-                );
-                usageData = usage;
+                const queryPromise = collectQueryResponse(q, observer);
+
+                const result = await Promise.race([
+                    queryPromise.then((r) => ({ kind: "response" as const, ...r })),
+                    cancelTimeoutPromise.then(() => ({ kind: "cancel-timeout" as const })),
+                ]);
+
                 clearInterval(statusInterval);
 
-                if (cancelled) {
-                    // Cancelled — include partial response so user can see what was generated
-                    responseText = currentPreview
-                        ? `${currentPreview}\n\n---\n🚫 Processing was cancelled.`
+                if (result.kind === "cancel-timeout") {
+                    log("WARN", `Cancel timeout: collectQueryResponse did not return within 30s after interrupt for ${messageId}`);
+                    responseText = fullAccumulatedText
+                        ? `${fullAccumulatedText}\n\n---\n🚫 Processing was cancelled.`
                         : "🚫 Processing was cancelled.";
                     clearStatus(messageId);
-                    // Still persist session so resume works
-                    if (newSessionId) {
+                } else if (cancelled) {
+                    // Cancelled but collectQueryResponse returned normally
+                    responseText = fullAccumulatedText
+                        ? `${fullAccumulatedText}\n\n---\n🚫 Processing was cancelled.`
+                        : "🚫 Processing was cancelled.";
+                    clearStatus(messageId);
+                    usageData = result.usage;
+                    if (result.sessionId) {
                         updateThread(threadId, {
-                            sessionId: newSessionId,
+                            sessionId: result.sessionId,
                             model: effectiveModel,
                             lastActive: Date.now(),
                         });
                     }
                 } else {
-                    responseText = text.trim();
+                    usageData = result.usage;
+                    responseText = result.text.trim();
 
-                    if (stallRecovered) {
+                    if (result.stallRecovered) {
                         responseText += `\n\n---\n⚠️ _Stall recovered: session hung after end\\_turn (${END_TURN_STALL_TIMEOUT_MS / 1000}s timeout). Response above may be incomplete._`;
                     }
 
                     // Persist session ID for future resume (atomic to avoid clobbering team/role)
-                    if (newSessionId) {
+                    if (result.sessionId) {
                         updateThread(threadId, {
-                            sessionId: newSessionId,
+                            sessionId: result.sessionId,
                             model: effectiveModel,
                             lastActive: Date.now(),
                         });
                         const cwd = loadThreads()[String(threadId)]?.cwd;
-                        if (cwd) syncSessionLog(newSessionId, cwd);
+                        if (cwd) syncSessionLog(result.sessionId, cwd);
                     }
                 }
             } catch (queryErr) {
@@ -1267,8 +1282,8 @@ async function processMessage(messageFile: string): Promise<void> {
 
                 if (cancelled) {
                     // Cancelled — include partial response so user can see what was generated
-                    responseText = currentPreview
-                        ? `${currentPreview}\n\n---\n🚫 Processing was cancelled.`
+                    responseText = fullAccumulatedText
+                        ? `${fullAccumulatedText}\n\n---\n🚫 Processing was cancelled.`
                         : "🚫 Processing was cancelled.";
                     clearStatus(messageId);
                 } else {
