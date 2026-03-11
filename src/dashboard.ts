@@ -838,6 +838,173 @@ app.get("/api/zones/pending", (_req, res) => {
     }
 });
 
+// GET /api/usage?days=7 — aggregated token usage and cost data
+app.get("/api/usage", (_req, res) => {
+    const days = Math.min(Math.max(parseInt(String(_req.query.days ?? "7"), 10) || 7, 1), 90);
+    const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+
+    // Read threads.json for name resolution
+    const threads = readJsonSafe<Record<string, { name?: string }>>(
+        path.join(BORG_DIR, "threads.json"),
+        {},
+    );
+
+    // Collect message history from all zone directories
+    const historyFiles: string[] = [];
+    const borgDir = BORG_DIR;
+    const zoneDirs = [
+        borgDir,
+        path.join(SCRIPT_DIR, ".borg-core"),
+        path.join(SCRIPT_DIR, ".borg-perimeter"),
+    ];
+
+    for (const dir of zoneDirs) {
+        const main = path.join(dir, "message-history.jsonl");
+        const backup = path.join(dir, "message-history.1.jsonl");
+        if (fs.existsSync(main)) historyFiles.push(main);
+        if (fs.existsSync(backup)) historyFiles.push(backup);
+    }
+
+    // Read and filter entries
+    interface UsageEntry {
+        ts: number;
+        threadId: number;
+        model?: string;
+        source?: string;
+        costUSD?: number;
+        inputTokens?: number;
+        outputTokens?: number;
+        cacheReadInputTokens?: number;
+        cacheCreationInputTokens?: number;
+        durationMs?: number;
+        numTurns?: number;
+        modelUsage?: Record<string, {
+            inputTokens: number;
+            outputTokens: number;
+            cacheReadInputTokens: number;
+            cacheCreationInputTokens: number;
+            costUSD: number;
+        }>;
+        direction?: string;
+    }
+
+    const entries: UsageEntry[] = [];
+    const seenIds = new Set<string>(); // deduplicate across files
+
+    for (const file of historyFiles) {
+        try {
+            const content = fs.readFileSync(file, "utf8");
+            for (const line of content.split("\n")) {
+                if (!line.trim()) continue;
+                try {
+                    const entry = JSON.parse(line) as UsageEntry & { messageId?: string };
+                    if (
+                        entry.direction === "out" &&
+                        entry.costUSD !== undefined &&
+                        entry.ts >= cutoff
+                    ) {
+                        // Deduplicate by messageId+threadId if available
+                        const dedup = entry.messageId
+                            ? `${entry.threadId}:${entry.messageId}`
+                            : `${entry.threadId}:${entry.ts}`;
+                        if (!seenIds.has(dedup)) {
+                            seenIds.add(dedup);
+                            entries.push(entry);
+                        }
+                    }
+                } catch { /* skip malformed */ }
+            }
+        } catch { /* file read error */ }
+    }
+
+    // Aggregation
+    let totalCostUSD = 0;
+    let totalInputTokens = 0;
+    let totalOutputTokens = 0;
+
+    const byThread = new Map<number, { costUSD: number; inputTokens: number; outputTokens: number; queries: number }>();
+    const byModel = new Map<string, { costUSD: number; inputTokens: number; outputTokens: number; queries: number }>();
+    const bySource = new Map<string, { costUSD: number; queries: number }>();
+    const byDay = new Map<string, { costUSD: number; queries: number; inputTokens: number; outputTokens: number }>();
+
+    function friendlyModel(model: string | undefined): string {
+        if (!model) return "Unknown";
+        const lower = model.toLowerCase();
+        if (lower.includes("haiku")) return "Haiku";
+        if (lower.includes("sonnet")) return "Sonnet";
+        if (lower.includes("opus")) return "Opus";
+        return model;
+    }
+
+    for (const e of entries) {
+        const cost = e.costUSD ?? 0;
+        const inp = e.inputTokens ?? 0;
+        const out = e.outputTokens ?? 0;
+
+        totalCostUSD += cost;
+        totalInputTokens += inp;
+        totalOutputTokens += out;
+
+        // By thread
+        const t = byThread.get(e.threadId) ?? { costUSD: 0, inputTokens: 0, outputTokens: 0, queries: 0 };
+        t.costUSD += cost;
+        t.inputTokens += inp;
+        t.outputTokens += out;
+        t.queries++;
+        byThread.set(e.threadId, t);
+
+        // By model
+        const modelName = friendlyModel(e.model);
+        const m = byModel.get(modelName) ?? { costUSD: 0, inputTokens: 0, outputTokens: 0, queries: 0 };
+        m.costUSD += cost;
+        m.inputTokens += inp;
+        m.outputTokens += out;
+        m.queries++;
+        byModel.set(modelName, m);
+
+        // By source
+        const srcName = e.source ?? "user";
+        const s = bySource.get(srcName) ?? { costUSD: 0, queries: 0 };
+        s.costUSD += cost;
+        s.queries++;
+        bySource.set(srcName, s);
+
+        // By day
+        const date = new Date(e.ts).toISOString().slice(0, 10);
+        const d = byDay.get(date) ?? { costUSD: 0, queries: 0, inputTokens: 0, outputTokens: 0 };
+        d.costUSD += cost;
+        d.queries++;
+        d.inputTokens += inp;
+        d.outputTokens += out;
+        byDay.set(date, d);
+    }
+
+    const totalQueries = entries.length;
+
+    res.json({
+        totalCostUSD,
+        totalInputTokens,
+        totalOutputTokens,
+        totalQueries,
+        byThread: Array.from(byThread.entries())
+            .map(([threadId, v]) => ({
+                threadId,
+                threadName: threads[String(threadId)]?.name ?? `Thread ${threadId}`,
+                ...v,
+            }))
+            .sort((a, b) => b.costUSD - a.costUSD),
+        byModel: Array.from(byModel.entries())
+            .map(([model, v]) => ({ model, ...v }))
+            .sort((a, b) => b.costUSD - a.costUSD),
+        bySource: Array.from(bySource.entries())
+            .map(([source, v]) => ({ source, ...v }))
+            .sort((a, b) => b.costUSD - a.costUSD),
+        daily: Array.from(byDay.entries())
+            .map(([date, v]) => ({ date, ...v }))
+            .sort((a, b) => b.date.localeCompare(a.date)),
+    });
+});
+
 // ─── Start Server ───
 
 const server = http.createServer(app);

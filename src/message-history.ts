@@ -26,6 +26,22 @@ export interface MessageHistoryEntry {
     source?: MessageSource;
     sourceThreadId?: number;
     messageId?: string;
+
+    // Usage data (outgoing entries only, when available)
+    costUSD?: number;
+    inputTokens?: number;
+    outputTokens?: number;
+    cacheReadInputTokens?: number;
+    cacheCreationInputTokens?: number;
+    durationMs?: number;
+    numTurns?: number;
+    modelUsage?: Record<string, {
+        inputTokens: number;
+        outputTokens: number;
+        cacheReadInputTokens: number;
+        cacheCreationInputTokens: number;
+        costUSD: number;
+    }>;
 }
 
 /**
