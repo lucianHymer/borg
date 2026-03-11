@@ -16,18 +16,11 @@ fi
 MY_START=$(awk '{print $22}' /proc/$$/stat)
 echo "$$:$MY_START" > "$PID_FILE"
 
-trap 'kill $TELEGRAM_PID $QUEUE_PID $HEARTBEAT_PID 2>/dev/null; wait $TELEGRAM_PID $QUEUE_PID $HEARTBEAT_PID 2>/dev/null; rm -f "$PID_FILE"; exit 0' SIGTERM SIGINT
+trap 'kill $QUEUE_PID 2>/dev/null; wait $QUEUE_PID 2>/dev/null; rm -f "$PID_FILE"; exit 0' SIGTERM SIGINT
 
-node dist/telegram-client.js &
-TELEGRAM_PID=$!
+# Zone containers only run queue-processor (heartbeats are built-in, zone-filtered)
 node dist/queue-processor.js &
 QUEUE_PID=$!
-./heartbeat-cron.sh &
-HEARTBEAT_PID=$!
 
-# Wait for any process to exit
-wait -n $TELEGRAM_PID $QUEUE_PID $HEARTBEAT_PID
-# If one exits, kill the others and wait for graceful shutdown
-kill $TELEGRAM_PID $QUEUE_PID $HEARTBEAT_PID 2>/dev/null
-wait $TELEGRAM_PID $QUEUE_PID $HEARTBEAT_PID 2>/dev/null
+wait $QUEUE_PID
 exit 1
