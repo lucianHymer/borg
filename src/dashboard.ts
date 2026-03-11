@@ -776,7 +776,7 @@ app.post("/api/zones/move", (req, res) => {
             // Auto-create zone-config.json with default zones
             config = {
                 zones: { core: { threads: [] }, perimeter: { threads: [] } },
-                defaults: { newThread: "perimeter" },
+                defaults: { newThread: "core" },
             };
             saveZoneConfig(ZONE_CONFIG_PATH, config);
         }

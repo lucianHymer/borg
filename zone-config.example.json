@@ -4,6 +4,6 @@
     "perimeter": { "threads": [] }
   },
   "defaults": {
-    "newThread": "perimeter"
+    "newThread": "core"
   }
 }
