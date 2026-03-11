@@ -92,6 +92,7 @@ services:
         condition: service_healthy
     volumes:
       - ./.borg:/app/.borg:ro
+      - ${WORKSPACE_ROOT:-/home/lucian/workspace}:/home/lucian/workspace:ro
     ports:
       - "127.0.0.1:3100:3100"
     environment:
