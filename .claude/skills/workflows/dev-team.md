@@ -75,6 +75,7 @@ After the standard tasks, Planner creates the actual work subtasks (tasks #4–N
 - **Triage step**: spins up a skeptic sub-agent to go through the generated todos and triage them — keep real issues (mark as todo), delete false positives and low-value noise. The skeptic should be proactive: if a "fix" is trivial, just do it rather than leaving it as a todo
 - Runs `/compound-engineering:resolve_todo_parallel` on the triaged list
 - MUST ask the Planner: "Does this implementation match your plan?" — required step
+- **Any planned feature that is not implemented is a review failure** — send it back to the Worker, do not approve
 - Approves the PR on GitHub when satisfied
 - Never rubber-stamp — if you can't point to specific code you verified, you haven't reviewed
 
