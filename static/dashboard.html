@@ -2756,40 +2756,46 @@ tr.clickable { cursor: pointer; }
     threadHtml += '</tbody></table>';
     document.getElementById('usage-by-thread').innerHTML = threadHtml;
 
-    // By Model table
-    var modelHtml = '<table><thead><tr><th>Model</th><th>Cost</th><th>In</th><th>Cache↓</th><th>Cache↑</th><th>Out</th><th>Queries</th></tr></thead><tbody>';
-    if (data.byModel && data.byModel.length > 0) {
-      for (var i = 0; i < data.byModel.length; i++) {
-        var m = data.byModel[i];
+    // By Model table — sorted Opus > Sonnet > Haiku
+    var modelOrder = { 'Opus': 0, 'Sonnet': 1, 'Haiku': 2 };
+    var sortedModels = (data.byModel || []).slice().sort(function(a, b) {
+      var ao = modelOrder[a.model] != null ? modelOrder[a.model] : 99;
+      var bo = modelOrder[b.model] != null ? modelOrder[b.model] : 99;
+      return ao - bo;
+    });
+    var modelHtml = '<table><thead><tr><th>Model</th><th>Cost</th><th>Tokens</th><th>Queries</th><th>Avg/Query</th><th>Avg/Mtok</th></tr></thead><tbody>';
+    if (sortedModels.length > 0) {
+      for (var i = 0; i < sortedModels.length; i++) {
+        var m = sortedModels[i];
+        var totalTok = m.inputTokens + m.outputTokens;
+        var avgPerQuery = m.queries > 0 ? fmtUSD(m.costUSD / m.queries) : '-';
+        var avgPerMtok = totalTok > 0 ? '$' + (m.costUSD / totalTok * 1e6).toFixed(2) + '/Mtok' : '-';
         modelHtml += '<tr>' +
           '<td class="' + modelColorClass(m.model) + '">' + escapeHtml(m.model) + '</td>' +
           '<td>' + fmtUSD(m.costUSD) + '</td>' +
-          '<td>' + fmtTokens(m.inputTokens) + '</td>' +
-          '<td style="color:var(--accent-yellow)">' + (m.cacheReadInputTokens ? fmtTokens(m.cacheReadInputTokens) : '<span style="color:var(--text-secondary)">-</span>') + '</td>' +
-          '<td style="color:var(--accent-yellow);opacity:0.7">' + (m.cacheCreationInputTokens ? fmtTokens(m.cacheCreationInputTokens) : '<span style="color:var(--text-secondary)">-</span>') + '</td>' +
-          '<td>' + fmtTokens(m.outputTokens) + '</td>' +
-          '<td>' + m.queries + '</td></tr>';
+          '<td>' + fmtTokens(totalTok) + '</td>' +
+          '<td>' + m.queries + '</td>' +
+          '<td>' + avgPerQuery + '</td>' +
+          '<td>' + avgPerMtok + '</td></tr>';
       }
     } else {
-      modelHtml += '<tr><td colspan="7" class="empty-state">No model data</td></tr>';
+      modelHtml += '<tr><td colspan="6" class="empty-state">No model data</td></tr>';
     }
     modelHtml += '</tbody></table>';
     document.getElementById('usage-by-model').innerHTML = modelHtml;
 
     // By Source table
-    var sourceHtml = '<table><thead><tr><th>Source</th><th>Cost</th><th>Queries</th><th>% of Total</th></tr></thead><tbody>';
+    var sourceHtml = '<table><thead><tr><th>Source</th><th>Cost</th><th>Queries</th></tr></thead><tbody>';
     if (data.bySource && data.bySource.length > 0) {
       for (var i = 0; i < data.bySource.length; i++) {
         var s = data.bySource[i];
-        var pctTotal = data.totalQueries > 0 ? (s.queries / data.totalQueries * 100).toFixed(0) : '0';
         sourceHtml += '<tr>' +
           '<td>' + escapeHtml(s.source) + '</td>' +
           '<td>' + fmtUSD(s.costUSD) + '</td>' +
-          '<td>' + s.queries + '</td>' +
-          '<td>' + pctTotal + '%</td></tr>';
+          '<td>' + s.queries + '</td></tr>';
       }
     } else {
-      sourceHtml += '<tr><td colspan="4" class="empty-state">No source data</td></tr>';
+      sourceHtml += '<tr><td colspan="3" class="empty-state">No source data</td></tr>';
     }
     sourceHtml += '</tbody></table>';
     document.getElementById('usage-by-source').innerHTML = sourceHtml;
