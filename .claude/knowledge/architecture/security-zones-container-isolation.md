@@ -36,17 +36,24 @@ Each zone gets its own `.borg-{zone}/` directory with queue/, message-history.js
 
 ## Docker Layout
 
-- Single-container: existing `docker-compose.yml` unchanged (`bot` service)
-- Multi-container: `docker compose -f docker-compose.yml -f docker-compose.zones.yml up` — replaces `bot` with `infra`, `core`, `perimeter` services
-- `BORG_ZONE` env var (`"core"`, `"perimeter"`, `"infra"`, or unset) controls zone-conditional behavior
+`docker compose up` starts all three containers: `infra`, `core`, `perimeter`. There is no single-container mode.
+- `BORG_ZONE` env var — always set: `"core"`, `"perimeter"`, or `"infra"`
 - `ZONE_CONFIG_PATH` env var points to zone-config.json location
+
+## Cross-Thread Routing
+
+`send_message` (mcp-tools.ts) is zone-unaware — writes one outgoing message with `crossThread: true`. Infra's `pollOutgoingQueue()` handles routing: same-zone messages are delivered directly to the target zone's incoming queue; cross-zone messages go to a pending queue with an inline approval keyboard.
+
+## Heartbeats
+
+Each zone's queue-processor generates heartbeats for its own threads only, using `getThreadsInZone()`. No external heartbeat script.
 
 ## Broadcast Filtering
 
-When zones are active, broadcast fan-out only reaches `mainThread: true` threads in the core zone. The broadcast MCP tool is only registered when `BORG_ZONE` is unset or `"core"` (excluded from perimeter). Backward compatible — all mainThreads receive broadcasts when no zone config exists.
+Broadcast fan-out only reaches `mainThread: true` threads in the core zone. The broadcast MCP tool is only registered when `BORG_ZONE` is `"core"` (excluded from perimeter and infra).
 
 ## Daily Pending Reminder
 
 Infra scans the pending queue hourly and sends a daily summary to the master thread with sender/target info, age, message preview, and deep links to approval keyboards.
 
-**Related files:** src/zone-config.ts, src/mcp-tools.ts, src/telegram-client.ts, src/types.ts, docker-compose.zones.yml, Dockerfile.infra, zone-config.example.json, scripts/init-zones.sh
+**Related files:** src/zone-config.ts, src/mcp-tools.ts, src/telegram-client.ts, src/queue-processor.ts, src/types.ts, docker-compose.yml, Dockerfile.infra, zone-config.example.json, scripts/init-zones.sh

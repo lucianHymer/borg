@@ -23,45 +23,34 @@ import { logDecision, logCorrection, ROUTING_LOG } from "./routing-logger.js";
 import { AUDIO_INCOMING_DIR, cleanupAudioFile, startPeriodicCleanup, ensureModels, distillForSpeech, synthesize, isAvailable } from "./audio.js";
 import { IMAGES_INCOMING_DIR, startPeriodicCleanup as startImageCleanup } from "./images.js";
 import { toTelegramMarkdownV2, escapeMarkdownV2 } from "./markdown-v2.js";
-import { loadZoneConfig, getThreadZone } from "./zone-config.js";
+import { loadZoneConfig, getThreadZone, isSameZone } from "./zone-config.js";
 
 // ─── Constants ───
 
 const SCRIPT_DIR = path.resolve(__dirname, "..");
-const BORG_ZONE = process.env.BORG_ZONE || "";
 const ZONE_CONFIG_PATH = process.env.ZONE_CONFIG_PATH || path.join(SCRIPT_DIR, "zone-config.json");
 
-// In infra mode, .borg dirs are at /app/.borg-{zone}. In single-container, at /app/.borg.
-const BORG_DIR = path.join(SCRIPT_DIR, ".borg");
-const QUEUE_INCOMING = path.join(BORG_DIR, "queue/incoming");
-const QUEUE_OUTGOING = path.join(BORG_DIR, "queue/outgoing");
-const QUEUE_DEAD_LETTER = path.join(BORG_DIR, "queue/dead-letter");
-const QUEUE_CANCEL = path.join(BORG_DIR, "queue/cancel");
-const LOG_FILE = BORG_ZONE === "infra"
-    ? path.join(SCRIPT_DIR, ".borg-infra/logs/telegram.log")
-    : path.join(BORG_DIR, "logs/telegram.log");
-const MESSAGE_MODELS_FILE = BORG_ZONE === "infra"
-    ? path.join(SCRIPT_DIR, ".borg-infra/message-models.json")
-    : path.join(BORG_DIR, "message-models.json");
-const QUEUE_STATUS = path.join(BORG_DIR, "status");
-const MARKDOWN_PARSE_FAILURES = BORG_ZONE === "infra"
-    ? path.join(SCRIPT_DIR, ".borg-infra/markdown-parse-failures.jsonl")
-    : path.join(BORG_DIR, "markdown-parse-failures.jsonl");
-const QUEUE_PENDING = path.join(BORG_DIR, "queue/pending");
+// Infra's own storage — telegram-client always runs in the infra container
+const BORG_INFRA_DIR = path.join(SCRIPT_DIR, ".borg-infra");
+const QUEUE_DEAD_LETTER = path.join(BORG_INFRA_DIR, "queue/dead-letter");
+const LOG_FILE = path.join(BORG_INFRA_DIR, "logs/telegram.log");
+const MESSAGE_MODELS_FILE = path.join(BORG_INFRA_DIR, "message-models.json");
+const MARKDOWN_PARSE_FAILURES = path.join(BORG_INFRA_DIR, "markdown-parse-failures.jsonl");
+
+// Zone status directories — queue-processors write status files to their zone's dir
+const ZONE_STATUS_DIRS = [
+    path.join(SCRIPT_DIR, ".borg-core/status"),
+    path.join(SCRIPT_DIR, ".borg-perimeter/status"),
+];
 
 /**
- * Get all pending queue directories to scan.
- * In infra mode, pending files live in each zone's own dir (written by zone MCP tools).
- * In single-container mode, there's just one pending dir.
+ * Get all pending queue directories to scan (one per zone).
  */
 function getPendingQueueDirs(): string[] {
-    if (BORG_ZONE === "infra") {
-        return [
-            path.join(SCRIPT_DIR, ".borg-core/queue/pending"),
-            path.join(SCRIPT_DIR, ".borg-perimeter/queue/pending"),
-        ];
-    }
-    return [QUEUE_PENDING];
+    return [
+        path.join(SCRIPT_DIR, ".borg-core/queue/pending"),
+        path.join(SCRIPT_DIR, ".borg-perimeter/queue/pending"),
+    ];
 }
 
 /**
@@ -77,59 +66,41 @@ function findPendingFile(pendingId: string): string | null {
 }
 
 /**
- * Resolve the incoming queue path for a target thread's zone.
- * In infra mode, routes to /app/.borg-{zone}/queue/incoming/.
- * In single-container mode, routes to /app/.borg/queue/incoming/.
+ * Resolve the incoming queue path for a target zone.
  */
 function resolveZoneIncoming(targetZone: string): string {
-    if (BORG_ZONE === "infra") {
-        return path.join(SCRIPT_DIR, `.borg-${targetZone}/queue/incoming`);
-    }
-    return QUEUE_INCOMING;
+    return path.join(SCRIPT_DIR, `.borg-${targetZone}/queue/incoming`);
 }
 
 /**
- * Resolve the outgoing queue path for a target thread's zone.
- * In infra mode, routes to /app/.borg-{zone}/queue/outgoing/.
- * In single-container mode, routes to /app/.borg/queue/outgoing/.
+ * Resolve the outgoing queue path for a target zone.
  */
 function resolveZoneOutgoing(targetZone: string): string {
-    if (BORG_ZONE === "infra") {
-        return path.join(SCRIPT_DIR, `.borg-${targetZone}/queue/outgoing`);
-    }
-    return QUEUE_OUTGOING;
+    return path.join(SCRIPT_DIR, `.borg-${targetZone}/queue/outgoing`);
 }
 
 /**
- * Resolve the incoming queue path for a specific thread.
- * Loads zone config to determine which zone the thread belongs to.
- * In single-container mode, always returns the default QUEUE_INCOMING.
+ * Resolve the incoming queue path for a specific thread by looking up its zone.
  */
 function resolveIncomingForThread(threadId: number): string {
-    if (BORG_ZONE !== "infra") return QUEUE_INCOMING;
     try {
         const config = loadZoneConfig(ZONE_CONFIG_PATH);
-        if (!config) return QUEUE_INCOMING;
+        if (!config) return resolveZoneIncoming("core");
         const zone = getThreadZone(config, threadId);
         return resolveZoneIncoming(zone);
     } catch {
-        return QUEUE_INCOMING;
+        return resolveZoneIncoming("core");
     }
 }
 
 /**
- * Get all outgoing queue directories to poll.
- * In infra mode, returns both zone outgoing queues.
- * In single-container mode, returns just the default.
+ * Get all outgoing queue directories to poll (one per zone).
  */
 function getOutgoingQueueDirs(): string[] {
-    if (BORG_ZONE === "infra") {
-        return [
-            path.join(SCRIPT_DIR, ".borg-core/queue/outgoing"),
-            path.join(SCRIPT_DIR, ".borg-perimeter/queue/outgoing"),
-        ];
-    }
-    return [QUEUE_OUTGOING];
+    return [
+        path.join(SCRIPT_DIR, ".borg-core/queue/outgoing"),
+        path.join(SCRIPT_DIR, ".borg-perimeter/queue/outgoing"),
+    ];
 }
 const DEDUP_WINDOW_MS = 10_000; // 10 seconds
 const TASK_LISTS_FILE = path.join(SCRIPT_DIR, ".borg", TASK_LISTS_FILENAME);
@@ -158,7 +129,7 @@ function isDuplicate(threadId: number, senderId: string, text: string): boolean 
 
 // ─── Ensure Directories Exist ───
 
-[QUEUE_INCOMING, QUEUE_OUTGOING, QUEUE_DEAD_LETTER, QUEUE_CANCEL, QUEUE_STATUS, path.dirname(LOG_FILE), path.dirname(MESSAGE_MODELS_FILE)].forEach(
+[QUEUE_DEAD_LETTER, ...ZONE_STATUS_DIRS, path.dirname(LOG_FILE), path.dirname(MESSAGE_MODELS_FILE)].forEach(
     (dir) => {
         if (!fs.existsSync(dir)) {
             fs.mkdirSync(dir, { recursive: true });
@@ -268,7 +239,6 @@ interface PendingMessage {
 }
 
 const pendingMessages = new Map<string, PendingMessage>();
-const telegramToQueueId = new Map<number, string>(); // Telegram message_id → queue messageId
 const listenInFlight = new Set<number>(); // track message IDs being processed for TTS
 const voiceButtonsInFlight = new Set<string>(); // track voice button callbacks being processed
 
@@ -567,7 +537,6 @@ bot.on("message:text").filter(
             threadId,
             telegramMessageId: ctx.msg.message_id,
         });
-        telegramToQueueId.set(ctx.msg.message_id, messageId);
 
         // React with 👀 to acknowledge we've seen the message
         try {
@@ -583,85 +552,6 @@ bot.on("message:text").filter(
         );
     },
 );
-
-// ─── Edited Message Handler ───
-
-bot.on("edited_message:text", async (ctx) => {
-    const editedMsg = ctx.editedMessage;
-    if (!editedMsg || ctx.from.id === bot.botInfo.id) return;
-
-    const telegramMsgId = editedMsg.message_id;
-    const queueMessageId = telegramToQueueId.get(telegramMsgId);
-    if (!queueMessageId) return; // Not a tracked message — ignore silently
-
-    const newText = editedMsg.text?.trim() ?? "";
-
-    // Check if it's still queued (file in incoming/)
-    const queueFile = path.join(QUEUE_INCOMING, `telegram_${queueMessageId}.json`);
-    if (fs.existsSync(queueFile)) {
-        if (newText === "") {
-            // Empty edit = delete the queued message
-            try {
-                fs.unlinkSync(queueFile);
-                pendingMessages.delete(queueMessageId);
-                telegramToQueueId.delete(telegramMsgId);
-                log("INFO", `Deleted queued message ${queueMessageId} (edited to empty)`);
-                await bot.api.setMessageReaction(ctx.chat!.id, telegramMsgId,
-                    [{ type: "emoji", emoji: "👌" as any }]).catch(() => {});
-            } catch {
-                log("WARN", `Failed to delete queued message file for ${queueMessageId}`);
-            }
-        } else {
-            // Rewrite the queue file with updated text
-            try {
-                const raw = JSON.parse(fs.readFileSync(queueFile, "utf8"));
-                raw.message = newText;
-                const tmpFile = queueFile + ".tmp";
-                fs.writeFileSync(tmpFile, JSON.stringify(raw, null, 2));
-                fs.renameSync(tmpFile, queueFile);
-                log("INFO", `Updated queued message ${queueMessageId}: ${newText.substring(0, 80)}`);
-                await bot.api.setMessageReaction(ctx.chat!.id, telegramMsgId,
-                    [{ type: "emoji", emoji: "✍" as any }]).catch(() => {});
-            } catch {
-                log("WARN", `Failed to rewrite queued message file for ${queueMessageId}`);
-            }
-        }
-        return;
-    }
-
-    // Check if it's currently processing (file in processing/)
-    const processingFile = path.join(
-        SCRIPT_DIR, ".borg/queue/processing", `telegram_${queueMessageId}.json`,
-    );
-    if (fs.existsSync(processingFile)) {
-        const pending = pendingMessages.get(queueMessageId);
-        if (pending) {
-            // Read original text from processing file
-            let originalText = "";
-            try {
-                const raw = JSON.parse(fs.readFileSync(processingFile, "utf8"));
-                originalText = raw.message ?? "";
-            } catch { /* best effort */ }
-
-            const warning = originalText
-                ? `⚠️ Edit received but already processing. Original text was:\n\n${originalText}`
-                : `⚠️ Edit received but already processing.`;
-
-            const threadOpt = getThreadOpt(pending);
-            await bot.api.sendMessage(
-                pending.chatId,
-                warning,
-                {
-                    message_thread_id: threadOpt,
-                    reply_parameters: { message_id: telegramMsgId },
-                },
-            ).catch(() => {});
-        }
-        return;
-    }
-
-    // Already done — ignore silently
-});
 
 // ─── Broadcast Group Listener ───
 
@@ -680,14 +570,14 @@ bot.on("message:text").filter(
 
         // Fan-out to mainThread:true threads in core zone only
         const threads = loadThreads();
-        const zoneConfig = loadZoneConfig(path.join(SCRIPT_DIR, "zone-config.json"));
+        const zoneConfig = loadZoneConfig(ZONE_CONFIG_PATH);
         const mainThreads = Object.entries(threads).filter(([id, t]) => {
             if (!t.mainThread) return false;
-            // If zone config exists, only include core zone threads
+            // Only include core zone threads for broadcast
             if (zoneConfig) {
                 return getThreadZone(zoneConfig, Number(id)) === "core";
             }
-            return true; // no zone config = all mainThread threads (backward compatible)
+            return true; // no zone config = all mainThread threads
         });
 
         if (mainThreads.length === 0) {
@@ -991,50 +881,102 @@ async function pollOutgoingQueue(): Promise<void> {
 
                 let firstSentId: number | undefined;
 
-                if (data.crossZonePending && data.targetThreadId && data.sourceThreadId) {
-                    // Cross-zone message: show approval keyboard in master thread
-                    const chatId = settings.telegram_chat_id;
-                    const pendingId = data.messageId.replace(/_tg$/, "");
-                    const preview = data.message.length > 200
-                        ? data.message.substring(0, 200) + "..."
-                        : data.message;
+                if (data.crossThread && data.targetThreadId && data.sourceThreadId) {
+                    // Cross-thread message: infra handles zone routing
+                    const zoneConfig = loadZoneConfig(ZONE_CONFIG_PATH);
+                    const crossZone = zoneConfig && !isSameZone(zoneConfig, data.sourceThreadId, data.targetThreadId);
 
-                    const approvalText = [
-                        `🔒 *Cross\\-zone message pending approval*`,
-                        ``,
-                        `*From:* ${escapeMarkdownV2(data.sender || "unknown")} \\(thread ${data.sourceThreadId}\\)`,
-                        `*To:* thread ${data.targetThreadId}`,
-                        ``,
-                        `${escapeMarkdownV2(preview)}`,
-                    ].join("\n");
+                    if (crossZone) {
+                        // Cross-zone: write to pending queue + show approval keyboard, then skip display
+                        const sourceZone = getThreadZone(zoneConfig!, data.sourceThreadId);
+                        const targetZone = getThreadZone(zoneConfig!, data.targetThreadId);
+                        const pendingId = data.messageId.replace(/_tg$/, "");
+                        const threads = loadThreads();
+                        const sourceName = data.sender || threads[String(data.sourceThreadId)]?.name || `Thread ${data.sourceThreadId}`;
+                        const targetName = threads[String(data.targetThreadId)]?.name || `Thread ${data.targetThreadId}`;
 
-                    const keyboard = new InlineKeyboard()
-                        .text("✅ Approve", `zone_approve:${pendingId}`)
-                        .text("❌ Reject", `zone_reject:${pendingId}`);
+                        const pending: PendingApproval = {
+                            id: pendingId,
+                            sourceThreadId: data.sourceThreadId,
+                            targetThreadId: data.targetThreadId,
+                            sourceZone,
+                            targetZone,
+                            senderName: sourceName,
+                            targetName,
+                            message: data.message,
+                            timestamp: data.timestamp,
+                        };
 
-                    try {
-                        const sent = await bot.api.sendMessage(chatId, approvalText, {
-                            parse_mode: "MarkdownV2",
-                            reply_markup: keyboard,
-                        });
+                        // Write pending file to infra's pending queue
+                        const pendingDir = path.join(SCRIPT_DIR, ".borg-infra/queue/pending");
+                        fs.mkdirSync(pendingDir, { recursive: true });
+                        const pendTmp = path.join(pendingDir, `${pendingId}.json.tmp`);
+                        const pendFinal = path.join(pendingDir, `${pendingId}.json`);
+                        fs.writeFileSync(pendTmp, JSON.stringify(pending));
+                        fs.renameSync(pendTmp, pendFinal);
 
-                        // Update the pending file with the Telegram message ID (for reminder links)
-                        const pendingFile = findPendingFile(pendingId);
-                        if (pendingFile) {
+                        // Show approval keyboard in master thread
+                        const chatId = settings.telegram_chat_id;
+                        const preview = data.message.length > 200
+                            ? data.message.substring(0, 200) + "..."
+                            : data.message;
+                        const approvalText = [
+                            `🔒 *Cross\\-zone message pending approval*`,
+                            ``,
+                            `*From:* ${escapeMarkdownV2(sourceName)} \\(thread ${data.sourceThreadId}\\)`,
+                            `*To:* thread ${data.targetThreadId}`,
+                            ``,
+                            `${escapeMarkdownV2(preview)}`,
+                        ].join("\n");
+                        const keyboard = new InlineKeyboard()
+                            .text("✅ Approve", `zone_approve:${pendingId}`)
+                            .text("❌ Reject", `zone_reject:${pendingId}`);
+
+                        try {
+                            const sent = await bot.api.sendMessage(chatId, approvalText, {
+                                parse_mode: "MarkdownV2",
+                                reply_markup: keyboard,
+                            });
                             try {
-                                const pendingData: PendingApproval = JSON.parse(fs.readFileSync(pendingFile, "utf8"));
-                                pendingData.telegramMessageId = sent.message_id;
-                                const tmp = pendingFile + ".tmp";
-                                fs.writeFileSync(tmp, JSON.stringify(pendingData));
-                                fs.renameSync(tmp, pendingFile);
-                            } catch { /* pending file may have been processed already */ }
+                                pending.telegramMessageId = sent.message_id;
+                                const tmp2 = pendFinal + ".tmp";
+                                fs.writeFileSync(tmp2, JSON.stringify(pending));
+                                fs.renameSync(tmp2, pendFinal);
+                            } catch { /* non-fatal */ }
+                            log("INFO", `Cross-zone approval keyboard shown for ${pendingId} (${sourceZone} → ${targetZone})`);
+                        } catch (err) {
+                            log("ERROR", `Failed to show cross-zone approval: ${toErrorMessage(err)}`);
                         }
 
-                        log("INFO", `Cross-zone approval keyboard shown for ${pendingId}`);
-                    } catch (err) {
-                        log("ERROR", `Failed to show cross-zone approval: ${toErrorMessage(err)}`);
+                        // Done — delete outgoing file and skip Telegram display
+                        try { fs.unlinkSync(filePath); } catch { /* already processed */ }
+                        continue;
                     }
-                } else if (data.targetThreadId) {
+
+                    // Same zone: deliver to target zone's incoming queue, then fall through to display
+                    const incomingId = data.messageId.replace(/_tg$/, "");
+                    const targetZone = zoneConfig ? getThreadZone(zoneConfig, data.targetThreadId) : "core";
+                    const targetIncoming = resolveZoneIncoming(targetZone);
+
+                    const incoming = {
+                        channel: "telegram",
+                        source: "cross-thread",
+                        threadId: data.targetThreadId,
+                        sourceThreadId: data.sourceThreadId,
+                        sender: data.sender,
+                        message: data.message,
+                        timestamp: data.timestamp,
+                        messageId: incomingId,
+                    };
+
+                    fs.mkdirSync(targetIncoming, { recursive: true });
+                    const inTmp = path.join(targetIncoming, `${incomingId}.json.tmp`);
+                    const inFinal = path.join(targetIncoming, `${incomingId}.json`);
+                    fs.writeFileSync(inTmp, JSON.stringify(incoming));
+                    fs.renameSync(inTmp, inFinal);
+                }
+
+                if (data.targetThreadId) {
                     // Cross-thread message: post to the target topic
                     const chatId = settings.telegram_chat_id;
 
@@ -1104,8 +1046,8 @@ async function pollOutgoingQueue(): Promise<void> {
                     if (pending) {
                         // Delete status file FIRST to prevent pollStatusFiles from overwriting final response
                         try {
-                            const statusFile = path.join(QUEUE_STATUS, `${data.messageId}.json`);
-                            fs.unlinkSync(statusFile);
+                            const statusFile = findStatusFile(data.messageId);
+                            if (statusFile) fs.unlinkSync(statusFile);
                         } catch { /* may not exist */ }
 
                         // Convert Claude's GFM output to Telegram MarkdownV2
@@ -1342,15 +1284,26 @@ function cleanupPendingMessages(): void {
             }
             // Delete status file if it exists
             try {
-                const statusFile = path.join(QUEUE_STATUS, `${messageId}.json`);
-                if (fs.existsSync(statusFile)) fs.unlinkSync(statusFile);
+                const statusFile = findStatusFile(messageId);
+                if (statusFile) fs.unlinkSync(statusFile);
             } catch { /* best effort */ }
 
             pendingMessages.delete(messageId);
-            telegramToQueueId.delete(pending.telegramMessageId);
             log("DEBUG", `Cleaned up stale pending message: ${messageId}`);
         }
     }
+}
+
+/**
+ * Find a status file by messageId across all zone status directories.
+ * Returns the full path if found, null otherwise.
+ */
+function findStatusFile(messageId: string): string | null {
+    for (const dir of ZONE_STATUS_DIRS) {
+        const filePath = path.join(dir, `${messageId}.json`);
+        if (fs.existsSync(filePath)) return filePath;
+    }
+    return null;
 }
 
 // ─── Status File Polling ───
@@ -1360,11 +1313,11 @@ async function pollStatusFiles(): Promise<void> {
     statusPollActive = true;
     try {
     for (const [messageId, pending] of pendingMessages) {
-        const statusFile = path.join(QUEUE_STATUS, `${messageId}.json`);
+        const statusFile = findStatusFile(messageId);
 
         let statusData: { label: string; ts: number; startTs: number; preview?: string };
         try {
-            if (!fs.existsSync(statusFile)) continue;
+            if (!statusFile) continue;
             statusData = JSON.parse(fs.readFileSync(statusFile, "utf8"));
             if (!statusData.label || !statusData.startTs) continue; // invalid format
         } catch {
@@ -1407,10 +1360,6 @@ async function pollStatusFiles(): Promise<void> {
         // Throttle: label/preview changes edit immediately, timer-only throttle to 20s
         if (!labelChanged && !previewChanged && !isStale && timeSinceLastEdit < 20_000) continue;
 
-        const cancelKeyboard = statusData.label !== "Cancelled"
-            ? new InlineKeyboard().text("✕ Cancel", `cancel:${messageId}`)
-            : undefined;
-
         try {
             if (pending.statusMessageId) {
                 // Edit existing status message
@@ -1418,7 +1367,6 @@ async function pollStatusFiles(): Promise<void> {
                     pending.chatId,
                     pending.statusMessageId,
                     displayText,
-                    { reply_markup: cancelKeyboard },
                 );
             } else {
                 // Send new status message as reply to original
@@ -1430,7 +1378,6 @@ async function pollStatusFiles(): Promise<void> {
                     displayText,
                     {
                         message_thread_id: getThreadOpt(pending),
-                        reply_markup: cancelKeyboard,
                         ...replyOpts,
                     },
                 );
@@ -1516,29 +1463,6 @@ bot.on("message_reaction", async (ctx) => {
 
 bot.on("callback_query:data", async (ctx) => {
     const data = ctx.callbackQuery.data;
-
-    // ─── Cancel Button (abort running SDK process) ───
-    if (data.startsWith("cancel:")) {
-        const queueMessageId = data.replace("cancel:", "");
-        const pending = pendingMessages.get(queueMessageId);
-        if (!pending) {
-            await ctx.answerCallbackQuery({ text: "Processing already finished" });
-            return;
-        }
-
-        // Write cancel signal file for queue-processor to pick up
-        const cancelFile = path.join(QUEUE_CANCEL, `${queueMessageId}.json`);
-        const tmpFile = cancelFile + ".tmp";
-        try {
-            fs.writeFileSync(tmpFile, JSON.stringify({ ts: Date.now() }));
-            fs.renameSync(tmpFile, cancelFile);
-            await ctx.answerCallbackQuery({ text: "Cancelling..." });
-            log("INFO", `Cancel signal written for ${queueMessageId}`);
-        } catch {
-            await ctx.answerCallbackQuery({ text: "Failed to cancel" });
-        }
-        return;
-    }
 
     // ─── Listen Button (TTS of bot response) ───
     if (data.startsWith("listen:")) {

@@ -28,6 +28,7 @@ import {
     buildHistoryContext,
 } from "./message-history.js";
 import { createBorgMcpServer } from "./mcp-tools.js";
+import { loadZoneConfig, getThreadsInZone } from "./zone-config.js";
 import { transcribe, cleanupAudioFile, ensureModels, AUDIO_INCOMING_DIR } from "./audio.js";
 import { IMAGES_INCOMING_DIR } from "./images.js";
 import type { MessageSource, MessageHistoryEntry } from "./message-history.js";
@@ -1556,6 +1557,73 @@ queueInterval = setInterval(() => {
 // Periodic session log sync (for live tailing during long-running queries)
 let sessionSyncInterval: ReturnType<typeof setInterval> | undefined;
 sessionSyncInterval = setInterval(syncAllActiveSessionLogs, 5000);
+
+// ─── Zone-Filtered Heartbeat Timer ───
+
+const BORG_ZONE = process.env.BORG_ZONE || "core";
+const ZONE_CONFIG_PATH = process.env.ZONE_CONFIG_PATH || path.join(SCRIPT_DIR, "zone-config.json");
+const HEARTBEAT_PROMPT = "Read HEARTBEAT.md if it exists. Follow it strictly. If nothing needs human attention, reply with exactly [NO_UPDATES].";
+
+function runHeartbeatCycle(): void {
+    try {
+        const settings = loadSettings();
+        const threads = loadThreads();
+        const zoneConfig = loadZoneConfig(ZONE_CONFIG_PATH);
+
+        // Get threads assigned to this zone
+        const zoneThreadIds = zoneConfig
+            ? getThreadsInZone(zoneConfig, BORG_ZONE)
+            : Object.keys(threads).map(Number);
+
+        // Filter to non-team threads in this zone
+        const eligibleThreads = zoneThreadIds.filter((id) => {
+            const config = threads[String(id)];
+            return config && !config.team;
+        });
+
+        if (eligibleThreads.length === 0) {
+            log("DEBUG", `Heartbeat: no eligible threads in zone ${BORG_ZONE}`);
+            return;
+        }
+
+        const ts = Date.now();
+        for (const threadId of eligibleThreads) {
+            const messageId = `heartbeat_${threadId}_${Math.floor(ts / 1000)}_${Math.random().toString(36).slice(2, 6)}`;
+            const incoming = {
+                channel: "heartbeat",
+                source: "heartbeat",
+                threadId,
+                sender: "system",
+                senderId: "heartbeat",
+                message: HEARTBEAT_PROMPT,
+                isReply: false,
+                timestamp: ts,
+                messageId,
+            };
+
+            fs.mkdirSync(QUEUE_INCOMING, { recursive: true });
+            const tmp = path.join(QUEUE_INCOMING, `${messageId}.json.tmp`);
+            const final_ = path.join(QUEUE_INCOMING, `${messageId}.json`);
+            fs.writeFileSync(tmp, JSON.stringify(incoming));
+            fs.renameSync(tmp, final_);
+        }
+
+        log("INFO", `Heartbeat: queued ${eligibleThreads.length} thread(s) in zone ${BORG_ZONE}`);
+    } catch (err) {
+        log("ERROR", `Heartbeat cycle failed: ${toErrorMessage(err)}`);
+    }
+}
+
+// Start heartbeat timer — read interval from settings, default 500s
+const heartbeatInterval = (() => {
+    try {
+        return loadSettings().heartbeat_interval || 500;
+    } catch {
+        return 500;
+    }
+})();
+log("INFO", `Heartbeat timer started (interval: ${heartbeatInterval}s, zone: ${BORG_ZONE})`);
+setInterval(runHeartbeatCycle, heartbeatInterval * 1000);
 
 // Initial queue drain on startup
 void processQueue();
