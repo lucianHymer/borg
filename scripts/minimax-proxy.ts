@@ -136,6 +136,7 @@ const server = http.createServer(async (req, res) => {
             Host: TARGET_HOST,
             "Content-Length": body.length,
             authorization: `Bearer ${apiKey}`,
+            "x-api-key": apiKey,
         },
     }, (targetRes) => {
         let responseBody = "";
