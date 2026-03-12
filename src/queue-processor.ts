@@ -125,7 +125,8 @@ function readBudgetUsage(usageId: string): QueryUsageData | null {
                 // Convert to QueryUsageData format
                 result = {
                     totalCostUSD: data.costUSD,
-                    inputTokens: data.usage.input_tokens,
+                    // Fireworks input_tokens includes cache reads; subtract to get net non-cached count
+                    inputTokens: data.usage.input_tokens - (data.usage.cache_read_input_tokens || 0),
                     outputTokens: data.usage.output_tokens,
                     cacheReadInputTokens: data.usage.cache_read_input_tokens || 0,
                     cacheCreationInputTokens: 0,
@@ -853,7 +854,7 @@ async function collectQueryResponse(
 
 // ─── Heartbeat Processing (one-shot, no persistent session) ───
 
-async function processHeartbeat(msg: IncomingMessage): Promise<{ text: string; usage?: QueryUsageData; heartbeatUsageId?: string }> {
+async function processHeartbeat(msg: IncomingMessage): Promise<{ text: string; usage?: QueryUsageData; heartbeatUsageId?: string; heartbeatModel?: string }> {
     const threads = loadThreads();
     const threadKey = String(msg.threadId);
     const threadConfig = threads[threadKey];
@@ -901,9 +902,12 @@ async function processHeartbeat(msg: IncomingMessage): Promise<{ text: string; u
 
     log("INFO", `Heartbeat one-shot for thread ${msg.threadId} (tier: ${dueTier})`);
 
-    const heartbeatModel = isBudgetMode() ? BUDGET_MODEL : "haiku";
+    // Respect thread-level model override; fall back to budget model or haiku
+    const isFireworksModel = threadConfig.model?.includes("fireworks");
+    const heartbeatModel = (isFireworksModel && threadConfig.model) || (isBudgetMode() ? BUDGET_MODEL : "haiku");
+    const needsProxy = isBudgetMode() || isFireworksModel;
     let heartbeatUsageId: string | undefined;
-    if (isBudgetMode()) {
+    if (needsProxy) {
         const proxyOk = await checkProxyAvailable();
         if (proxyOk) {
             heartbeatUsageId = crypto.randomUUID();
@@ -954,7 +958,7 @@ async function processHeartbeat(msg: IncomingMessage): Promise<{ text: string; u
             saveLastReport(threadKey, response);
         }
 
-        return { text: response, usage, heartbeatUsageId };
+        return { text: response, usage, heartbeatUsageId, heartbeatModel };
     } catch (err) {
         const stderrOutput = stderrLines.join("").trim();
         log(
@@ -1166,8 +1170,8 @@ async function processMessage(messageFile: string): Promise<void> {
                 }
                 return;
             }
-            effectiveModel = isBudgetMode() ? BUDGET_MODEL : "haiku";
             const heartbeatResult = await processHeartbeat(msg);
+            effectiveModel = heartbeatResult.heartbeatModel ?? (isBudgetMode() ? BUDGET_MODEL : "haiku");
             responseText = heartbeatResult.text;
             usageData = heartbeatResult.usage;
             if (heartbeatResult.heartbeatUsageId) {
@@ -1194,7 +1198,7 @@ async function processMessage(messageFile: string): Promise<void> {
                         source: "heartbeat",
                         messageId,
                         costUSD: usageData.totalCostUSD,
-                        inputTokens: usageData.inputTokens - usageData.cacheReadInputTokens,
+                        inputTokens: usageData.inputTokens,
                         outputTokens: usageData.outputTokens,
                         cacheReadInputTokens: usageData.cacheReadInputTokens,
                         cacheCreationInputTokens: usageData.cacheCreationInputTokens,
@@ -1247,6 +1251,11 @@ async function processMessage(messageFile: string): Promise<void> {
             // Update lastActive
             threads[key].lastActive = Date.now();
 
+            // Apply thread-level model override (e.g. explicit Fireworks model on the thread)
+            if (threadConfig.model?.includes("fireworks")) {
+                effectiveModel = threadConfig.model;
+            }
+
             // ─── Build the full prompt ───
             const now = formatCurrentTime();
             const prefix = buildSourcePrefix(msg);
@@ -1281,8 +1290,8 @@ async function processMessage(messageFile: string): Promise<void> {
             const stderrLines: string[] = [];
             const options = await buildQueryOptions(threadId, threadConfig, effectiveModel, stderrLines);
 
-            // Create pending usage file for budget mode correlation
-            if (isBudgetMode()) {
+            // Create pending usage file for budget mode or thread-level Fireworks model correlation
+            if (isBudgetMode() || effectiveModel.includes("fireworks")) {
                 budgetUsageId = crypto.randomUUID();
                 const pendingFile = path.join(BORG_DIR, `minimax-usage-${budgetUsageId}.pending`);
                 fs.writeFileSync(pendingFile, "");
@@ -1432,7 +1441,7 @@ async function processMessage(messageFile: string): Promise<void> {
             } finally {
                 // Clean up pending usage file regardless of success or error
                 // This prevents orphaned .pending files when queries fail
-                if (budgetUsageId && isBudgetMode()) {
+                if (budgetUsageId) {
                     const pendingFile = path.join(BORG_DIR, `minimax-usage-${budgetUsageId}.pending`);
                     try {
                         if (fs.existsSync(pendingFile)) {
@@ -1453,13 +1462,11 @@ async function processMessage(messageFile: string): Promise<void> {
         }
 
         // Read budget mode usage from correlation file if applicable
-        if (budgetUsageId && isBudgetMode()) {
+        if (budgetUsageId) {
             const budgetUsage = readBudgetUsage(budgetUsageId);
             if (budgetUsage) {
                 usageData = budgetUsage;
             }
-            // Clean up correlation env var after reading (success or failure)
-            delete process.env.MINIMAX_USAGE_ID;
         }
 
         // ─── Log outgoing message to history ───
@@ -1475,7 +1482,7 @@ async function processMessage(messageFile: string): Promise<void> {
             messageId,
             ...(usageData ? {
                 costUSD: usageData.totalCostUSD,
-                inputTokens: usageData.inputTokens - usageData.cacheReadInputTokens,
+                inputTokens: usageData.inputTokens,
                 outputTokens: usageData.outputTokens,
                 cacheReadInputTokens: usageData.cacheReadInputTokens,
                 cacheCreationInputTokens: usageData.cacheCreationInputTokens,
