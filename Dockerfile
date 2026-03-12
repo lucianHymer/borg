@@ -36,6 +36,7 @@ RUN npm prune --production
 
 # ── Runtime setup ────────────────────────────────────────────────────
 COPY entrypoint.sh heartbeat-cron.sh ./
+COPY scripts/ ./scripts/
 RUN chmod +x entrypoint.sh heartbeat-cron.sh
 
 COPY docker/github-token-helper.sh /usr/local/bin/github-token-helper

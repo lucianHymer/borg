@@ -918,9 +918,11 @@ app.get("/api/usage", (_req, res) => {
     let totalCostUSD = 0;
     let totalInputTokens = 0;
     let totalOutputTokens = 0;
+    let totalCacheReadTokens = 0;
+    let totalCacheCreationTokens = 0;
 
-    const byThread = new Map<number, { costUSD: number; inputTokens: number; outputTokens: number; queries: number }>();
-    const byModel = new Map<string, { costUSD: number; inputTokens: number; outputTokens: number; queries: number }>();
+    const byThread = new Map<number, { costUSD: number; inputTokens: number; outputTokens: number; cacheReadInputTokens: number; cacheCreationInputTokens: number; queries: number }>();
+    const byModel = new Map<string, { costUSD: number; inputTokens: number; outputTokens: number; cacheReadInputTokens: number; cacheCreationInputTokens: number; queries: number }>();
     const bySource = new Map<string, { costUSD: number; queries: number }>();
     const byDay = new Map<string, { costUSD: number; queries: number; inputTokens: number; outputTokens: number }>();
 
@@ -930,6 +932,7 @@ app.get("/api/usage", (_req, res) => {
         if (lower.includes("haiku")) return "Haiku";
         if (lower.includes("sonnet")) return "Sonnet";
         if (lower.includes("opus")) return "Opus";
+        if (lower.includes("minimax")) return "M2.5";
         return model;
     }
 
@@ -937,25 +940,33 @@ app.get("/api/usage", (_req, res) => {
         const cost = e.costUSD ?? 0;
         const inp = e.inputTokens ?? 0;
         const out = e.outputTokens ?? 0;
+        const cacheRead = e.cacheReadInputTokens ?? 0;
+        const cacheCreate = e.cacheCreationInputTokens ?? 0;
 
         totalCostUSD += cost;
         totalInputTokens += inp;
         totalOutputTokens += out;
+        totalCacheReadTokens += cacheRead;
+        totalCacheCreationTokens += cacheCreate;
 
         // By thread
-        const t = byThread.get(e.threadId) ?? { costUSD: 0, inputTokens: 0, outputTokens: 0, queries: 0 };
+        const t = byThread.get(e.threadId) ?? { costUSD: 0, inputTokens: 0, outputTokens: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, queries: 0 };
         t.costUSD += cost;
         t.inputTokens += inp;
         t.outputTokens += out;
+        t.cacheReadInputTokens += cacheRead;
+        t.cacheCreationInputTokens += cacheCreate;
         t.queries++;
         byThread.set(e.threadId, t);
 
         // By model
         const modelName = friendlyModel(e.model);
-        const m = byModel.get(modelName) ?? { costUSD: 0, inputTokens: 0, outputTokens: 0, queries: 0 };
+        const m = byModel.get(modelName) ?? { costUSD: 0, inputTokens: 0, outputTokens: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, queries: 0 };
         m.costUSD += cost;
         m.inputTokens += inp;
         m.outputTokens += out;
+        m.cacheReadInputTokens += cacheRead;
+        m.cacheCreationInputTokens += cacheCreate;
         m.queries++;
         byModel.set(modelName, m);
 
@@ -982,6 +993,8 @@ app.get("/api/usage", (_req, res) => {
         totalCostUSD,
         totalInputTokens,
         totalOutputTokens,
+        totalCacheReadTokens,
+        totalCacheCreationTokens,
         totalQueries,
         byThread: Array.from(byThread.entries())
             .map(([threadId, v]) => ({
@@ -1083,6 +1096,7 @@ app.get("/api/usage/queries", (_req, res) => {
         if (lower.includes("haiku")) return "Haiku";
         if (lower.includes("sonnet")) return "Sonnet";
         if (lower.includes("opus")) return "Opus";
+        if (lower.includes("minimax")) return "M2.5";
         return model;
     }
 

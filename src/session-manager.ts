@@ -48,6 +48,7 @@ export interface Settings {
     tts_voice: string;
     tts_speed: number;
     budgetMode?: boolean;        // Use budget/cheap model instead of Claude tiers
+    fireworks_api_key?: string;  // API key for Fireworks (budget mode proxy)
 }
 
 // ─── Constants ───

@@ -160,6 +160,7 @@ tr.clickable { cursor: pointer; }
 .badge-purple { background: rgba(188,140,255,0.15); color: var(--accent-purple); }
 .badge-red { background: rgba(248,81,73,0.15); color: var(--accent-red); }
 .badge-yellow { background: rgba(210,153,34,0.15); color: var(--accent-yellow); }
+.badge-orange { background: rgba(249,115,22,0.15); color: #f97316; }
 
 .bar-container {
   width: 100%;
@@ -295,6 +296,7 @@ tr.clickable { cursor: pointer; }
 .model-haiku { color: var(--accent-green); }
 .model-sonnet { color: var(--accent-blue); }
 .model-opus { color: var(--accent-purple); }
+.model-minimax { color: var(--accent-orange, #f97316); }
 
 /* ─── Thread Detail Chat ─── */
 
@@ -996,6 +998,7 @@ tr.clickable { cursor: pointer; }
         <option value="haiku">Haiku</option>
         <option value="sonnet">Sonnet</option>
         <option value="opus">Opus</option>
+        <option value="m2.5">M2.5</option>
       </select>
       <select id="usage-filter-source" style="background:var(--bg-secondary);border:1px solid var(--border);color:var(--text-primary);padding:4px 8px;border-radius:4px;font-size:12px;">
         <option value="">All Sources</option>
@@ -1062,6 +1065,7 @@ tr.clickable { cursor: pointer; }
     if (m.includes('haiku')) return 'model-haiku';
     if (m.includes('sonnet')) return 'model-sonnet';
     if (m.includes('opus')) return 'model-opus';
+    if (m.includes('minimax')) return 'model-minimax';
     return '';
   }
 
@@ -1071,13 +1075,24 @@ tr.clickable { cursor: pointer; }
     return '<span class="badge ' + cls + '">' + escapeHtml(tier) + '</span>';
   }
 
+  function friendlyModel(model) {
+    if (!model) return 'Unknown';
+    const m = model.toLowerCase();
+    if (m.includes('haiku')) return 'Haiku';
+    if (m.includes('sonnet')) return 'Sonnet';
+    if (m.includes('opus')) return 'Opus';
+    if (m.includes('minimax')) return 'M2.5';
+    return model;
+  }
+
   function modelBadge(model) {
     if (!model) return '';
     const m = model.toLowerCase();
     let cls = 'badge-blue';
     if (m.includes('haiku')) cls = 'badge-green';
     else if (m.includes('opus')) cls = 'badge-purple';
-    return '<span class="badge ' + cls + '">' + escapeHtml(model) + '</span>';
+    else if (m.includes('minimax')) cls = 'badge-orange';
+    return '<span class="badge ' + cls + '">' + friendlyModel(model) + '</span>';
   }
 
   function formatRAM(mb) {
@@ -1604,7 +1619,7 @@ tr.clickable { cursor: pointer; }
           ' <span class="badge badge-blue">t/' + (m.threadId || '?') + '</span>' +
           ' <span>' + escapeHtml(m.sender || '?') + '</span>' +
           ' <span>' + dirArrow + '</span>' +
-          (m.model ? ' <span class="' + mCls + '">' + escapeHtml(m.model) + '</span>' : '') +
+          (m.model ? ' <span class="' + mCls + '">' + escapeHtml(friendlyModel(m.model)) + '</span>' : '') +
         '</div>' +
         '<div class="preview">' + escapeHtml(preview) + '</div>' +
         '<div class="full-content">' + escapeHtml(m.message || '') + '</div>' +
@@ -2674,6 +2689,7 @@ tr.clickable { cursor: pointer; }
     if (m.includes('haiku')) return 'model-haiku';
     if (m.includes('sonnet')) return 'model-sonnet';
     if (m.includes('opus')) return 'model-opus';
+    if (m.includes('minimax')) return 'model-minimax';
     return '';
   }
 
@@ -2693,6 +2709,7 @@ tr.clickable { cursor: pointer; }
     document.getElementById('usage-stats').innerHTML =
       '<div class="stat-card"><div class="label">Total Cost</div><div class="value" style="color:var(--accent-green)">' + fmtUSD(data.totalCostUSD) + '</div></div>' +
       '<div class="stat-card"><div class="label">Total Tokens</div><div class="value">' + fmtTokens(data.totalInputTokens + data.totalOutputTokens) + '</div></div>' +
+      '<div class="stat-card" title="Cache read: ' + fmtTokens(data.totalCacheReadTokens || 0) + ' / Cache write: ' + fmtTokens(data.totalCacheCreationTokens || 0) + '"><div class="label">Cache Tokens</div><div class="value" style="color:var(--accent-yellow)">' + fmtTokens((data.totalCacheReadTokens || 0) + (data.totalCacheCreationTokens || 0)) + '</div></div>' +
       '<div class="stat-card"><div class="label">Avg Cost/Query</div><div class="value">' + fmtUSD(avgCost) + '</div></div>' +
       '<div class="stat-card"><div class="label">Total Queries</div><div class="value" style="color:var(--accent-blue)">' + data.totalQueries + '</div></div>';
 
@@ -2740,18 +2757,21 @@ tr.clickable { cursor: pointer; }
     document.getElementById('usage-by-thread').innerHTML = threadHtml;
 
     // By Model table
-    var modelHtml = '<table><thead><tr><th>Model</th><th>Cost</th><th>Tokens</th><th>Queries</th></tr></thead><tbody>';
+    var modelHtml = '<table><thead><tr><th>Model</th><th>Cost</th><th>In</th><th>Cache↓</th><th>Cache↑</th><th>Out</th><th>Queries</th></tr></thead><tbody>';
     if (data.byModel && data.byModel.length > 0) {
       for (var i = 0; i < data.byModel.length; i++) {
         var m = data.byModel[i];
         modelHtml += '<tr>' +
           '<td class="' + modelColorClass(m.model) + '">' + escapeHtml(m.model) + '</td>' +
           '<td>' + fmtUSD(m.costUSD) + '</td>' +
-          '<td>' + fmtTokens(m.inputTokens + m.outputTokens) + '</td>' +
+          '<td>' + fmtTokens(m.inputTokens) + '</td>' +
+          '<td style="color:var(--accent-yellow)">' + (m.cacheReadInputTokens ? fmtTokens(m.cacheReadInputTokens) : '<span style="color:var(--text-secondary)">-</span>') + '</td>' +
+          '<td style="color:var(--accent-yellow);opacity:0.7">' + (m.cacheCreationInputTokens ? fmtTokens(m.cacheCreationInputTokens) : '<span style="color:var(--text-secondary)">-</span>') + '</td>' +
+          '<td>' + fmtTokens(m.outputTokens) + '</td>' +
           '<td>' + m.queries + '</td></tr>';
       }
     } else {
-      modelHtml += '<tr><td colspan="4" class="empty-state">No model data</td></tr>';
+      modelHtml += '<tr><td colspan="7" class="empty-state">No model data</td></tr>';
     }
     modelHtml += '</tbody></table>';
     document.getElementById('usage-by-model').innerHTML = modelHtml;
@@ -2837,7 +2857,7 @@ tr.clickable { cursor: pointer; }
 
     var html = '<table><thead><tr>' +
       '<th>Time</th><th>Thread</th><th>Model</th><th>Cost</th>' +
-      '<th>In Tokens</th><th>Out Tokens</th><th>Duration</th><th>Source</th><th>Preview</th>' +
+      '<th>In</th><th>Cache↓</th><th>Cache↑</th><th>Out</th><th>Duration</th><th>Source</th><th>Preview</th>' +
       '</tr></thead><tbody>';
 
     for (var i = 0; i < data.queries.length; i++) {
@@ -2849,6 +2869,8 @@ tr.clickable { cursor: pointer; }
         '<td class="' + modelColorClass(q.model) + '">' + escapeHtml(q.model) + '</td>' +
         '<td>' + fmtUSD(q.costUSD) + '</td>' +
         '<td>' + fmtTokens(q.inputTokens) + '</td>' +
+        '<td style="color:var(--accent-yellow)">' + (q.cacheReadInputTokens ? fmtTokens(q.cacheReadInputTokens) : '<span style="color:var(--text-secondary)">-</span>') + '</td>' +
+        '<td style="color:var(--accent-yellow);opacity:0.7">' + (q.cacheCreationInputTokens ? fmtTokens(q.cacheCreationInputTokens) : '<span style="color:var(--text-secondary)">-</span>') + '</td>' +
         '<td>' + fmtTokens(q.outputTokens) + '</td>' +
         '<td>' + fmtDuration(q.durationMs) + '</td>' +
         '<td>' + escapeHtml(q.source) + '</td>' +
@@ -2857,7 +2879,7 @@ tr.clickable { cursor: pointer; }
     }
 
     if (data.queries.length === 0) {
-      html += '<tr><td colspan="9" class="empty-state">No queries match filters</td></tr>';
+      html += '<tr><td colspan="11" class="empty-state">No queries match filters</td></tr>';
     }
     html += '</tbody></table>';
     document.getElementById('usage-queries-table').innerHTML = html;

@@ -17,6 +17,17 @@ const TARGET_HOST = "api.fireworks.ai";
 const TARGET_PATH = "/inference/v1/messages";
 const PORT = 9999;
 const USAGE_DIR = ".borg";
+const SETTINGS_FILE = path.join(process.cwd(), "settings.json");
+
+function getFireworksApiKey(): string | null {
+    try {
+        const data = fs.readFileSync(SETTINGS_FILE, "utf8");
+        const settings = JSON.parse(data);
+        return settings.fireworks_api_key || null;
+    } catch {
+        return null;
+    }
+}
 
 // Pricing: $0.30/M input, $0.03/M cached, $1.20/M output
 const INPUT_RATE = 0.30 / 1_000_000;
@@ -108,6 +119,13 @@ const server = http.createServer(async (req, res) => {
     const body = Buffer.concat(chunks);
 
     // Forward to Fireworks via HTTPS
+    const apiKey = getFireworksApiKey();
+    if (!apiKey) {
+        console.error(`[PROXY] ${requestId} No fireworks_api_key in settings.json`);
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "No fireworks_api_key configured in settings.json" }));
+        return;
+    }
     const targetReq = https.request({
         hostname: TARGET_HOST,
         port: 443,
@@ -117,6 +135,7 @@ const server = http.createServer(async (req, res) => {
             ...req.headers,
             Host: TARGET_HOST,
             "Content-Length": body.length,
+            authorization: `Bearer ${apiKey}`,
         },
     }, (targetRes) => {
         let responseBody = "";

@@ -37,7 +37,7 @@ echo "[init-zones] Zone directories ready"
 
 # Handle Docker's "create directory for missing file mount" quirk:
 # If threads.json or zone-config.json are empty directories, remove them first.
-for f in threads.json zone-config.json; do
+for f in threads.json zone-config.json settings.json; do
     if [ -d "$f" ] && [ -z "$(ls -A "$f" 2>/dev/null)" ]; then
         rmdir "$f"
         echo "[init-zones] Removed empty directory $f (Docker mount artifact)"
@@ -65,6 +65,21 @@ fi
 if [ ! -f threads.json ]; then
     echo "{}" > threads.json
     echo "[init-zones] Created empty threads.json"
+fi
+
+# Create shared settings.json if missing (Docker mount artifact fix).
+# Copy from infra zone settings which has the real bot token and config.
+if [ ! -f settings.json ]; then
+    if [ -f .borg-infra/settings.json ]; then
+        cp .borg-infra/settings.json settings.json
+        echo "[init-zones] Created settings.json from .borg-infra/settings.json"
+    elif [ -f .borg-core/settings.json ]; then
+        cp .borg-core/settings.json settings.json
+        echo "[init-zones] Created settings.json from .borg-core/settings.json"
+    else
+        echo "{}" > settings.json
+        echo "[init-zones] Created empty settings.json"
+    fi
 fi
 
 # ── Migrate from single-container .borg/ if present ──

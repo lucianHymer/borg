@@ -647,8 +647,10 @@ async function buildQueryOptions(
             process.env.ANTHROPIC_BASE_URL = BUDGET_PROXY_URL;
         } else {
             log("WARN", "Budget proxy unavailable, falling back to direct API");
-            // Don't set ANTHROPIC_BASE_URL - use direct API
+            delete process.env.ANTHROPIC_BASE_URL;
         }
+    } else {
+        delete process.env.ANTHROPIC_BASE_URL;
     }
 
     // Resume existing session if available
@@ -899,18 +901,30 @@ async function processHeartbeat(msg: IncomingMessage): Promise<{ text: string; u
 
     log("INFO", `Heartbeat one-shot for thread ${msg.threadId} (tier: ${dueTier})`);
 
+    const heartbeatModel = isBudgetMode() ? BUDGET_MODEL : "haiku";
+    if (isBudgetMode()) {
+        const proxyOk = await checkProxyAvailable();
+        if (proxyOk) {
+            process.env.ANTHROPIC_BASE_URL = BUDGET_PROXY_URL;
+        } else {
+            log("WARN", "Budget proxy unavailable for heartbeat");
+            delete process.env.ANTHROPIC_BASE_URL;
+        }
+    } else {
+        delete process.env.ANTHROPIC_BASE_URL;
+    }
     const stderrLines: string[] = [];
     const q = query({
         prompt: heartbeatPrompt,
         options: {
-            model: "haiku",
+            model: heartbeatModel,
             cwd: threadConfig.cwd,
             canUseTool: sdkCanUseTool,
             settingSources: ["project"],
             systemPrompt: {
                 type: "preset",
                 preset: "claude_code",
-                append: buildThreadPrompt(threadConfig, { threadId: msg.threadId, model: "haiku" }),
+                append: buildThreadPrompt(threadConfig, { threadId: msg.threadId, model: heartbeatModel }),
             },
             mcpServers: {
                 borg: createBorgMcpServer(msg.threadId),
@@ -1148,7 +1162,7 @@ async function processMessage(messageFile: string): Promise<void> {
                 }
                 return;
             }
-            effectiveModel = "haiku";
+            effectiveModel = isBudgetMode() ? BUDGET_MODEL : "haiku";
             const heartbeatResult = await processHeartbeat(msg);
             responseText = heartbeatResult.text;
             usageData = heartbeatResult.usage;

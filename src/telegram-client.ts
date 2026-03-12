@@ -506,7 +506,15 @@ for (const cmd of ["budget_on", "budget_off"] as const) {
         const currentSettings = loadSettings();
         currentSettings.budgetMode = isOn;
         // Write to shared settings.json at project root (accessible by all zones)
-        fs.writeFileSync(SHARED_SETTINGS_FILE, JSON.stringify(currentSettings, null, 2));
+        try {
+            fs.writeFileSync(SHARED_SETTINGS_FILE, JSON.stringify(currentSettings, null, 2));
+        } catch (err) {
+            log("ERROR", `Failed to write shared settings.json: ${toErrorMessage(err)}`);
+            await ctx.reply(`❌ Failed to save budget mode setting: ${toErrorMessage(err)}`, {
+                message_thread_id: ctx.msg?.message_thread_id,
+            });
+            return;
+        }
         await ctx.reply(isOn ? "💰 Budget mode enabled" : "💰 Budget mode disabled", {
             message_thread_id: ctx.msg?.message_thread_id,
         });
@@ -1018,12 +1026,12 @@ bot.on("edited_message:text", async (ctx) => {
 
 // ─── Model Reaction Emoji (single source of truth) ───
 
-// ⚡ haiku (fast), ✍ sonnet (writing), 🔥 opus (fire), 💰 budget mode (minimax via Fireworks)
+// ⚡ haiku (fast), ✍ sonnet (writing), 🔥 opus (fire), 🤡 budget mode (minimax via Fireworks)
 const MODEL_REACTIONS: Record<string, string> = {
     haiku: "⚡",
     sonnet: "✍",
     opus: "🔥",
-    "accounts/fireworks/models/minimax-m2p5": "💰",
+    "accounts/fireworks/models/minimax-m2p5": "🤡",
 };
 
 // Derived: emoji → model reverse map
@@ -1041,8 +1049,8 @@ async function reactWithModel(chatId: string | number, messageId: number, model?
     try {
         await bot.api.setMessageReaction(chatId, messageId,
             [{ type: "emoji", emoji: emoji as any }]);
-    } catch {
-        // Reactions may not be available in all groups — silently ignore
+    } catch (err) {
+        log("WARN", `Failed to set reaction ${emoji} on message ${messageId}: ${toErrorMessage(err)}`);
     }
 }
 
