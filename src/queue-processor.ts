@@ -853,7 +853,7 @@ async function collectQueryResponse(
 
 // ─── Heartbeat Processing (one-shot, no persistent session) ───
 
-async function processHeartbeat(msg: IncomingMessage): Promise<{ text: string; usage?: QueryUsageData }> {
+async function processHeartbeat(msg: IncomingMessage): Promise<{ text: string; usage?: QueryUsageData; heartbeatUsageId?: string }> {
     const threads = loadThreads();
     const threadKey = String(msg.threadId);
     const threadConfig = threads[threadKey];
@@ -902,10 +902,14 @@ async function processHeartbeat(msg: IncomingMessage): Promise<{ text: string; u
     log("INFO", `Heartbeat one-shot for thread ${msg.threadId} (tier: ${dueTier})`);
 
     const heartbeatModel = isBudgetMode() ? BUDGET_MODEL : "haiku";
+    let heartbeatUsageId: string | undefined;
     if (isBudgetMode()) {
         const proxyOk = await checkProxyAvailable();
         if (proxyOk) {
-            process.env.ANTHROPIC_BASE_URL = BUDGET_PROXY_URL;
+            heartbeatUsageId = crypto.randomUUID();
+            const pendingFile = path.join(BORG_DIR, `minimax-usage-${heartbeatUsageId}.pending`);
+            fs.writeFileSync(pendingFile, "");
+            process.env.ANTHROPIC_BASE_URL = `${BUDGET_PROXY_URL}/${heartbeatUsageId}`;
         } else {
             log("WARN", "Budget proxy unavailable for heartbeat");
             delete process.env.ANTHROPIC_BASE_URL;
@@ -950,7 +954,7 @@ async function processHeartbeat(msg: IncomingMessage): Promise<{ text: string; u
             saveLastReport(threadKey, response);
         }
 
-        return { text: response, usage };
+        return { text: response, usage, heartbeatUsageId };
     } catch (err) {
         const stderrOutput = stderrLines.join("").trim();
         log(
@@ -1166,6 +1170,10 @@ async function processMessage(messageFile: string): Promise<void> {
             const heartbeatResult = await processHeartbeat(msg);
             responseText = heartbeatResult.text;
             usageData = heartbeatResult.usage;
+            if (heartbeatResult.heartbeatUsageId) {
+                const budgetUsage = readBudgetUsage(heartbeatResult.heartbeatUsageId);
+                if (budgetUsage) usageData = budgetUsage;
+            }
 
             // Suppress heartbeat responses with no actionable content
             if (responseText.includes("[NO_UPDATES]")) {
