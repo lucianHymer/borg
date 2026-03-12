@@ -14,6 +14,7 @@ import {
     loadSettings,
     resetThread,
     configureThread,
+    SHARED_SETTINGS_FILE,
 } from "./session-manager.js";
 import type { ThreadConfig, ThreadsMap, Settings } from "./session-manager.js";
 import type { OutgoingMessage, TaskListMapping, MessageModelEntry, PendingApproval } from "./types.js";
@@ -495,6 +496,23 @@ bot.command("setdir", async (ctx) => {
     });
     log("INFO", `Thread ${threadId} cwd set to ${dir} by ${ctx.from?.first_name ?? "unknown"}`);
 });
+
+// /budget_on and /budget_off toggle budget mode (cheap model via Fireworks)
+// Writes to shared settings.json at project root - accessible by all zone containers
+for (const cmd of ["budget_on", "budget_off"] as const) {
+    bot.command(cmd, async (ctx) => {
+        if (String(ctx.chat?.id) !== settings.telegram_chat_id) return;
+        const isOn = cmd === "budget_on";
+        const currentSettings = loadSettings();
+        currentSettings.budgetMode = isOn;
+        // Write to shared settings.json at project root (accessible by all zones)
+        fs.writeFileSync(SHARED_SETTINGS_FILE, JSON.stringify(currentSettings, null, 2));
+        await ctx.reply(isOn ? "💰 Budget mode enabled" : "💰 Budget mode disabled", {
+            message_thread_id: ctx.msg?.message_thread_id,
+        });
+        log("INFO", `Budget mode ${isOn ? "enabled" : "disabled"} by ${ctx.from?.first_name ?? "unknown"}`);
+    });
+}
 
 // /compact_team resets all team sessions; an alias for /clear_team.
 for (const cmd of ["clear_team", "compact_team"] as const) {
@@ -1000,11 +1018,12 @@ bot.on("edited_message:text", async (ctx) => {
 
 // ─── Model Reaction Emoji (single source of truth) ───
 
-// ⚡ haiku (fast), ✍ sonnet (writing), 🔥 opus (fire)
+// ⚡ haiku (fast), ✍ sonnet (writing), 🔥 opus (fire), 💰 budget mode (minimax via Fireworks)
 const MODEL_REACTIONS: Record<string, string> = {
     haiku: "⚡",
     sonnet: "✍",
     opus: "🔥",
+    "accounts/fireworks/models/minimax-m2p5": "💰",
 };
 
 // Derived: emoji → model reverse map

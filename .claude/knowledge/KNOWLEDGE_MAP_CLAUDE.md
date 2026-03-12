@@ -1,6 +1,7 @@
 # Knowledge Map (Claude Reference)
 
 ## Architecture
+- @architecture/budget-mode-minimax-proxy-implementation.md
 - @architecture/usage-tracking-data-in-message-history-jsonl.md
 - @architecture/telegram-bot-commands-vs-queue-processor-command-handling.md
 - @architecture/team-mcp-tools-only-create-thread-configure-thread-disband-team.md

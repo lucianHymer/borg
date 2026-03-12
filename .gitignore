@@ -12,11 +12,15 @@ dist/
 .borg-infra/
 threads.json
 zone-config.json
+settings.json
 *.log
 
 # Docker / Secrets
 secrets/
 .env
+.env.minimax-fireworks
+.borg/minimax-usage*.json
+.borg/minimax-usage*.pending
 
 # OS files
 .DS_Store
