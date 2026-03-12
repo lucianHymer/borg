@@ -2206,6 +2206,8 @@ bot.start({
             { command: "clear", description: "Reset session (recent history preserved)" },
             { command: "compact", description: "Reset session (recent history preserved)" },
             { command: "setdir", description: "Set working directory for this thread" },
+            { command: "budget_on", description: "Enable budget mode (cheap model)" },
+            { command: "budget_off", description: "Disable budget mode" },
             { command: "status", description: "Show all active threads and their status" },
             { command: "clear_team", description: "Reset all team member sessions" },
             { command: "compact_team", description: "Reset all team member sessions" },
