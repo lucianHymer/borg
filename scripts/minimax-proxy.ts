@@ -35,8 +35,19 @@ if (!fs.existsSync(USAGE_DIR)) {
     fs.mkdirSync(USAGE_DIR, { recursive: true });
 }
 
-// Find pending request ID from .pending files
+// Find pending request ID - prefer env var, fall back to directory scan
 function findPendingRequestId(): string | null {
+    // First check for correlation ID passed via environment variable (preferred method)
+    const envUsageId = process.env.MINIMAX_USAGE_ID;
+    if (envUsageId) {
+        const pendingFile = path.join(USAGE_DIR, `minimax-usage-${envUsageId}.pending`);
+        if (fs.existsSync(pendingFile)) {
+            console.log(`[PROXY] Using correlation ID from env: ${envUsageId}`);
+            return envUsageId;
+        }
+    }
+
+    // Fall back to scanning directory for first pending file (race-prone)
     try {
         const files = fs.readdirSync(USAGE_DIR);
         for (const file of files) {
@@ -76,6 +87,13 @@ function writeUsageFile(requestId: string, usage: any, duration: number): void {
 }
 
 const server = http.createServer(async (req, res) => {
+    // Health check endpoint
+    if (req.url === "/health" && req.method === "GET") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: "ok", timestamp: new Date().toISOString() }));
+        return;
+    }
+
     // Check for pending correlation ID first
     const requestId = findPendingRequestId() || Math.random().toString(36).substring(7);
     const startTime = Date.now();

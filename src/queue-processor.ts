@@ -46,8 +46,12 @@ import {
     formatHumanTime,
     getTimedTasks,
     isBudgetMode,
+    invalidateSettingsCacheIfChanged,
     BUDGET_MODEL,
     BUDGET_PROXY_URL,
+    checkProxyAvailable,
+    getProxyAvailable,
+    resetProxyAvailable,
 } from "./session-manager.js";
 import type { ThreadConfig, HeartbeatTier, HeartbeatSections } from "./session-manager.js";
 import { z } from "zod/v4";
@@ -104,31 +108,49 @@ const TASK_LISTS_FILE = path.join(BORG_DIR, TASK_LISTS_FILENAME);
 // ─── Budget Mode Usage Reading ───
 
 /**
- * Read budget mode usage from correlation file and convert to QueryUsageData
+ * Read budget mode usage from correlation file with retry logic
+ * Uses exponential backoff to handle timing edge cases where proxy hasn't written the file yet
  */
 function readBudgetUsage(usageId: string): QueryUsageData | null {
     const usageFile = path.join(BORG_DIR, `minimax-usage-${usageId}.json`);
-    try {
-        if (fs.existsSync(usageFile)) {
-            const content = fs.readFileSync(usageFile, "utf8");
-            const data = JSON.parse(content);
-            // Convert to QueryUsageData format
-            return {
-                totalCostUSD: data.costUSD,
-                inputTokens: data.usage.input_tokens,
-                outputTokens: data.usage.output_tokens,
-                cacheReadInputTokens: data.usage.cache_read_input_tokens || 0,
-                cacheCreationInputTokens: 0,
-                durationMs: data.duration,
-                durationApiMs: data.duration,
-                numTurns: 1,
-                modelUsage: {},
-            };
+    const maxRetries = 3;
+    const initialDelayMs = 50;
+    let result: QueryUsageData | null = null;
+
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+        try {
+            if (fs.existsSync(usageFile)) {
+                const content = fs.readFileSync(usageFile, "utf8");
+                const data = JSON.parse(content);
+                // Convert to QueryUsageData format
+                result = {
+                    totalCostUSD: data.costUSD,
+                    inputTokens: data.usage.input_tokens,
+                    outputTokens: data.usage.output_tokens,
+                    cacheReadInputTokens: data.usage.cache_read_input_tokens || 0,
+                    cacheCreationInputTokens: 0,
+                    durationMs: data.duration,
+                    durationApiMs: data.duration,
+                    numTurns: 1,
+                    modelUsage: {},
+                };
+                break; // Success - exit retry loop
+            }
+        } catch (err) {
+            log("WARN", `Failed to read budget usage file ${usageId} (attempt ${attempt + 1}): ${toErrorMessage(err)}`);
         }
-    } catch (err) {
-        log("WARN", `Failed to read budget usage file ${usageId}: ${toErrorMessage(err)}`);
+
+        // Wait before retry with exponential backoff
+        if (attempt < maxRetries - 1) {
+            const delayMs = initialDelayMs * Math.pow(2, attempt);
+            const now = Date.now();
+            while (Date.now() - now < delayMs) {
+                // Busy wait - minimal delay for responsiveness
+            }
+        }
     }
-    // Clean up the usage file after reading
+
+    // Clean up the usage file after reading (success or failure)
     try {
         if (fs.existsSync(usageFile)) {
             fs.unlinkSync(usageFile);
@@ -136,7 +158,11 @@ function readBudgetUsage(usageId: string): QueryUsageData | null {
     } catch {
         // Ignore cleanup errors
     }
-    return null;
+
+    if (!result) {
+        log("WARN", `Budget usage file ${usageId} not found after ${maxRetries} attempts`);
+    }
+    return result;
 }
 
 // ─── Ensure queue directories exist ───
@@ -579,12 +605,12 @@ function updateTaskListMapping(threadId: number, taskListId: string, team?: stri
     }
 }
 
-function buildQueryOptions(
+async function buildQueryOptions(
     threadId: number,
     threadConfig: ThreadConfig,
     effectiveModel: string,
     stderrLines?: string[],
-): Options {
+): Promise<Options> {
     // Enable SDK task tracking
     const taskListId = getTaskListId(threadId, threadConfig);
     process.env.CLAUDE_CODE_TASK_LIST_ID = taskListId;
@@ -614,8 +640,15 @@ function buildQueryOptions(
     };
 
     // Use budget proxy URL when budget mode is enabled (via env var, SDK reads from process.env)
+    // Check proxy availability first - fall back to direct API if proxy unavailable
     if (isBudgetMode()) {
-        process.env.ANTHROPIC_BASE_URL = BUDGET_PROXY_URL;
+        const proxyOk = await checkProxyAvailable();
+        if (proxyOk) {
+            process.env.ANTHROPIC_BASE_URL = BUDGET_PROXY_URL;
+        } else {
+            log("WARN", "Budget proxy unavailable, falling back to direct API");
+            // Don't set ANTHROPIC_BASE_URL - use direct API
+        }
     }
 
     // Resume existing session if available
@@ -1224,13 +1257,15 @@ async function processMessage(messageFile: string): Promise<void> {
 
             // ─── Send query ───
             const stderrLines: string[] = [];
-            const options = buildQueryOptions(threadId, threadConfig, effectiveModel, stderrLines);
+            const options = await buildQueryOptions(threadId, threadConfig, effectiveModel, stderrLines);
 
             // Create pending usage file for budget mode correlation
             if (isBudgetMode()) {
                 budgetUsageId = crypto.randomUUID();
                 const pendingFile = path.join(BORG_DIR, `minimax-usage-${budgetUsageId}.pending`);
                 fs.writeFileSync(pendingFile, "");
+                // Pass correlation ID via environment variable for header-based correlation
+                process.env.MINIMAX_USAGE_ID = budgetUsageId;
             }
 
             const q = query({ prompt: fullPrompt, options });
@@ -1271,6 +1306,8 @@ async function processMessage(messageFile: string): Promise<void> {
                     }, 30_000);
                     return;
                 }
+                // Check for settings file changes (e.g., /budget_on from telegram-client)
+                invalidateSettingsCacheIfChanged();
                 writeStatus(messageId, currentStatusLabel, statusStartTime, currentPreview);
             }, 2000);
 
@@ -1370,6 +1407,22 @@ async function processMessage(messageFile: string): Promise<void> {
 
                     throw queryErr;
                 }
+            } finally {
+                // Clean up pending usage file regardless of success or error
+                // This prevents orphaned .pending files when queries fail
+                if (budgetUsageId && isBudgetMode()) {
+                    const pendingFile = path.join(BORG_DIR, `minimax-usage-${budgetUsageId}.pending`);
+                    try {
+                        if (fs.existsSync(pendingFile)) {
+                            fs.unlinkSync(pendingFile);
+                            log("DEBUG", `Cleaned up pending file: ${pendingFile}`);
+                        }
+                    } catch {
+                        // Best effort cleanup — don't throw, query may already be failing
+                    }
+                    // Clean up correlation env var to prevent stale correlation on next query
+                    delete process.env.MINIMAX_USAGE_ID;
+                }
             }
         }
 
@@ -1384,6 +1437,8 @@ async function processMessage(messageFile: string): Promise<void> {
             if (budgetUsage) {
                 usageData = budgetUsage;
             }
+            // Clean up correlation env var after reading (success or failure)
+            delete process.env.MINIMAX_USAGE_ID;
         }
 
         // ─── Log outgoing message to history ───
@@ -1460,7 +1515,26 @@ async function processMessage(messageFile: string): Promise<void> {
             fs.unlinkSync(processingFile);
         }
     } catch (error) {
-        log("ERROR", `Processing error for ${filename}: ${toErrorMessage(error)}`);
+        const errorMsg = toErrorMessage(error);
+        log("ERROR", `Processing error for ${filename}: ${errorMsg}`);
+
+        // Detect connection errors (proxy unavailable) and reset proxy availability
+        // so subsequent retries fall back to direct API
+        if (isBudgetMode() && (
+            errorMsg.includes("ECONNREFUSED") ||
+            errorMsg.includes("connect ECONNREFUSED") ||
+            errorMsg.includes("fetch failed") ||
+            errorMsg.includes("connection") ||
+            errorMsg.includes("timeout")
+        )) {
+            log("WARN", "Budget proxy connection error detected, resetting proxy state");
+            resetProxyAvailable();
+            // Ensure direct API is used on retry by clearing the env var
+            if (process.env.ANTHROPIC_BASE_URL === BUDGET_PROXY_URL) {
+                delete process.env.ANTHROPIC_BASE_URL;
+            }
+        }
+
         clearStatus(messageId);
         handleRetry(processingFile, filename, retryCount);
     }

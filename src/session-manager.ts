@@ -56,6 +56,8 @@ const SCRIPT_DIR = path.resolve(__dirname, "..");
 const BORG_DIR = path.join(SCRIPT_DIR, ".borg");
 // threads.json is at project root (shared across all zone containers via bind-mount)
 const THREADS_FILE = path.join(SCRIPT_DIR, "threads.json");
+// Shared settings.json at project root - written by infra's telegram-client, read by all zones
+export const SHARED_SETTINGS_FILE = path.join(SCRIPT_DIR, "settings.json");
 const SETTINGS_FILE = path.join(BORG_DIR, "settings.json");
 const DEFAULT_CWD = process.env.DEFAULT_CWD || process.cwd();
 export const MAX_CONCURRENT_SESSIONS = 2;
@@ -63,6 +65,49 @@ export const MAX_CONCURRENT_SESSIONS = 2;
 // Budget mode configuration
 export const BUDGET_MODEL = "accounts/fireworks/models/minimax-m2p5";
 export const BUDGET_PROXY_URL = "http://localhost:9999";
+
+// Cached proxy availability state (checked on first query, not repeatedly)
+let proxyAvailable: boolean | null = null;
+
+/**
+ * Check if budget proxy is reachable (health check with timeout)
+ */
+export async function checkProxyAvailable(): Promise<boolean> {
+    if (proxyAvailable !== null) {
+        return proxyAvailable;
+    }
+
+    try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 3000);
+
+        const response = await fetch(`${BUDGET_PROXY_URL}/health`, {
+            method: "GET",
+            signal: controller.signal,
+        });
+
+        clearTimeout(timeoutId);
+        proxyAvailable = response.ok;
+        return proxyAvailable;
+    } catch {
+        proxyAvailable = false;
+        return false;
+    }
+}
+
+/**
+ * Force recheck proxy availability (use after proxy restarts)
+ */
+export function resetProxyAvailable(): void {
+    proxyAvailable = null;
+}
+
+/**
+ * Get cached proxy availability (null = not yet checked)
+ */
+export function getProxyAvailable(): boolean | null {
+    return proxyAvailable;
+}
 
 /**
  * Check if budget mode is enabled (env var takes precedence over settings file)
@@ -81,6 +126,36 @@ let threadsCache: ThreadsMap | null = null;
 let threadsMtime: number = 0;
 let settingsCache: Settings | null = null;
 let settingsMtime: number = 0;
+
+/**
+ * Proactively invalidate settings cache if the settings file has been modified.
+ * Call this periodically (e.g., on statusInterval) to detect external changes
+ * like /budget_on command writing from telegram-client in a different container.
+ */
+export function invalidateSettingsCacheIfChanged(): void {
+    if (!settingsCache) return; // No cache to invalidate
+    try {
+        // Check shared settings file first
+        const currentMtime = fs.statSync(SHARED_SETTINGS_FILE).mtimeMs;
+        if (currentMtime !== settingsMtime) {
+            settingsCache = null;
+            settingsMtime = 0;
+        }
+    } catch {
+        // Shared file doesn't exist, check zone-specific fallback
+        try {
+            const currentMtime = fs.statSync(SETTINGS_FILE).mtimeMs;
+            if (currentMtime !== settingsMtime) {
+                settingsCache = null;
+                settingsMtime = 0;
+            }
+        } catch {
+            // Neither file exists, clear cache
+            settingsCache = null;
+            settingsMtime = 0;
+        }
+    }
+}
 
 // ─── Thread Persistence ───
 
@@ -157,6 +232,12 @@ export function deleteThreadField(threadId: number, field: keyof ThreadConfig): 
 
 // ─── Settings ───
 
+/**
+ * Load settings with two-tier fallback:
+ * 1. Shared settings.json at project root (written by infra's telegram-client)
+ * 2. Zone-specific .borg/settings.json (legacy fallback)
+ * Shared settings take precedence for cross-zone settings like budgetMode.
+ */
 export function loadSettings(): Settings {
     const defaults: Settings = {
         timezone: "UTC",
@@ -169,19 +250,37 @@ export function loadSettings(): Settings {
         tts_speed: 1.0,
     };
 
+    // Check shared settings file first (project root - accessible by all zones)
+    let settingsSource: string;
+    let data: string | null = null;
+
     try {
-        const currentMtime = fs.statSync(SETTINGS_FILE).mtimeMs;
+        const currentMtime = fs.statSync(SHARED_SETTINGS_FILE).mtimeMs;
         if (settingsCache && currentMtime === settingsMtime) {
             return settingsCache;
         }
         settingsMtime = currentMtime;
+        data = fs.readFileSync(SHARED_SETTINGS_FILE, "utf8");
+        settingsSource = SHARED_SETTINGS_FILE;
     } catch {
-        // File doesn't exist yet, fall through to read attempt
+        // Shared file doesn't exist, fall back to zone-specific settings
+        try {
+            const currentMtime = fs.statSync(SETTINGS_FILE).mtimeMs;
+            if (settingsCache && currentMtime === settingsMtime) {
+                return settingsCache;
+            }
+            settingsMtime = currentMtime;
+            data = fs.readFileSync(SETTINGS_FILE, "utf8");
+            settingsSource = SETTINGS_FILE;
+        } catch {
+            // Neither file exists, return defaults
+            settingsCache = defaults;
+            return settingsCache;
+        }
     }
 
     try {
-        const data = fs.readFileSync(SETTINGS_FILE, "utf8");
-        const parsed = JSON.parse(data) as Partial<Settings>;
+        const parsed = JSON.parse(data!) as Partial<Settings>;
         settingsCache = { ...defaults, ...parsed };
         return settingsCache;
     } catch {

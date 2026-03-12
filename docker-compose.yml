@@ -50,6 +50,7 @@ services:
       - ./.borg-perimeter:/app/.borg-perimeter
       - ./threads.json:/app/threads.json
       - ./zone-config.json:/app/zone-config.json
+      - ./settings.json:/app/settings.json
     environment:
       - NODE_ENV=production
       - BORG_ZONE=infra
@@ -79,6 +80,7 @@ services:
       - ./.borg-core:/app/.borg
       - ./threads.json:/app/threads.json
       - ./zone-config.json:/app/zone-config.json
+      - ./settings.json:/app/settings.json
       # Workspace access
       - ${WORKSPACE_ROOT}:${WORKSPACE_ROOT}
       # Credentials
@@ -121,6 +123,7 @@ services:
       - ./.borg-perimeter:/app/.borg
       - ./threads.json:/app/threads.json
       - ./zone-config.json:/app/zone-config.json
+      - ./settings.json:/app/settings.json
       # Workspace access (sandboxed by Claude Code)
       - ${WORKSPACE_ROOT}:${WORKSPACE_ROOT}
       # Credentials (limited)

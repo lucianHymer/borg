@@ -14,6 +14,7 @@ import {
     loadSettings,
     resetThread,
     configureThread,
+    SHARED_SETTINGS_FILE,
 } from "./session-manager.js";
 import type { ThreadConfig, ThreadsMap, Settings } from "./session-manager.js";
 import type { OutgoingMessage, TaskListMapping, MessageModelEntry, PendingApproval } from "./types.js";
@@ -497,15 +498,15 @@ bot.command("setdir", async (ctx) => {
 });
 
 // /budget_on and /budget_off toggle budget mode (cheap model via Fireworks)
+// Writes to shared settings.json at project root - accessible by all zone containers
 for (const cmd of ["budget_on", "budget_off"] as const) {
     bot.command(cmd, async (ctx) => {
         if (String(ctx.chat?.id) !== settings.telegram_chat_id) return;
         const isOn = cmd === "budget_on";
         const currentSettings = loadSettings();
         currentSettings.budgetMode = isOn;
-        // Write settings - session-manager writes atomically
-        const settingsPath = path.join(path.resolve(__dirname, ".."), ".borg", "settings.json");
-        fs.writeFileSync(settingsPath, JSON.stringify(currentSettings, null, 2));
+        // Write to shared settings.json at project root (accessible by all zones)
+        fs.writeFileSync(SHARED_SETTINGS_FILE, JSON.stringify(currentSettings, null, 2));
         await ctx.reply(isOn ? "💰 Budget mode enabled" : "💰 Budget mode disabled", {
             message_thread_id: ctx.msg?.message_thread_id,
         });
