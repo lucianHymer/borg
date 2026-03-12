@@ -496,6 +496,23 @@ bot.command("setdir", async (ctx) => {
     log("INFO", `Thread ${threadId} cwd set to ${dir} by ${ctx.from?.first_name ?? "unknown"}`);
 });
 
+// /budget_on and /budget_off toggle budget mode (cheap model via Fireworks)
+for (const cmd of ["budget_on", "budget_off"] as const) {
+    bot.command(cmd, async (ctx) => {
+        if (String(ctx.chat?.id) !== settings.telegram_chat_id) return;
+        const isOn = cmd === "budget_on";
+        const currentSettings = loadSettings();
+        currentSettings.budgetMode = isOn;
+        // Write settings - session-manager writes atomically
+        const settingsPath = path.join(path.resolve(__dirname, ".."), ".borg", "settings.json");
+        fs.writeFileSync(settingsPath, JSON.stringify(currentSettings, null, 2));
+        await ctx.reply(isOn ? "💰 Budget mode enabled" : "💰 Budget mode disabled", {
+            message_thread_id: ctx.msg?.message_thread_id,
+        });
+        log("INFO", `Budget mode ${isOn ? "enabled" : "disabled"} by ${ctx.from?.first_name ?? "unknown"}`);
+    });
+}
+
 // /compact_team resets all team sessions; an alias for /clear_team.
 for (const cmd of ["clear_team", "compact_team"] as const) {
     bot.command(cmd, async (ctx) => {
@@ -1000,11 +1017,12 @@ bot.on("edited_message:text", async (ctx) => {
 
 // ─── Model Reaction Emoji (single source of truth) ───
 
-// ⚡ haiku (fast), ✍ sonnet (writing), 🔥 opus (fire)
+// ⚡ haiku (fast), ✍ sonnet (writing), 🔥 opus (fire), 💰 budget mode (minimax via Fireworks)
 const MODEL_REACTIONS: Record<string, string> = {
     haiku: "⚡",
     sonnet: "✍",
     opus: "🔥",
+    "accounts/fireworks/models/minimax-m2p5": "💰",
 };
 
 // Derived: emoji → model reverse map

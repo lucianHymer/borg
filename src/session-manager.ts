@@ -47,6 +47,7 @@ export interface Settings {
     session_idle_timeout_minutes: number;
     tts_voice: string;
     tts_speed: number;
+    budgetMode?: boolean;        // Use budget/cheap model instead of Claude tiers
 }
 
 // ─── Constants ───
@@ -58,6 +59,21 @@ const THREADS_FILE = path.join(SCRIPT_DIR, "threads.json");
 const SETTINGS_FILE = path.join(BORG_DIR, "settings.json");
 const DEFAULT_CWD = process.env.DEFAULT_CWD || process.cwd();
 export const MAX_CONCURRENT_SESSIONS = 2;
+
+// Budget mode configuration
+export const BUDGET_MODEL = "accounts/fireworks/models/minimax-m2p5";
+export const BUDGET_PROXY_URL = "http://localhost:9999";
+
+/**
+ * Check if budget mode is enabled (env var takes precedence over settings file)
+ */
+export function isBudgetMode(): boolean {
+    if (process.env.BUDGET_MODE === "1" || process.env.BUDGET_MODE === "true") {
+        return true;
+    }
+    const settings = loadSettings();
+    return settings.budgetMode === true;
+}
 
 // ─── In-memory caches ───
 

@@ -45,6 +45,9 @@ import {
     parseHeartbeatSections,
     formatHumanTime,
     getTimedTasks,
+    isBudgetMode,
+    BUDGET_MODEL,
+    BUDGET_PROXY_URL,
 } from "./session-manager.js";
 import type { ThreadConfig, HeartbeatTier, HeartbeatSections } from "./session-manager.js";
 import { z } from "zod/v4";
@@ -97,6 +100,44 @@ const PROMPTS_LOG_BACKUP = path.join(BORG_DIR, "logs/prompts.1.jsonl");
 const MAX_PROMPTS_LOG_SIZE = 10 * 1024 * 1024; // 10MB
 const SESSIONS_DIR = path.join(BORG_DIR, "sessions");
 const TASK_LISTS_FILE = path.join(BORG_DIR, TASK_LISTS_FILENAME);
+
+// ─── Budget Mode Usage Reading ───
+
+/**
+ * Read budget mode usage from correlation file and convert to QueryUsageData
+ */
+function readBudgetUsage(usageId: string): QueryUsageData | null {
+    const usageFile = path.join(BORG_DIR, `minimax-usage-${usageId}.json`);
+    try {
+        if (fs.existsSync(usageFile)) {
+            const content = fs.readFileSync(usageFile, "utf8");
+            const data = JSON.parse(content);
+            // Convert to QueryUsageData format
+            return {
+                totalCostUSD: data.costUSD,
+                inputTokens: data.usage.input_tokens,
+                outputTokens: data.usage.output_tokens,
+                cacheReadInputTokens: data.usage.cache_read_input_tokens || 0,
+                cacheCreationInputTokens: 0,
+                durationMs: data.duration,
+                durationApiMs: data.duration,
+                numTurns: 1,
+                modelUsage: {},
+            };
+        }
+    } catch (err) {
+        log("WARN", `Failed to read budget usage file ${usageId}: ${toErrorMessage(err)}`);
+    }
+    // Clean up the usage file after reading
+    try {
+        if (fs.existsSync(usageFile)) {
+            fs.unlinkSync(usageFile);
+        }
+    } catch {
+        // Ignore cleanup errors
+    }
+    return null;
+}
 
 // ─── Ensure queue directories exist ───
 
@@ -572,6 +613,11 @@ function buildQueryOptions(
             : undefined,
     };
 
+    // Use budget proxy URL when budget mode is enabled (via env var, SDK reads from process.env)
+    if (isBudgetMode()) {
+        process.env.ANTHROPIC_BASE_URL = BUDGET_PROXY_URL;
+    }
+
     // Resume existing session if available
     if (threadConfig.sessionId) {
         opts.resume = threadConfig.sessionId;
@@ -874,6 +920,22 @@ async function processHeartbeat(msg: IncomingMessage): Promise<{ text: string; u
 function routeMessage(
     msg: IncomingMessage,
 ): { effectiveModel: string; decision: RoutingDecision } {
+    // Check budget mode first - bypass normal routing
+    if (isBudgetMode()) {
+        return {
+            effectiveModel: BUDGET_MODEL,
+            decision: {
+                tier: "SIMPLE" as Tier,
+                model: BUDGET_MODEL,
+                confidence: 1.0,
+                method: "rules",
+                reasoning: "budget_mode_enabled",
+                signals: ["budget_mode"],
+                estimatedTokens: 0,
+            },
+        };
+    }
+
     // Route on current message only — history context was inflating scores,
     // making model selection "sticky" even for simple follow-ups.
     // Reply-to stickiness (isReply + replyToModel → maxTier below) already
@@ -1034,6 +1096,7 @@ async function processMessage(messageFile: string): Promise<void> {
     });
 
     let responseText: string;
+    let budgetUsageId: string | undefined;
     let effectiveModel: string;
     let routingResult: { effectiveModel: string; decision: RoutingDecision } | undefined;
     let usageData: QueryUsageData | undefined;
@@ -1162,6 +1225,14 @@ async function processMessage(messageFile: string): Promise<void> {
             // ─── Send query ───
             const stderrLines: string[] = [];
             const options = buildQueryOptions(threadId, threadConfig, effectiveModel, stderrLines);
+
+            // Create pending usage file for budget mode correlation
+            if (isBudgetMode()) {
+                budgetUsageId = crypto.randomUUID();
+                const pendingFile = path.join(BORG_DIR, `minimax-usage-${budgetUsageId}.pending`);
+                fs.writeFileSync(pendingFile, "");
+            }
+
             const q = query({ prompt: fullPrompt, options });
 
             // Write initial status; the telegram-client computes elapsed time from startTs
@@ -1305,6 +1376,14 @@ async function processMessage(messageFile: string): Promise<void> {
         // Fallback for empty responses
         if (!responseText) {
             responseText = "(No response generated)";
+        }
+
+        // Read budget mode usage from correlation file if applicable
+        if (budgetUsageId && isBudgetMode()) {
+            const budgetUsage = readBudgetUsage(budgetUsageId);
+            if (budgetUsage) {
+                usageData = budgetUsage;
+            }
         }
 
         // ─── Log outgoing message to history ───
