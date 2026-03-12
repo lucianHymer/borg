@@ -1186,7 +1186,7 @@ async function processMessage(messageFile: string): Promise<void> {
                         source: "heartbeat",
                         messageId,
                         costUSD: usageData.totalCostUSD,
-                        inputTokens: usageData.inputTokens,
+                        inputTokens: usageData.inputTokens - usageData.cacheReadInputTokens,
                         outputTokens: usageData.outputTokens,
                         cacheReadInputTokens: usageData.cacheReadInputTokens,
                         cacheCreationInputTokens: usageData.cacheCreationInputTokens,
@@ -1278,8 +1278,8 @@ async function processMessage(messageFile: string): Promise<void> {
                 budgetUsageId = crypto.randomUUID();
                 const pendingFile = path.join(BORG_DIR, `minimax-usage-${budgetUsageId}.pending`);
                 fs.writeFileSync(pendingFile, "");
-                // Pass correlation ID via environment variable for header-based correlation
-                process.env.MINIMAX_USAGE_ID = budgetUsageId;
+                // Embed UUID in base URL path — proxy extracts it from the request URL
+                process.env.ANTHROPIC_BASE_URL = `${BUDGET_PROXY_URL}/${budgetUsageId}`;
             }
 
             const q = query({ prompt: fullPrompt, options });
@@ -1435,7 +1435,6 @@ async function processMessage(messageFile: string): Promise<void> {
                         // Best effort cleanup — don't throw, query may already be failing
                     }
                     // Clean up correlation env var to prevent stale correlation on next query
-                    delete process.env.MINIMAX_USAGE_ID;
                 }
             }
         }
@@ -1468,7 +1467,7 @@ async function processMessage(messageFile: string): Promise<void> {
             messageId,
             ...(usageData ? {
                 costUSD: usageData.totalCostUSD,
-                inputTokens: usageData.inputTokens,
+                inputTokens: usageData.inputTokens - usageData.cacheReadInputTokens,
                 outputTokens: usageData.outputTokens,
                 cacheReadInputTokens: usageData.cacheReadInputTokens,
                 cacheCreationInputTokens: usageData.cacheCreationInputTokens,
@@ -1544,7 +1543,7 @@ async function processMessage(messageFile: string): Promise<void> {
             log("WARN", "Budget proxy connection error detected, resetting proxy state");
             resetProxyAvailable();
             // Ensure direct API is used on retry by clearing the env var
-            if (process.env.ANTHROPIC_BASE_URL === BUDGET_PROXY_URL) {
+            if (process.env.ANTHROPIC_BASE_URL?.startsWith(BUDGET_PROXY_URL)) {
                 delete process.env.ANTHROPIC_BASE_URL;
             }
         }

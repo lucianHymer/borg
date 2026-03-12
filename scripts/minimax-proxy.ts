@@ -105,8 +105,9 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
-    // Check for pending correlation ID first
-    const requestId = findPendingRequestId() || Math.random().toString(36).substring(7);
+    // Extract correlation UUID from URL path: /<uuid>/v1/messages
+    const uuidMatch = req.url?.match(/^\/([0-9a-f-]{36})\//);
+    const requestId = uuidMatch ? uuidMatch[1] : (findPendingRequestId() || Math.random().toString(36).substring(7));
     const startTime = Date.now();
 
     console.log(`[PROXY] ${requestId} ${req.method} ${req.url}`);
@@ -118,6 +119,12 @@ const server = http.createServer(async (req, res) => {
     }
     const body = Buffer.concat(chunks);
 
+    // Log request body for debugging (truncated)
+    try {
+        const parsed = JSON.parse(body.toString());
+        console.log(`[PROXY] ${requestId} req model=${parsed.model} msgs=${parsed.messages?.length} betas=${JSON.stringify(parsed.betas)} tools=${parsed.tools?.length ?? 0}`);
+    } catch { /* ignore */ }
+
     // Forward to Fireworks via HTTPS
     const apiKey = getFireworksApiKey();
     if (!apiKey) {
@@ -126,6 +133,31 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify({ error: "No fireworks_api_key configured in settings.json" }));
         return;
     }
+
+    // Sanitize request body for Fireworks compatibility:
+    // 1. Strip "thinking" content blocks from message history (Fireworks rejects them in history)
+    // 2. Remove "context_management" field (Claude Code SDK extension, unknown to Fireworks)
+    let forwardBody = body;
+    try {
+        const parsed = JSON.parse(body.toString());
+        let modified = false;
+        if (Array.isArray(parsed.messages)) {
+            parsed.messages = parsed.messages.map((msg: any) => {
+                if (msg.role === "assistant" && Array.isArray(msg.content)) {
+                    const filtered = msg.content.filter((c: any) => c.type !== "thinking");
+                    return { ...msg, content: filtered.length === 1 && typeof filtered[0]?.text === "string" ? filtered[0].text : filtered };
+                }
+                return msg;
+            });
+            modified = true;
+        }
+        if ("context_management" in parsed) {
+            delete parsed.context_management;
+            modified = true;
+        }
+        if (modified) forwardBody = Buffer.from(JSON.stringify(parsed));
+    } catch { /* leave body unchanged */ }
+
     const targetReq = https.request({
         hostname: TARGET_HOST,
         port: 443,
@@ -134,7 +166,7 @@ const server = http.createServer(async (req, res) => {
         headers: {
             ...req.headers,
             Host: TARGET_HOST,
-            "Content-Length": body.length,
+            "Content-Length": forwardBody.length,
             authorization: `Bearer ${apiKey}`,
             "x-api-key": apiKey,
         },
@@ -166,17 +198,15 @@ const server = http.createServer(async (req, res) => {
                         currentEvent = line.substring(6).trim();
                     } else if (line.startsWith("data:")) {
                         const dataStr = line.substring(5).trim();
-                        // Check for usage in message, message_delta, or message_stop events
+                        // Fireworks sends final usage in message_delta (not message_stop)
                         if (currentEvent === "message" || currentEvent === "message_delta" || currentEvent === "message_stop") {
                             try {
                                 const data = JSON.parse(dataStr);
-                                if (data.usage || (data.delta && data.delta.usage)) {
-                                    const usage = data.usage || data.delta.usage;
+                                const usage = data.usage || (data.delta && data.delta.usage);
+                                if (usage && usage.input_tokens) {
                                     capturedUsage = usage;
-                                    // Write to correlation file (only final message_stop has complete usage)
-                                    if (currentEvent === "message_stop") {
-                                        writeUsageFile(requestId, usage, duration);
-                                    }
+                                    // Write on every update — last one wins with final counts
+                                    writeUsageFile(requestId, usage, duration);
                                 }
                             } catch {
                                 // Not JSON, skip
@@ -189,6 +219,10 @@ const server = http.createServer(async (req, res) => {
                 try {
                     const data = JSON.parse(responseBody);
                     console.log(`[PROXY] ${requestId} Parsed JSON, keys: ${Object.keys(data)}`);
+                    if (data.error) {
+                        console.log(`[PROXY] ${requestId} Error response: ${responseBody.substring(0, 300)}`);
+                        console.log(`[PROXY] ${requestId} Request body size: ${forwardBody.length} bytes, tool names: ${(() => { try { return JSON.parse(forwardBody.toString()).tools?.map((t: any) => t.name).join(',') ?? 'none'; } catch { return 'parse-err'; } })()}`);
+                    }
 
                     if (data.usage) {
                         capturedUsage = data.usage;
@@ -209,7 +243,7 @@ const server = http.createServer(async (req, res) => {
         res.end("Proxy error");
     });
 
-    targetReq.write(body);
+    targetReq.write(forwardBody);
     targetReq.end();
 });
 
