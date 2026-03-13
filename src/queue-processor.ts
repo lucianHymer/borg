@@ -624,7 +624,7 @@ async function buildQueryOptions(
         model: effectiveModel,
         cwd: threadConfig.cwd,
         canUseTool: sdkCanUseTool,
-        settingSources: ["project"],
+        settingSources: ["project", "user"],
         systemPrompt: {
             type: "preset",
             preset: "claude_code",
@@ -928,7 +928,7 @@ async function processHeartbeat(msg: IncomingMessage): Promise<{ text: string; u
             model: heartbeatModel,
             cwd: threadConfig.cwd,
             canUseTool: sdkCanUseTool,
-            settingSources: ["project"],
+            settingSources: ["project", "user"],
             systemPrompt: {
                 type: "preset",
                 preset: "claude_code",
