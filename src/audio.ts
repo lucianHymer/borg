@@ -93,17 +93,57 @@ export async function transcribe(oggPath: string): Promise<string> {
     return data.text?.trim() ?? "";
 }
 
-// ─── TTS: Text → OGG/Opus file ───
+// ─── TTS: Text → MP3 file ───
 
-export async function synthesize(text: string, voice?: string, speed?: number): Promise<string> {
+/** Max chars per TTS chunk — Kokoro-82M truncates beyond ~500 tokens. */
+const TTS_CHUNK_SIZE = 800;
+
+/** Split text into chunks at sentence boundaries, respecting max size. */
+function chunkText(text: string, maxLen: number): string[] {
+    if (text.length <= maxLen) return [text];
+
+    const chunks: string[] = [];
+    let remaining = text;
+
+    while (remaining.length > 0) {
+        if (remaining.length <= maxLen) {
+            chunks.push(remaining);
+            break;
+        }
+
+        // Find last sentence boundary within maxLen
+        const window = remaining.slice(0, maxLen);
+        let splitAt = -1;
+        // Prefer sentence-ending punctuation followed by space or end
+        for (const sep of [". ", "! ", "? ", ".\n", "!\n", "?\n"]) {
+            const idx = window.lastIndexOf(sep);
+            if (idx > splitAt) splitAt = idx + sep.length;
+        }
+        // Fallback: split at last space
+        if (splitAt <= 0) {
+            splitAt = window.lastIndexOf(" ");
+        }
+        // Last resort: hard split
+        if (splitAt <= 0) {
+            splitAt = maxLen;
+        }
+
+        chunks.push(remaining.slice(0, splitAt).trim());
+        remaining = remaining.slice(splitAt).trim();
+    }
+
+    return chunks.filter(c => c.length > 0);
+}
+
+async function synthesizeChunk(text: string, voice: string, speed: number): Promise<Buffer> {
     const res = await fetch(`${SPEACHES_URL}/v1/audio/speech`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
             model: TTS_MODEL,
-            voice: voice ?? "bf_alice",
+            voice,
             input: text,
-            speed: speed ?? 1.0,
+            speed,
             response_format: "mp3",
         }),
         signal: AbortSignal.timeout(60_000),
@@ -114,11 +154,26 @@ export async function synthesize(text: string, voice?: string, speed?: number): 
         throw new Error(`TTS failed (${res.status}): ${body}`);
     }
 
-    const arrayBuffer = await res.arrayBuffer();
+    return Buffer.from(await res.arrayBuffer());
+}
+
+export async function synthesize(text: string, voice?: string, speed?: number): Promise<string> {
+    const v = voice ?? "bf_alice";
+    const s = speed ?? 1.0;
+    const chunks = chunkText(text, TTS_CHUNK_SIZE);
+
+    // Synthesize all chunks (sequentially — Speaches queues internally)
+    const buffers: Buffer[] = [];
+    for (const chunk of chunks) {
+        buffers.push(await synthesizeChunk(chunk, v, s));
+    }
+
+    // Concatenate MP3 frames (MP3 is frame-based, simple concat works)
+    const combined = Buffer.concat(buffers);
     const filename = `tts_${Date.now()}_${Math.random().toString(36).slice(2, 6)}.mp3`;
     const outPath = path.join(AUDIO_DIR, filename);
     const tmpPath = outPath + ".tmp";
-    fs.writeFileSync(tmpPath, Buffer.from(arrayBuffer));
+    fs.writeFileSync(tmpPath, combined);
     fs.renameSync(tmpPath, outPath);
 
     return outPath;
