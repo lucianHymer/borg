@@ -61,7 +61,6 @@ services:
       resources:
         limits:
           memory: 512M
-          cpus: '1.0'
 
   # ── Core: agent SDK sessions for trusted threads ──
   core:
@@ -104,7 +103,6 @@ services:
       resources:
         limits:
           memory: 2G
-          cpus: '2.0'
 
   # ── Perimeter: agent SDK sessions for untrusted threads ──
   perimeter:
@@ -144,7 +142,6 @@ services:
       resources:
         limits:
           memory: 1G
-          cpus: '1.0'
 
   docker-proxy:
     image: wollomatic/socket-proxy:1
