@@ -1236,7 +1236,6 @@ async function processMessage(messageFile: string): Promise<void> {
                 threadConfig = {
                     name: msg.topicName ?? `Thread ${threadId}`,
                     cwd: defaultCwd,
-                    model: effectiveModel,
                     isMaster: false,
                     lastActive: Date.now(),
                 };
@@ -1393,7 +1392,6 @@ async function processMessage(messageFile: string): Promise<void> {
                     if (result.sessionId) {
                         updateThread(threadId, {
                             sessionId: result.sessionId,
-                            model: effectiveModel,
                             lastActive: Date.now(),
                         });
                     }
@@ -1409,7 +1407,6 @@ async function processMessage(messageFile: string): Promise<void> {
                     if (result.sessionId) {
                         updateThread(threadId, {
                             sessionId: result.sessionId,
-                            model: effectiveModel,
                             lastActive: Date.now(),
                         });
                         const cwd = loadThreads()[String(threadId)]?.cwd;
@@ -1730,9 +1727,9 @@ async function processQueue(): Promise<void> {
             if (msg.source === 'heartbeat' && activeHeartbeatCount >= 1) continue;
 
             // Coalesce: grab other queued messages for the same thread
-            // Skip command messages (starting with /) and non-user sources
+            // Skip command messages (starting with /), non-user sources, and voice/image messages
             const coalesced: QueueFile[] = [];
-            if (!msg.message.startsWith("/")) {
+            if (!msg.message.startsWith("/") && !msg.audioPath && !msg.imagePath) {
                 for (const other of files) {
                     if (other === file) continue;
                     try {
@@ -1742,6 +1739,7 @@ async function processQueue(): Promise<void> {
                         const otherMsg = otherParsed.data;
                         if (otherMsg.threadId !== msg.threadId) continue;
                         if (otherMsg.message.startsWith("/")) continue;
+                        if (otherMsg.audioPath || otherMsg.imagePath) continue;
                         coalesced.push(other);
                         // Append text to primary message
                         msg.message = msg.message + "\n\n" + otherMsg.message;
