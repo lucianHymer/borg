@@ -1278,6 +1278,7 @@ async function processMessage(messageFile: string): Promise<void> {
                 threadConfig = {
                     name: msg.topicName ?? `Thread ${threadId}`,
                     cwd: defaultCwd,
+                    model: "sonnet",
                     isMaster: false,
                     lastActive: Date.now(),
                 };
