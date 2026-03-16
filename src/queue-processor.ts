@@ -1327,7 +1327,12 @@ async function processMessage(messageFile: string): Promise<void> {
                     currentStatusLabel = "Cancelled";
                     writeStatus(messageId, currentStatusLabel, statusStartTime, currentPreview);
                     try { fs.unlinkSync(cancelFile); } catch { /* best effort */ }
-                    try { await q.interrupt(); } catch { /* process may be gone */ }
+                    // Race interrupt() against a 10s timeout — if the SDK subprocess
+                    // hangs (e.g. waiting on a background task), we can't block this
+                    // callback forever or the cancel timeout never gets scheduled and
+                    // the processing slot is permanently stuck.
+                    const interruptTimeout = new Promise<void>((r) => setTimeout(r, 10_000));
+                    Promise.race([q.interrupt(), interruptTimeout]).catch(() => { /* process may be gone */ });
                     log("INFO", `Cancelled processing for ${messageId}`);
                     // Safety net: if collectQueryResponse doesn't return within 30s
                     // after interrupt, resolve the cancel timeout to unblock the race
