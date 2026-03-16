@@ -2875,23 +2875,23 @@ tr.clickable { cursor: pointer; }
       var bo = modelOrder[b.model] != null ? modelOrder[b.model] : 99;
       return ao - bo;
     });
-    var modelHtml = '<table><thead><tr><th>Model</th><th>Cost</th><th>Tokens</th><th>Queries</th><th>Avg/Query</th><th>Avg/Mtok</th></tr></thead><tbody>';
+    var modelHtml = '<table><thead><tr><th>Model</th><th>Cost</th><th>IN</th><th>CACHE↓</th><th>CACHE↑</th><th>OUT</th><th>Queries</th><th>Avg/Query</th></tr></thead><tbody>';
     if (sortedModels.length > 0) {
       for (var i = 0; i < sortedModels.length; i++) {
         var m = sortedModels[i];
-        var totalTok = m.inputTokens + m.outputTokens;
         var avgPerQuery = m.queries > 0 ? fmtUSD(m.costUSD / m.queries) : '-';
-        var avgPerMtok = totalTok > 0 ? '$' + (m.costUSD / totalTok * 1e6).toFixed(2) + '/Mtok' : '-';
         modelHtml += '<tr>' +
           '<td class="' + modelColorClass(m.model) + '">' + escapeHtml(m.model) + '</td>' +
           '<td>' + fmtUSD(m.costUSD) + '</td>' +
-          '<td>' + fmtTokens(totalTok) + '</td>' +
+          '<td>' + fmtTokens(m.inputTokens) + '</td>' +
+          '<td style="color:var(--accent-yellow)">' + (m.cacheReadInputTokens ? fmtTokens(m.cacheReadInputTokens) : '<span style="color:var(--text-secondary)">-</span>') + '</td>' +
+          '<td style="color:var(--accent-yellow);opacity:0.7">' + (m.cacheCreationInputTokens ? fmtTokens(m.cacheCreationInputTokens) : '<span style="color:var(--text-secondary)">-</span>') + '</td>' +
+          '<td>' + fmtTokens(m.outputTokens) + '</td>' +
           '<td>' + m.queries + '</td>' +
-          '<td>' + avgPerQuery + '</td>' +
-          '<td>' + avgPerMtok + '</td></tr>';
+          '<td>' + avgPerQuery + '</td></tr>';
       }
     } else {
-      modelHtml += '<tr><td colspan="6" class="empty-state">No model data</td></tr>';
+      modelHtml += '<tr><td colspan="8" class="empty-state">No model data</td></tr>';
     }
     modelHtml += '</tbody></table>';
     document.getElementById('usage-by-model').innerHTML = modelHtml;
