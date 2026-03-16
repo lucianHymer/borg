@@ -30,6 +30,7 @@ Container-level isolation. Agents are separated into **Core** (trusted) and **Pe
 - `.borg/threads.json` — thread configurations (threadId → session mapping)
 - `.borg/message-history.jsonl` — all messages across all threads
 - `.borg/message-models.json` — Telegram messageId → model mapping
+- `.borg/scheduled-tasks.json` — durable cron-based scheduled tasks
 - `.borg/settings.json` — bot token, chat ID, timezone, intervals
 - `zone-config.json` — thread-to-zone mapping (see Security Zones)
 - `HEARTBEAT.md` — living task list for heartbeat checks (per-repo)
@@ -44,11 +45,15 @@ Agents communicate through the file queue system:
 
 ## Message Sources
 
-Queue messages carry a `source` field: `"user"`, `"cross-thread"`, `"heartbeat"`, `"cli"`, `"system"`, `"broadcast"`.
+Queue messages carry a `source` field: `"user"`, `"cross-thread"`, `"heartbeat"`, `"cli"`, `"system"`, `"broadcast"`, `"scheduled-task"`.
 
 ## Model Selection
 
 Sticky per-thread model — each thread uses its configured model for all messages (`threadConfig.model`). Default: `sonnet[1m]`. Change via `/model <haiku|sonnet|opus>` (also resets the session to maximize prompt cache hits). The `[1m]` suffix enables 1M context window. Effort defaults to `medium`; include "ultrathink" in a message for `max` (opus) or `high` (sonnet). Heartbeats are always haiku one-shot sessions (no resume, no cache sharing with the main thread).
+
+## Scheduled Tasks
+
+Durable cron-based task scheduling via `.borg/scheduled-tasks.json`. Tasks survive restarts and support per-task model selection. Cron expressions use the bot's configured timezone (from settings.json). Execution is one-shot (no session resume) to avoid cache entanglement. MCP tools: `create_scheduled_task`, `list_scheduled_tasks`, `update_scheduled_task`, `delete_scheduled_task`. SDK's built-in CronCreate/CronDelete/CronList are denied (session-only, won't survive restarts). Dashboard shows task status at `/api/scheduled-tasks`.
 
 ## Coding Conventions
 

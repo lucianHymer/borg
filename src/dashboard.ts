@@ -7,6 +7,7 @@ import express from "express";
 import fs from "fs";
 import path from "path";
 import http from "http";
+import { Cron } from "croner";
 import {
     type DockerContainerInspect,
     fetchDockerJson,
@@ -1130,6 +1131,68 @@ app.get("/api/usage/queries", (_req, res) => {
         offset,
         limit,
     });
+});
+
+// GET /api/scheduled-tasks — all scheduled tasks with next run times
+app.get("/api/scheduled-tasks", (_req, res) => {
+    // Read scheduled-tasks.json from all zone directories
+    const zoneDirs = [
+        BORG_DIR,
+        path.join(SCRIPT_DIR, ".borg-core"),
+        path.join(SCRIPT_DIR, ".borg-perimeter"),
+    ];
+
+    interface TaskEntry {
+        id: string;
+        name: string;
+        model: string;
+        cron: string;
+        cwd: string;
+        reportThreadId: number;
+        enabled: boolean;
+        recurring: boolean;
+        createdAt: number;
+        lastRunTs?: number;
+        lastResult?: string;
+        lastCostUSD?: number;
+    }
+
+    const allTasks: TaskEntry[] = [];
+    const seenIds = new Set<string>();
+
+    for (const dir of zoneDirs) {
+        const file = path.join(dir, "scheduled-tasks.json");
+        try {
+            const data = JSON.parse(fs.readFileSync(file, "utf8"));
+            for (const task of (data.tasks ?? [])) {
+                if (!seenIds.has(task.id)) {
+                    seenIds.add(task.id);
+                    allTasks.push(task);
+                }
+            }
+        } catch { /* file doesn't exist or is invalid */ }
+    }
+
+    // Compute next run times using Croner
+    let settingsTimezone = "UTC";
+    try {
+        const settingsFile = path.join(SCRIPT_DIR, "settings.json");
+        const settings = JSON.parse(fs.readFileSync(settingsFile, "utf8"));
+        settingsTimezone = settings.timezone || "UTC";
+    } catch { /* ignore */ }
+
+    const tasksWithNext = allTasks.map(t => {
+        let nextRun: string | null = null;
+        try {
+            const cron = new Cron(t.cron, { timezone: settingsTimezone });
+            const next = cron.nextRun();
+            nextRun = next ? next.toISOString() : null;
+        } catch { /* invalid cron */ }
+
+        return { ...t, nextRun, timezone: settingsTimezone };
+    });
+
+    res.json({ tasks: tasksWithNext });
 });
 
 // ─── Start Server ───

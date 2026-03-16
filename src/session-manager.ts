@@ -302,7 +302,7 @@ export const canUseTool: CanUseTool = async (toolName, input) => {
     if (toolName === "CronCreate" || toolName === "CronDelete" || toolName === "CronList") {
         return {
             behavior: "deny",
-            message: "Cron tools are session-only and won't survive restarts. Read ~/.claude/skills/scheduled-opus-tasks.md for how to schedule tasks durably.",
+            message: "SDK cron tools are session-only and won't survive restarts. Use the Borg MCP tools instead: create_scheduled_task, list_scheduled_tasks, update_scheduled_task, delete_scheduled_task. These persist across restarts and support model selection.",
         };
     }
     if (toolName === "EnterPlanMode" || toolName === "ExitPlanMode") {
@@ -595,6 +595,12 @@ function buildMcpToolsBlock(isMaster: boolean): string {
         "- `get_routing_decisions` — Get recent routing decisions with model, confidence, prompt text, and any user corrections",
         "- `get_current_time` — Get the current date and time in any timezone",
         "- `get_elapsed_time` — Calculate how much time has passed since a timestamp",
+        "",
+        "Scheduled task tools (durable cron jobs, persist across restarts):",
+        "- `create_scheduled_task` — Create a cron-based task (name, prompt, model, cron, cwd, reportThreadId). Cron uses bot timezone.",
+        "- `list_scheduled_tasks` — List all tasks with status and next run times",
+        "- `update_scheduled_task` — Update a task (id + fields to change, e.g. enabled: false to pause)",
+        "- `delete_scheduled_task` — Delete a task by ID",
         "",
         "Team management tools:",
         "- `create_thread` — Create a new Telegram forum topic and register it as a Borg thread (with optional team/role)",

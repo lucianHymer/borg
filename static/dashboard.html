@@ -838,6 +838,7 @@ tr.clickable { cursor: pointer; }
   <a href="#logs" data-view="logs">Logs</a>
   <a href="#memory" data-view="memory">Memory</a>
   <a href="#heartbeats" data-view="heartbeats">Heartbeats</a>
+  <a href="#tasks" data-view="tasks">Tasks</a>
   <a href="#usage" data-view="usage">Usage</a>
   <div id="conn-status">
     <div id="conn-dot" class="connecting"></div>
@@ -962,6 +963,15 @@ tr.clickable { cursor: pointer; }
       <span id="heartbeats-meta" style="color:var(--text-secondary);font-size:11px;"></span>
     </div>
     <div id="heartbeats-list"></div>
+  </div>
+
+  <!-- View: Scheduled Tasks -->
+  <div id="view-tasks" class="view">
+    <h2 style="margin-bottom:12px;">Scheduled Tasks</h2>
+    <div style="display:flex;gap:8px;margin-bottom:16px;align-items:center;">
+      <span id="tasks-meta" style="color:var(--text-secondary);font-size:11px;"></span>
+    </div>
+    <div id="tasks-table"></div>
   </div>
 
   <!-- View: Usage -->
@@ -1239,6 +1249,7 @@ tr.clickable { cursor: pointer; }
       case 'logs': initLogs(); break;
       case 'memory': initMemory(); break;
       case 'heartbeats': initHeartbeats(); break;
+      case 'tasks': initTasks(); break;
       case 'usage': initUsage(); break;
     }
   }
@@ -2651,6 +2662,53 @@ tr.clickable { cursor: pointer; }
   }
 
   // ─── View: Usage ───
+
+  // ─── Scheduled Tasks View ───
+
+  function initTasks() {
+    fetchTasks();
+  }
+
+  async function fetchTasks() {
+    var data = await api('/api/scheduled-tasks');
+    if (!data || !data.tasks) {
+      document.getElementById('tasks-table').innerHTML = '<div class="empty-state">No scheduled tasks</div>';
+      document.getElementById('tasks-meta').textContent = '';
+      return;
+    }
+
+    var tasks = data.tasks;
+    document.getElementById('tasks-meta').textContent = tasks.length + ' task(s)' + (tasks.length > 0 ? ' · timezone: ' + (tasks[0].timezone || 'UTC') : '');
+
+    if (tasks.length === 0) {
+      document.getElementById('tasks-table').innerHTML = '<div class="empty-state">No scheduled tasks. Create one with the create_scheduled_task MCP tool.</div>';
+      return;
+    }
+
+    var html = '<table><thead><tr><th>Name</th><th>Model</th><th>Cron</th><th>Next Run</th><th>Last Run</th><th>Last Cost</th><th>Status</th></tr></thead><tbody>';
+    for (var i = 0; i < tasks.length; i++) {
+      var t = tasks[i];
+      var nextRun = t.nextRun ? fmtTime(new Date(t.nextRun).getTime()) : 'N/A';
+      var lastRun = t.lastRunTs ? fmtTime(t.lastRunTs) : 'never';
+      var lastCost = t.lastCostUSD != null ? fmtUSD(t.lastCostUSD) : '-';
+      var statusColor = !t.enabled ? 'var(--text-secondary)' : t.lastResult === 'error' ? 'var(--accent-red, #ff6b6b)' : 'var(--accent-green)';
+      var statusText = !t.enabled ? 'disabled' : t.lastResult || 'pending';
+      var modelClass = modelColorClass(t.model.replace('[1m]', ''));
+      html += '<tr title="ID: ' + escapeHtml(t.id) + '\nCWD: ' + escapeHtml(t.cwd) + '\nReport to: Thread ' + t.reportThreadId + '\nRecurring: ' + t.recurring + '">' +
+        '<td>' + escapeHtml(t.name) + '</td>' +
+        '<td class="' + modelClass + '">' + escapeHtml(t.model.replace('[1m]', '')) + '</td>' +
+        '<td style="font-family:monospace;font-size:11px;">' + escapeHtml(t.cron) + '</td>' +
+        '<td>' + nextRun + '</td>' +
+        '<td>' + lastRun + '</td>' +
+        '<td>' + lastCost + '</td>' +
+        '<td style="color:' + statusColor + '">' + statusText + '</td>' +
+        '</tr>';
+    }
+    html += '</tbody></table>';
+    document.getElementById('tasks-table').innerHTML = html;
+  }
+
+  // ─── Usage View ───
 
   var usageDays = 7;
   var queryOffset = 0;

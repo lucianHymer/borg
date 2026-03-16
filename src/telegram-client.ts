@@ -1361,7 +1361,11 @@ async function pollOutgoingQueue(): Promise<void> {
 
                         // Fallback: send to the configured chat, routing to the correct thread
                         const chatId = settings.telegram_chat_id;
-                        const markdownV2Fallback = toTelegramMarkdownV2(data.message);
+                        // Frame scheduled task output for human readability
+                        const messageToSend = data.scheduledTaskName
+                            ? `**Scheduled task "${data.scheduledTaskName}"**\n\n${data.message}`
+                            : data.message;
+                        const markdownV2Fallback = toTelegramMarkdownV2(messageToSend);
                         const chunks = splitMessage(markdownV2Fallback);
                         const threadOpt = data.threadId && data.threadId !== 1
                             ? { message_thread_id: data.threadId }

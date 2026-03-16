@@ -52,11 +52,13 @@ import {
     resetProxyAvailable,
 } from "./session-manager.js";
 import type { ThreadConfig, HeartbeatTier, HeartbeatSections } from "./session-manager.js";
+import { loadTasks, getDueTasks, markTaskComplete } from "./scheduled-tasks.js";
+import type { ScheduledTask } from "./scheduled-tasks.js";
 import { z } from "zod/v4";
 
 // ─── Zod Schemas for Queue Messages ───
 
-const MessageSourceSchema = z.enum(["user", "cross-thread", "heartbeat", "cli", "system", "broadcast"]);
+const MessageSourceSchema = z.enum(["user", "cross-thread", "heartbeat", "cli", "system", "broadcast", "scheduled-task"]);
 
 const IncomingMessageSchema = z.object({
     channel: z.string(),
@@ -482,6 +484,7 @@ let activeCount = 0;
 const activeThreads = new Set<number>();
 let scanning = false;
 let activeHeartbeatCount = 0;
+let activeScheduledTaskCount = 0;
 
 // ─── SDK canUseTool Adapter ───
 
@@ -519,6 +522,7 @@ function buildSourcePrefix(msg: IncomingMessage): string {
         cli: `[CLI message]:`,
         system: `[System event]:`,
         broadcast: `[Broadcast]:`,
+        "scheduled-task": `[Scheduled task]:`,
     };
     return prefixMap[msg.source ?? "user"];
 }
@@ -963,6 +967,78 @@ async function processHeartbeat(msg: IncomingMessage): Promise<{ text: string; u
     }
 }
 
+// ─── Scheduled Task Processing (one-shot, no persistent session) ───
+
+async function processScheduledTask(task: ScheduledTask): Promise<{ text: string; usage?: QueryUsageData }> {
+    const threads = loadThreads();
+    const settings = loadSettings();
+    const reportThread = threads[String(task.reportThreadId)];
+    const threadName = reportThread?.name ?? `Thread ${task.reportThreadId}`;
+
+    const systemPreamble = [
+        `You are running as a scheduled task.`,
+        `Task: ${task.name}`,
+        `Schedule: ${task.cron} (${settings.timezone || "UTC"})`,
+        `Your output will be posted to thread "${threadName}" (ID: ${task.reportThreadId}).`,
+        `Be concise and actionable. If there's nothing to report, say so briefly.`,
+    ].join("\n");
+
+    // Budget mode proxy setup (same as heartbeats)
+    const isFireworksModel = task.model.includes("fireworks");
+    const needsProxy = isFireworksModel || isBudgetMode();
+
+    if (needsProxy) {
+        const proxyOk = await checkProxyAvailable();
+        if (proxyOk) {
+            const usageId = crypto.randomUUID();
+            const pendingFile = path.join(BORG_DIR, `minimax-usage-${usageId}.pending`);
+            fs.writeFileSync(pendingFile, "");
+            process.env.ANTHROPIC_BASE_URL = `${BUDGET_PROXY_URL}/${usageId}`;
+        } else {
+            delete process.env.ANTHROPIC_BASE_URL;
+        }
+    } else {
+        delete process.env.ANTHROPIC_BASE_URL;
+    }
+
+    const taskModel = isBudgetMode() ? BUDGET_MODEL : task.model;
+    const stderrLines: string[] = [];
+    const q = query({
+        prompt: task.prompt,
+        options: {
+            model: taskModel,
+            effort: "medium",
+            cwd: task.cwd,
+            canUseTool: sdkCanUseTool,
+            settingSources: ["project", "user"],
+            systemPrompt: {
+                type: "preset",
+                preset: "claude_code",
+                append: systemPreamble,
+            },
+            mcpServers: {
+                borg: createBorgMcpServer(task.reportThreadId),
+            },
+            permissionMode: "bypassPermissions",
+            allowDangerouslySkipPermissions: true,
+            stderr: (data: string) => { stderrLines.push(data); },
+        },
+    });
+
+    try {
+        const { text, usage } = await collectQueryResponse(q);
+        return { text: text.trim() || "[No output]", usage };
+    } catch (err) {
+        const stderrOutput = stderrLines.join("").trim();
+        log(
+            "ERROR",
+            `Scheduled task "${task.name}" query error: ${toErrorMessage(err)}` +
+                (stderrOutput ? `\n  stderr: ${stderrOutput.slice(0, 2000)}` : ""),
+        );
+        throw err;
+    }
+}
+
 // ─── Process a Single Message ───
 
 async function processMessage(messageFile: string): Promise<void> {
@@ -1104,10 +1180,37 @@ async function processMessage(messageFile: string): Promise<void> {
     let budgetUsageId: string | undefined;
     let effectiveModel: string;
     let usageData: QueryUsageData | undefined;
+    let scheduledTaskName: string | undefined;
 
     try {
+        // ─── Scheduled Task: one-shot, no persistent session ───
+        if (source === "scheduled-task") {
+            const taskId = msg.messageId.match(/^sched_([^_]+)_/)?.[1];
+            const task = taskId ? loadTasks().find(t => t.id === taskId) : undefined;
+            if (!task) {
+                log("WARN", `Scheduled task not found for messageId ${msg.messageId}`);
+                clearStatus(messageId);
+                if (fs.existsSync(processingFile)) fs.unlinkSync(processingFile);
+                return;
+            }
+
+            log("INFO", `Running scheduled task "${task.name}" (${task.model})`);
+            effectiveModel = isBudgetMode() ? BUDGET_MODEL : task.model;
+            scheduledTaskName = task.name;
+
+            try {
+                const result = await processScheduledTask(task);
+                responseText = result.text;
+                usageData = result.usage;
+                markTaskComplete(task.id, "success", usageData?.totalCostUSD ?? 0);
+            } catch (err) {
+                responseText = `Scheduled task "${task.name}" failed: ${toErrorMessage(err)}`;
+                markTaskComplete(task.id, "error", 0);
+            }
+
+            clearStatus(messageId);
         // ─── Heartbeat: one-shot, skip router and session ───
-        if (source === "heartbeat") {
+        } else if (source === "heartbeat") {
             // Defense-in-depth: skip heartbeat for team threads
             const teamCheckThreads = loadThreads();
             const teamCheckConfig = teamCheckThreads[String(threadId)];
@@ -1453,6 +1556,7 @@ async function processMessage(messageFile: string): Promise<void> {
                 replyToMessageId: msg.telegramMessageId,
                 replyToVoice: true,
             } : {}),
+            ...(scheduledTaskName ? { scheduledTaskName } : {}),
         };
 
         const responseFile =
@@ -1631,11 +1735,11 @@ async function processQueue(): Promise<void> {
                 time: fs.statSync(path.join(QUEUE_INCOMING, f)).mtimeMs,
             }))
             .sort((a, b) => {
-                const aHB = a.name.startsWith('heartbeat_');
-                const bHB = b.name.startsWith('heartbeat_');
-                if (aHB && !bHB) return 1;   // heartbeats go to back
-                if (!aHB && bHB) return -1;  // user messages jump ahead
-                return a.time - b.time;      // within same priority, FIFO
+                const aLow = a.name.startsWith('heartbeat_') || a.name.startsWith('sched_');
+                const bLow = b.name.startsWith('heartbeat_') || b.name.startsWith('sched_');
+                if (aLow && !bLow) return 1;   // heartbeats/tasks go to back
+                if (!aLow && bLow) return -1;  // user messages jump ahead
+                return a.time - b.time;         // within same priority, FIFO
             });
 
         if (files.length > 0) {
@@ -1664,6 +1768,8 @@ async function processQueue(): Promise<void> {
 
             // Only 1 heartbeat can process concurrently — reserve other slots for user messages
             if (msg.source === 'heartbeat' && activeHeartbeatCount >= 1) continue;
+            // Only 1 scheduled task at a time
+            if (msg.source === 'scheduled-task' && activeScheduledTaskCount >= 1) continue;
 
             // Coalesce: grab other queued messages for the same thread
             // Skip command messages (starting with /), non-user sources, and voice/image messages
@@ -1706,6 +1812,7 @@ async function processQueue(): Promise<void> {
             activeCount++;
             activeThreads.add(msg.threadId);
             if (msg.source === 'heartbeat') activeHeartbeatCount++;
+            if (msg.source === 'scheduled-task') activeScheduledTaskCount++;
 
             log(
                 "INFO",
@@ -1717,6 +1824,7 @@ async function processQueue(): Promise<void> {
                 activeCount--;
                 activeThreads.delete(msg.threadId);
                 if (msg.source === 'heartbeat') activeHeartbeatCount--;
+                if (msg.source === 'scheduled-task') activeScheduledTaskCount--;
                 // Re-scan queue for more work
                 void processQueue();
             });
@@ -1866,6 +1974,43 @@ const heartbeatInterval = (() => {
 })();
 log("INFO", `Heartbeat timer started (interval: ${heartbeatInterval}s, zone: ${BORG_ZONE})`);
 setInterval(runHeartbeatCycle, heartbeatInterval * 1000);
+
+// ─── Scheduled Tasks Timer ───
+
+function runScheduledTasksCycle(): void {
+    try {
+        const dueTasks = getDueTasks();
+        if (dueTasks.length === 0) return;
+
+        const ts = Date.now();
+        fs.mkdirSync(QUEUE_INCOMING, { recursive: true });
+        for (const task of dueTasks) {
+            const messageId = `sched_${task.id}_${Math.floor(ts / 1000)}_${Math.random().toString(36).slice(2, 6)}`;
+            const incoming = {
+                channel: "scheduled-task",
+                source: "scheduled-task",
+                threadId: task.reportThreadId,
+                sender: "system",
+                senderId: "scheduler",
+                message: task.prompt,
+                isReply: false,
+                timestamp: ts,
+                messageId,
+            };
+            const tmp = path.join(QUEUE_INCOMING, `${messageId}.json.tmp`);
+            const final_ = path.join(QUEUE_INCOMING, `${messageId}.json`);
+            fs.writeFileSync(tmp, JSON.stringify(incoming));
+            fs.renameSync(tmp, final_);
+        }
+
+        log("INFO", `Scheduled tasks: queued ${dueTasks.length} due task(s)`);
+    } catch (err) {
+        log("ERROR", `Scheduled tasks cycle failed: ${toErrorMessage(err)}`);
+    }
+}
+
+log("INFO", "Scheduled tasks timer started (interval: 60s)");
+setInterval(runScheduledTasksCycle, 60_000);
 
 // Initial queue drain on startup
 void processQueue();

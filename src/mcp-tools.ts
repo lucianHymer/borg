@@ -26,6 +26,7 @@ import {
 } from "./docker-client.js";
 import { parseMeminfo, parseCpuPercent, getDiskUsage, countQueueFiles } from "./host-metrics.js";
 import { loadThreads, loadSettings, formatHumanTime, configureThread, saveThreads } from "./session-manager.js";
+import { loadTasks, addTask, updateTask, deleteTask, getNextRun, validateCron, MODEL_MAP } from "./scheduled-tasks.js";
 import { toErrorMessage, parseSSHPublicKey, parseDevEmail } from "./types.js";
 import { logCorrection, ROUTING_LOG, mergeCorrectionsOntoDecisions } from "./routing-logger.js";
 import { readRecentJsonl } from "./jsonl-reader.js";
@@ -616,6 +617,157 @@ export function createBorgMcpServer(sourceThreadId: number) {
         },
     );
 
+    // ─── Scheduled Task MCP Tools ───
+
+    const createScheduledTask = tool(
+        "create_scheduled_task",
+        "Create a durable cron-based scheduled task. Tasks survive restarts. Uses 5-field cron expressions evaluated in the bot's configured timezone (check with get_current_time). One-shot tasks (recurring: false) auto-delete after first execution.",
+        {
+            name: z.string().min(1).max(128).describe("Human-readable task name"),
+            prompt: z.string().min(1).describe("The prompt to run on each execution"),
+            model: z.enum(["haiku", "sonnet", "opus"]).describe("Model to use (haiku=cheap, sonnet=balanced, opus=powerful)"),
+            cron: z.string().describe("5-field cron expression: 'M H DoM Mon DoW' (e.g., '0 9 * * *' = daily 9am, '*/30 * * * *' = every 30min)"),
+            cwd: z.string().optional().describe("Working directory (defaults to calling thread's cwd)"),
+            reportThreadId: z.number().optional().describe("Thread ID where results are posted (defaults to calling thread)"),
+            recurring: z.boolean().optional().describe("true (default) = fire on every cron match. false = fire once then auto-delete."),
+        },
+        async ({ name, prompt, model, cron, cwd, reportThreadId, recurring }) => {
+            const cronError = validateCron(cron);
+            if (cronError) {
+                return { content: [textContent(`Invalid cron expression: ${cronError}`)], isError: true };
+            }
+
+            const modelMap = MODEL_MAP;
+            const threads = loadThreads();
+            const callingThread = threads[String(sourceThreadId)];
+            const taskCwd = cwd || callingThread?.cwd || process.cwd();
+            const taskReportThread = reportThreadId ?? sourceThreadId;
+
+            const task = addTask({
+                name,
+                prompt,
+                model: modelMap[model],
+                cron,
+                cwd: taskCwd,
+                reportThreadId: taskReportThread,
+                enabled: true,
+                recurring: recurring ?? true,
+            });
+
+            const nextRun = getNextRun(task);
+            const settings = loadSettings();
+            return {
+                content: [textContent(JSON.stringify({
+                    id: task.id,
+                    name: task.name,
+                    model: task.model,
+                    cron: task.cron,
+                    cwd: task.cwd,
+                    reportThreadId: task.reportThreadId,
+                    recurring: task.recurring,
+                    nextRun: nextRun?.toISOString() ?? "unknown",
+                    timezone: settings.timezone,
+                }, null, 2))],
+            };
+        },
+    );
+
+    const listScheduledTasks = tool(
+        "list_scheduled_tasks",
+        "List all scheduled tasks with their status, next run time, and last execution details.",
+        {},
+        async () => {
+            const tasks = loadTasks();
+            if (tasks.length === 0) {
+                return { content: [textContent("No scheduled tasks.")] };
+            }
+
+            const settings = loadSettings();
+            const lines = tasks.map(t => {
+                const next = getNextRun(t);
+                return [
+                    `ID: ${t.id}`,
+                    `  Name: ${t.name}`,
+                    `  Model: ${t.model}`,
+                    `  Cron: ${t.cron} (${settings.timezone})`,
+                    `  CWD: ${t.cwd}`,
+                    `  Report to: Thread ${t.reportThreadId}`,
+                    `  Enabled: ${t.enabled}`,
+                    `  Recurring: ${t.recurring}`,
+                    `  Next run: ${next?.toISOString() ?? "N/A"}`,
+                    `  Last run: ${t.lastRunTs ? new Date(t.lastRunTs).toISOString() : "never"}`,
+                    `  Last result: ${t.lastResult ?? "N/A"}`,
+                    `  Last cost: ${t.lastCostUSD != null ? `$${t.lastCostUSD.toFixed(4)}` : "N/A"}`,
+                ].join("\n");
+            });
+
+            return { content: [textContent(lines.join("\n\n"))] };
+        },
+    );
+
+    const updateScheduledTask = tool(
+        "update_scheduled_task",
+        "Update an existing scheduled task. Pass the task ID and any fields to change.",
+        {
+            id: z.string().describe("Task ID"),
+            name: z.string().optional().describe("New name"),
+            prompt: z.string().optional().describe("New prompt"),
+            model: z.enum(["haiku", "sonnet", "opus"]).optional().describe("New model"),
+            cron: z.string().optional().describe("New cron expression"),
+            enabled: z.boolean().optional().describe("Enable/disable the task"),
+            cwd: z.string().optional().describe("New working directory"),
+            reportThreadId: z.number().optional().describe("New report thread ID"),
+            recurring: z.boolean().optional().describe("Change recurring flag"),
+        },
+        async ({ id, name, prompt, model, cron, enabled, cwd, reportThreadId, recurring }) => {
+            if (cron) {
+                const cronError = validateCron(cron);
+                if (cronError) {
+                    return { content: [textContent(`Invalid cron expression: ${cronError}`)], isError: true };
+                }
+            }
+
+            const updates: Partial<Pick<import("./scheduled-tasks.js").ScheduledTask, "name" | "prompt" | "model" | "cron" | "enabled" | "cwd" | "reportThreadId" | "recurring">> = {};
+            if (name != null) updates.name = name;
+            if (prompt != null) updates.prompt = prompt;
+            if (model != null) updates.model = MODEL_MAP[model];
+            if (cron != null) updates.cron = cron;
+            if (enabled != null) updates.enabled = enabled;
+            if (cwd != null) updates.cwd = cwd;
+            if (reportThreadId != null) updates.reportThreadId = reportThreadId;
+            if (recurring != null) updates.recurring = recurring;
+
+            const updated = updateTask(id, updates);
+            if (!updated) {
+                return { content: [textContent(`Task not found: ${id}`)], isError: true };
+            }
+
+            const next = getNextRun(updated);
+            return {
+                content: [textContent(`Task "${updated.name}" updated. Next run: ${next?.toISOString() ?? "N/A"}`)],
+            };
+        },
+    );
+
+    const deleteScheduledTask = tool(
+        "delete_scheduled_task",
+        "Delete a scheduled task by ID.",
+        {
+            id: z.string().describe("Task ID to delete"),
+        },
+        async ({ id }) => {
+            const tasks = loadTasks();
+            const task = tasks.find(t => t.id === id);
+            const deleted = deleteTask(id);
+            if (!deleted) {
+                return { content: [textContent(`Task not found: ${id}`)], isError: true };
+            }
+            return { content: [textContent(`Deleted task "${task?.name ?? id}".`)] };
+        },
+    );
+
+    // ─── Thread Management Tools ───
+
     const createThread = tool(
         "create_thread",
         "Create a new Telegram forum topic and register it as a Borg thread. Available to all threads. For team threads, you MUST first create a git worktree and pass its absolute path as the cwd parameter — see borg-teams skill for worktree setup instructions.",
@@ -998,6 +1150,7 @@ export function createBorgMcpServer(sourceThreadId: number) {
         getContainerStats, getSystemStatus, getHostMemory,
         getRoutingDecisions,
         getCurrentTime, getElapsedTime,
+        createScheduledTask, listScheduledTasks, updateScheduledTask, deleteScheduledTask,
         createThread, configureThreadTool, disbandTeam, deleteThread,
     ];
     // Broadcast tool only available in core zone
