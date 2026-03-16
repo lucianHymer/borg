@@ -842,13 +842,17 @@ async function collectQueryResponse(
                 }
             }
 
-            // Capture usage data from both success and error result subtypes
+            // Capture usage data from both success and error result subtypes.
+            // Sum modelUsage instead of using result.usage — result.usage is top-level only
+            // and excludes subagent token usage. result.total_cost_usd is correct (Anthropic
+            // aggregates everything), so we need modelUsage totals to match.
+            const muValues = Object.values(result.modelUsage);
             usageData = {
                 totalCostUSD: result.total_cost_usd,
-                inputTokens: result.usage.input_tokens,
-                outputTokens: result.usage.output_tokens,
-                cacheReadInputTokens: result.usage.cache_read_input_tokens ?? 0,
-                cacheCreationInputTokens: result.usage.cache_creation_input_tokens ?? 0,
+                inputTokens: muValues.reduce((s, m) => s + m.inputTokens, 0) || result.usage.input_tokens,
+                outputTokens: muValues.reduce((s, m) => s + m.outputTokens, 0) || result.usage.output_tokens,
+                cacheReadInputTokens: muValues.reduce((s, m) => s + m.cacheReadInputTokens, 0) || (result.usage.cache_read_input_tokens ?? 0),
+                cacheCreationInputTokens: muValues.reduce((s, m) => s + m.cacheCreationInputTokens, 0) || (result.usage.cache_creation_input_tokens ?? 0),
                 durationMs: result.duration_ms,
                 durationApiMs: result.duration_api_ms,
                 numTurns: result.num_turns,
