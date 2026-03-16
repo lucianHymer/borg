@@ -88,7 +88,11 @@ After the standard tasks, Planner creates the actual work subtasks (tasks #4–N
 - **Commits and pushes all documentation changes** so they land in the PR — docs that aren't committed aren't shipped
 - Sends final summary to master thread — this is the team's "done" signal
 
-Note: model selection is handled by the message router, not per-role.
+**Model selection per role** — set via the `model` parameter when creating each thread:
+- **Planner**: `opus` — planning requires deep reasoning and architectural judgment
+- **Worker**: `sonnet` — implementation is high-volume; sonnet is cost-effective and capable
+- **Reviewer**: `sonnet` — review is structured and tool-assisted via compound-engineering
+- **Documenter**: `sonnet` — documentation and interviews don't need opus-level reasoning
 
 ## Sub-Agent Usage
 
@@ -133,7 +137,7 @@ When you finish a workflow step, update the task status — don't message teamma
 
 ## Coordination Flow
 
-1. Create a thread for each role
+1. Create a thread for each role (set `model` per role — see model selection above)
 2. Give the Planner the task (issue, description, context)
 3. Planner runs `/compound-engineering:workflows:plan`, creates all tasks with blockers, creates/updates GitHub issue
 4. Planner posts plan summary in its own thread and **waits for user approval** (the user can read and respond directly in the planner thread)

@@ -782,12 +782,14 @@ export function createBorgMcpServer(sourceThreadId: number) {
                 .describe("Path to workflow skill file (e.g., '.claude/skills/workflows/dev-team.md'). REQUIRED for team threads — tells the agent which workflow to follow."),
             cwd: z.string().optional()
                 .describe("Working directory for the thread. REQUIRED for team threads — set this to the absolute path of the team's git worktree (e.g., /absolute/path/.borg/worktrees/{team-name}). All team members must share the same cwd for proper isolation."),
+            model: z.enum(["haiku", "sonnet", "opus"]).optional()
+                .describe("Model for this thread (default: sonnet). Use haiku for simple tasks, sonnet for most work, opus for complex reasoning/planning."),
             mainThread: z.boolean().optional()
                 .describe("Mark as a main thread that receives broadcast fan-outs (only for long-lived threads, NOT team workers)"),
             initialMessage: z.string().optional()
                 .describe("First message to send to the new thread"),
         },
-        async ({ name, team, role, workflow, cwd, mainThread, initialMessage }) => {
+        async ({ name, team, role, workflow, cwd, model, mainThread, initialMessage }) => {
             try {
                 const settings = loadSettings();
                 const threads = loadThreads();
@@ -854,7 +856,7 @@ export function createBorgMcpServer(sourceThreadId: number) {
                 configureThread(threadId, {
                     name,
                     cwd: cwd || (process.env.DEFAULT_CWD || process.cwd()),
-                    model: "sonnet",
+                    model: model ? MODEL_MAP[model] : "sonnet",
                     isMaster: false,
                     lastActive: Date.now(),
                     ...(team ? { team } : {}),

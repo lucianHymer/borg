@@ -25,7 +25,9 @@ export interface IncomingMessage {
     audioPath?: string;         // path to downloaded OGG file (voice messages)
     voiceDuration?: number;     // duration in seconds
     imagePath?: string;         // path to downloaded image file (photo messages)
+    imagePaths?: string[];      // multiple image paths (media group / album)
     telegramMessageId?: number; // Telegram message_id (for voice transcript cache)
+    oneshotModel?: string;      // model override for /do one-shot queries
 }
 
 export interface OutgoingMessage {

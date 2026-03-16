@@ -34,8 +34,8 @@ interface TaskStore {
 
 // ─── Model Aliases ───
 
-/** Maps short model names to SDK model strings with 1M context suffix */
-export const MODEL_MAP: Record<string, string> = { haiku: "haiku", sonnet: "sonnet[1m]", opus: "opus[1m]" };
+/** Maps short model names to SDK model strings */
+export const MODEL_MAP: Record<string, string> = { haiku: "haiku", sonnet: "sonnet", opus: "opus[1m]" };
 
 // ─── File Paths ───
 

@@ -12,7 +12,7 @@ const HISTORY_FILE = path.join(SCRIPT_DIR, ".borg/message-history.jsonl");
 const HISTORY_BACKUP = path.join(SCRIPT_DIR, ".borg/message-history.1.jsonl");
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
 
-export type MessageSource = "user" | "cross-thread" | "heartbeat" | "cli" | "system" | "broadcast" | "scheduled-task";
+export type MessageSource = "user" | "cross-thread" | "heartbeat" | "cli" | "system" | "broadcast" | "scheduled-task" | "one-shot";
 
 export interface MessageHistoryEntry {
     ts: number;

@@ -58,7 +58,7 @@ import { z } from "zod/v4";
 
 // ─── Zod Schemas for Queue Messages ───
 
-const MessageSourceSchema = z.enum(["user", "cross-thread", "heartbeat", "cli", "system", "broadcast", "scheduled-task"]);
+const MessageSourceSchema = z.enum(["user", "cross-thread", "heartbeat", "cli", "system", "broadcast", "scheduled-task", "one-shot"]);
 
 const IncomingMessageSchema = z.object({
     channel: z.string(),
@@ -77,7 +77,9 @@ const IncomingMessageSchema = z.object({
     audioPath: z.string().optional(),
     voiceDuration: z.number().optional(),
     imagePath: z.string().optional(),
+    imagePaths: z.array(z.string()).optional(),
     telegramMessageId: z.number().optional(),
+    oneshotModel: z.string().optional(),
 });
 
 const CommandMessageSchema = z.object({
@@ -241,7 +243,7 @@ function buildRetryFilename(filename: string, retryNum: number): string {
 // ─── Tier / Model Mapping ───
 
 // Default model for threads that don't have one explicitly set
-const DEFAULT_THREAD_MODEL = "sonnet[1m]";
+const DEFAULT_THREAD_MODEL = "sonnet";
 
 // ─── Session Log Sync ───
 
@@ -502,6 +504,32 @@ const sdkCanUseTool: SDKCanUseTool = async (toolName, input, _options) => {
     return { behavior: "deny", message: result.message };
 };
 
+// ─── Budget Proxy Setup ───
+
+/**
+ * Set up the budget/Fireworks proxy for a query. Returns a usageId if the proxy
+ * was activated (caller should pass to readBudgetUsage after the query), or
+ * undefined if direct API will be used.
+ */
+async function setupBudgetProxy(model: string): Promise<string | undefined> {
+    const isFireworksModel = model.includes("fireworks");
+    const needsProxy = isFireworksModel || isBudgetMode();
+    if (!needsProxy) {
+        delete process.env.ANTHROPIC_BASE_URL;
+        return undefined;
+    }
+    const proxyOk = await checkProxyAvailable();
+    if (!proxyOk) {
+        delete process.env.ANTHROPIC_BASE_URL;
+        return undefined;
+    }
+    const usageId = crypto.randomUUID();
+    const pendingFile = path.join(BORG_DIR, `minimax-usage-${usageId}.pending`);
+    fs.writeFileSync(pendingFile, "");
+    process.env.ANTHROPIC_BASE_URL = `${BUDGET_PROXY_URL}/${usageId}`;
+    return usageId;
+}
+
 // ─── Time Injection ───
 
 function formatCurrentTime(): string {
@@ -523,6 +551,7 @@ function buildSourcePrefix(msg: IncomingMessage): string {
         system: `[System event]:`,
         broadcast: `[Broadcast]:`,
         "scheduled-task": `[Scheduled task]:`,
+        "one-shot": `[${msg.sender} via /do]:`,
     };
     return prefixMap[msg.source ?? "user"];
 }
@@ -902,22 +931,7 @@ async function processHeartbeat(msg: IncomingMessage): Promise<{ text: string; u
     // Respect thread-level model override; fall back to budget model or haiku
     const isFireworksModel = threadConfig.model?.includes("fireworks");
     const heartbeatModel = (isFireworksModel && threadConfig.model) || (isBudgetMode() ? BUDGET_MODEL : "haiku");
-    const needsProxy = isBudgetMode() || isFireworksModel;
-    let heartbeatUsageId: string | undefined;
-    if (needsProxy) {
-        const proxyOk = await checkProxyAvailable();
-        if (proxyOk) {
-            heartbeatUsageId = crypto.randomUUID();
-            const pendingFile = path.join(BORG_DIR, `minimax-usage-${heartbeatUsageId}.pending`);
-            fs.writeFileSync(pendingFile, "");
-            process.env.ANTHROPIC_BASE_URL = `${BUDGET_PROXY_URL}/${heartbeatUsageId}`;
-        } else {
-            log("WARN", "Budget proxy unavailable for heartbeat");
-            delete process.env.ANTHROPIC_BASE_URL;
-        }
-    } else {
-        delete process.env.ANTHROPIC_BASE_URL;
-    }
+    const heartbeatUsageId = await setupBudgetProxy(heartbeatModel);
     const stderrLines: string[] = [];
     const q = query({
         prompt: heartbeatPrompt,
@@ -983,23 +997,7 @@ async function processScheduledTask(task: ScheduledTask): Promise<{ text: string
         `Be concise and actionable. If there's nothing to report, say so briefly.`,
     ].join("\n");
 
-    // Budget mode proxy setup (same as heartbeats)
-    const isFireworksModel = task.model.includes("fireworks");
-    const needsProxy = isFireworksModel || isBudgetMode();
-
-    if (needsProxy) {
-        const proxyOk = await checkProxyAvailable();
-        if (proxyOk) {
-            const usageId = crypto.randomUUID();
-            const pendingFile = path.join(BORG_DIR, `minimax-usage-${usageId}.pending`);
-            fs.writeFileSync(pendingFile, "");
-            process.env.ANTHROPIC_BASE_URL = `${BUDGET_PROXY_URL}/${usageId}`;
-        } else {
-            delete process.env.ANTHROPIC_BASE_URL;
-        }
-    } else {
-        delete process.env.ANTHROPIC_BASE_URL;
-    }
+    await setupBudgetProxy(isBudgetMode() ? BUDGET_MODEL : task.model);
 
     const taskModel = isBudgetMode() ? BUDGET_MODEL : task.model;
     const stderrLines: string[] = [];
@@ -1040,6 +1038,69 @@ async function processScheduledTask(task: ScheduledTask): Promise<{ text: string
 }
 
 // ─── Process a Single Message ───
+
+// ─── One-Shot Query (/do command) ───
+
+async function processOneShot(msg: IncomingMessage): Promise<{ text: string; model: string; usage?: QueryUsageData; budgetUsageId?: string }> {
+    const threadId = msg.threadId;
+    const oneshotModel = msg.oneshotModel;
+    const effectiveModel = isBudgetMode() ? BUDGET_MODEL : (oneshotModel || "haiku");
+
+    log("INFO", `One-shot query for thread ${threadId}: model=${effectiveModel}`);
+
+    const threads = loadThreads();
+    const threadConfig = threads[String(threadId)];
+    const cwd = threadConfig?.cwd || process.env.DEFAULT_CWD || process.cwd();
+
+    // Inject recent history as background context (not conversation you're part of)
+    const historyContext = buildHistoryContext(threadId, threadConfig?.isMaster ?? false);
+    const historyBlock = historyContext
+        ? `\n\nBelow is recent activity in this thread for background context. You are NOT part of this conversation — this is just to help you understand what's been going on. Do not continue or reply to these messages; focus only on the task you've been given.\n\n${historyContext}`
+        : "";
+
+    const systemPreamble = [
+        `You are running as an independent one-shot query via /do — you have no conversation history or session state.`,
+        `Thread: "${threadConfig?.name ?? `Thread ${threadId}`}"`,
+        `Working directory: ${cwd}`,
+        `Be concise and direct. This is a quick task — no need for lengthy explanations.`,
+    ].join("\n") + historyBlock;
+
+    const budgetUsageId = await setupBudgetProxy(effectiveModel);
+
+    const stderrLines: string[] = [];
+    const q = query({
+        prompt: msg.message,
+        options: {
+            model: effectiveModel,
+            effort: "medium",
+            cwd,
+            canUseTool: sdkCanUseTool,
+            settingSources: ["project", "user"],
+            systemPrompt: {
+                type: "preset",
+                preset: "claude_code",
+                append: systemPreamble,
+            },
+            mcpServers: {
+                borg: createBorgMcpServer(threadId),
+            },
+            permissionMode: "bypassPermissions",
+            allowDangerouslySkipPermissions: true,
+            stderr: (data: string) => { stderrLines.push(data); },
+        },
+    });
+
+    try {
+        const { text, usage } = await collectQueryResponse(q);
+        return { text: text.trim() || "(No output)", model: effectiveModel, usage, budgetUsageId };
+    } catch (err) {
+        const stderrOutput = stderrLines.join("").trim();
+        log("ERROR", `One-shot query error: ${toErrorMessage(err)}${stderrOutput ? `\n  stderr: ${stderrOutput.slice(0, 2000)}` : ""}`);
+        return { text: `One-shot query failed: ${toErrorMessage(err)}`, model: effectiveModel, budgetUsageId };
+    }
+}
+
+// ─── Process Message ───
 
 async function processMessage(messageFile: string): Promise<void> {
     const filename = path.basename(messageFile);
@@ -1086,9 +1147,13 @@ async function processMessage(messageFile: string): Promise<void> {
         }
     }
 
-    // ─── Validate imagePath is within the allowed directory ───
-    if (msg.imagePath) {
-        const resolved = path.resolve(msg.imagePath);
+    // ─── Validate imagePath(s) are within the allowed directory ───
+    const allImagePaths = [
+        ...(msg.imagePath ? [msg.imagePath] : []),
+        ...(msg.imagePaths ?? []),
+    ];
+    for (const ip of allImagePaths) {
+        const resolved = path.resolve(ip);
         if (!resolved.startsWith(IMAGES_INCOMING_DIR + "/") && resolved !== IMAGES_INCOMING_DIR) {
             throw new Error(`imagePath outside allowed directory: ${resolved}`);
         }
@@ -1152,15 +1217,21 @@ async function processMessage(messageFile: string): Promise<void> {
     }
 
     // ─── Photo Message: Add Read tool instruction ───
-    if (msg.imagePath) {
-        const imageInstruction = `[Image received: ${msg.imagePath}]\n\nPlease analyze this image using the Read tool.`;
+    // Collect all image paths (single imagePath or multiple imagePaths from media group)
+    const imagesToProcess = msg.imagePaths?.length ? msg.imagePaths : (msg.imagePath ? [msg.imagePath] : []);
+    if (imagesToProcess.length > 0) {
+        const instructions = imagesToProcess.map(
+            (p, i) => imagesToProcess.length > 1
+                ? `[Image ${i + 1} received: ${p}]\n\nPlease view this image using the Read tool.`
+                : `[Image received: ${p}]\n\nPlease analyze this image using the Read tool.`
+        );
+        const imageInstruction = instructions.join("\n\n");
         if (msg.message) {
-            // If there's a caption, prepend the instruction
             msg.message = `${imageInstruction}\n\nCaption: ${msg.message}`;
         } else {
             msg.message = imageInstruction;
         }
-        log("INFO", `Image message: ${msg.imagePath}`);
+        log("INFO", `Image message: ${imagesToProcess.length} image(s) — ${imagesToProcess.join(", ")}`);
     }
 
     // Log incoming message to history (after STT and image instruction so they're captured)
@@ -1183,8 +1254,16 @@ async function processMessage(messageFile: string): Promise<void> {
     let scheduledTaskName: string | undefined;
 
     try {
+        // ─── One-Shot (/do): no session context, user-specified model ───
+        if (source === "one-shot") {
+            const oneshotResult = await processOneShot(msg);
+            effectiveModel = oneshotResult.model;
+            responseText = oneshotResult.text;
+            usageData = oneshotResult.usage;
+            budgetUsageId = oneshotResult.budgetUsageId;
+            clearStatus(messageId);
         // ─── Scheduled Task: one-shot, no persistent session ───
-        if (source === "scheduled-task") {
+        } else if (source === "scheduled-task") {
             const taskId = msg.messageId.match(/^sched_([^_]+)_/)?.[1];
             const task = taskId ? loadTasks().find(t => t.id === taskId) : undefined;
             if (!task) {
@@ -1628,10 +1707,19 @@ function handleRetry(
     const retryPath = path.join(QUEUE_INCOMING, retryFilename);
 
     try {
-        fs.renameSync(processingFile, retryPath);
+        // Add retryAfter timestamp for exponential backoff (5s, 15s, 30s)
+        const backoffMs = [5_000, 15_000, 30_000][Math.min(newRetry - 1, 2)];
+        const retryAfter = Date.now() + backoffMs;
+        const content = fs.readFileSync(processingFile, "utf8");
+        const data = JSON.parse(content);
+        data.retryAfter = retryAfter;
+        const tmpFile = retryPath + ".tmp";
+        fs.writeFileSync(tmpFile, JSON.stringify(data, null, 2));
+        fs.renameSync(tmpFile, retryPath);
+        fs.unlinkSync(processingFile);
         log(
             "WARN",
-            `Retry ${newRetry}/${MAX_RETRIES} for ${filename} -> ${retryFilename}`,
+            `Retry ${newRetry}/${MAX_RETRIES} for ${filename} -> ${retryFilename} (backoff ${backoffMs / 1000}s)`,
         );
     } catch (err) {
         log(
@@ -1757,6 +1845,11 @@ async function processQueue(): Promise<void> {
             let msg: IncomingMessage;
             try {
                 const raw: unknown = JSON.parse(fs.readFileSync(file.path, "utf8"));
+                // Check retry backoff — skip if not ready yet
+                if (raw && typeof raw === "object" && "retryAfter" in raw) {
+                    const retryAfter = (raw as any).retryAfter;
+                    if (typeof retryAfter === "number" && Date.now() < retryAfter) continue;
+                }
                 const parsed = IncomingMessageSchema.safeParse(raw);
                 if (!parsed.success) continue; // Skip malformed messages — processMessage will handle them
                 msg = parsed.data;
@@ -1773,9 +1866,10 @@ async function processQueue(): Promise<void> {
             if (msg.source === 'scheduled-task' && activeScheduledTaskCount >= 1) continue;
 
             // Coalesce: grab other queued messages for the same thread
-            // Skip command messages (starting with /), non-user sources, and voice/image messages
+            // Skip command messages (starting with /), non-user sources, and voice messages
             const coalesced: QueueFile[] = [];
-            if (!msg.message.startsWith("/") && !msg.audioPath && !msg.imagePath) {
+            const hasImage = !!(msg.imagePath || msg.imagePaths?.length);
+            if (!msg.message.startsWith("/") && !msg.audioPath) {
                 for (const other of files) {
                     if (other === file) continue;
                     try {
@@ -1785,10 +1879,27 @@ async function processQueue(): Promise<void> {
                         const otherMsg = otherParsed.data;
                         if (otherMsg.threadId !== msg.threadId) continue;
                         if (otherMsg.message.startsWith("/")) continue;
-                        if (otherMsg.audioPath || otherMsg.imagePath) continue;
+                        if (otherMsg.audioPath) continue;
+                        const otherHasImage = !!(otherMsg.imagePath || otherMsg.imagePaths?.length);
+                        // Don't mix image and non-image messages in coalescing
+                        if (hasImage !== otherHasImage) continue;
                         coalesced.push(other);
-                        // Append text to primary message
-                        msg.message = msg.message + "\n\n" + otherMsg.message;
+                        if (otherHasImage) {
+                            // Merge image paths into imagePaths array
+                            if (!msg.imagePaths) msg.imagePaths = msg.imagePath ? [msg.imagePath] : [];
+                            if (otherMsg.imagePaths?.length) {
+                                msg.imagePaths.push(...otherMsg.imagePaths);
+                            } else if (otherMsg.imagePath) {
+                                msg.imagePaths.push(otherMsg.imagePath);
+                            }
+                            // Merge captions
+                            if (otherMsg.message) {
+                                msg.message = msg.message ? msg.message + "\n\n" + otherMsg.message : otherMsg.message;
+                            }
+                        } else {
+                            // Append text to primary message
+                            msg.message = msg.message + "\n\n" + otherMsg.message;
+                        }
                     } catch { continue; }
                 }
 

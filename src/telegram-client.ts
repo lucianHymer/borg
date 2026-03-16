@@ -500,7 +500,7 @@ bot.command("setdir", async (ctx) => {
 // /model <haiku|sonnet|opus> — switch the thread's sticky model and reset session
 const VALID_MODEL_ARGS: Record<string, string> = {
     haiku: "haiku",
-    sonnet: "sonnet[1m]",
+    sonnet: "sonnet",
     opus: "opus[1m]",
 };
 bot.command("model", async (ctx) => {
@@ -509,7 +509,7 @@ bot.command("model", async (ctx) => {
     const arg = ctx.match?.trim().toLowerCase();
 
     if (!arg || !VALID_MODEL_ARGS[arg]) {
-        const current = loadThreads()[String(threadId)]?.model ?? "sonnet[1m]";
+        const current = loadThreads()[String(threadId)]?.model ?? "sonnet";
         await ctx.reply(
             `Current model: ${current}\nUsage: /model <haiku|sonnet|opus>`,
             { message_thread_id: ctx.msg.message_thread_id },
@@ -525,6 +525,72 @@ bot.command("model", async (ctx) => {
         { message_thread_id: ctx.msg.message_thread_id },
     );
     log("INFO", `Thread ${threadId} model set to ${newModel} by ${ctx.from?.first_name ?? "unknown"}`);
+});
+
+// /do <haiku|sonnet|opus> <message> — one-shot query, no session context
+bot.command("do", async (ctx) => {
+    if (String(ctx.chat?.id) !== settings.telegram_chat_id) return;
+    const threadId = ctx.msg.message_thread_id ?? 1;
+    const args = ctx.match?.trim();
+
+    if (!args) {
+        await ctx.reply("Usage: /do <haiku|sonnet|opus> <message>\nDefaults to haiku if no model specified.", {
+            message_thread_id: ctx.msg.message_thread_id,
+        });
+        return;
+    }
+
+    // Parse: first word may be a model, rest is the message
+    const firstSpace = args.indexOf(" ");
+    const firstWord = firstSpace > 0 ? args.slice(0, firstSpace).toLowerCase() : args.toLowerCase();
+    let model: string;
+    let message: string;
+
+    if (VALID_MODEL_ARGS[firstWord] && firstSpace > 0) {
+        model = VALID_MODEL_ARGS[firstWord];
+        message = args.slice(firstSpace + 1).trim();
+    } else {
+        // No model specified — default to haiku, entire args is the message
+        model = "haiku";
+        message = args;
+    }
+
+    if (!message) {
+        await ctx.reply("Usage: /do <haiku|sonnet|opus> <message>", {
+            message_thread_id: ctx.msg.message_thread_id,
+        });
+        return;
+    }
+
+    const messageId = `oneshot_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const topicName = topicNames.get(threadId);
+    const queueData = {
+        channel: "telegram",
+        source: "one-shot" as const,
+        threadId,
+        sender: ctx.from?.first_name ?? "user",
+        senderId: String(ctx.from?.id ?? ""),
+        message,
+        topicName,
+        timestamp: Date.now(),
+        messageId,
+        oneshotModel: model,
+    };
+
+    const incomingDir = resolveIncomingForThread(threadId);
+    fs.mkdirSync(incomingDir, { recursive: true });
+    const queueFile = path.join(incomingDir, `telegram_${messageId}.json`);
+    const tmpFile = queueFile + ".tmp";
+    fs.writeFileSync(tmpFile, JSON.stringify(queueData, null, 2));
+    fs.renameSync(tmpFile, queueFile);
+
+    // No pendingMessage registration — response will arrive via fallback path (direct send)
+
+    const modelLabel = model.replace("[1m]", "");
+    await ctx.reply(`⚡ Running with ${modelLabel}...`, {
+        message_thread_id: ctx.msg.message_thread_id,
+    });
+    log("INFO", `One-shot /do command: thread=${threadId} model=${model} message="${message.slice(0, 100)}"`);
 });
 
 // /budget_on and /budget_off toggle budget mode (cheap model via Fireworks)
@@ -864,7 +930,71 @@ bot.on("message:voice").filter(
     },
 );
 
-// ─── Photo Message Handler ───
+// ─── Photo Message Handler (with media group buffering) ───
+
+// Buffer for media group photos — Telegram sends each photo in an album as a separate update
+// with the same media_group_id. We collect them for 800ms then emit one queue message.
+interface MediaGroupEntry {
+    threadId: number;
+    ctx: any; // first photo's context (used for reply info, pending message)
+    sender: string;
+    senderId: string;
+    caption: string;
+    imagePaths: string[];       // zone-local paths (for download verification)
+    canonicalPaths: string[];   // canonical /app/.borg/ paths (for queue message)
+    isReplyToBot: boolean;
+    replyToModel?: string;
+    replyToText?: string;
+    topicName?: string;
+    telegramMessageIds: number[];
+    timer: ReturnType<typeof setTimeout>;
+}
+const mediaGroupBuffer = new Map<string, MediaGroupEntry>();
+
+function flushMediaGroup(groupId: string): void {
+    const group = mediaGroupBuffer.get(groupId);
+    if (!group) return;
+    mediaGroupBuffer.delete(groupId);
+    clearTimeout(group.timer);
+
+    const messageId = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+
+    const queueData = {
+        channel: "telegram",
+        source: "user" as const,
+        threadId: group.threadId,
+        sender: group.sender,
+        senderId: group.senderId,
+        message: group.caption,
+        imagePaths: group.canonicalPaths,
+        isReply: group.isReplyToBot,
+        replyToText: group.replyToText,
+        replyToModel: group.replyToModel,
+        topicName: group.topicName,
+        timestamp: Date.now(),
+        messageId,
+    };
+
+    const incomingDir = resolveIncomingForThread(group.threadId);
+    fs.mkdirSync(incomingDir, { recursive: true });
+    const queueFile = path.join(incomingDir, `telegram_${messageId}.json`);
+    const tmpFile = queueFile + ".tmp";
+    fs.writeFileSync(tmpFile, JSON.stringify(queueData, null, 2));
+    fs.renameSync(tmpFile, queueFile);
+
+    // Register pending message using the first photo's context
+    pendingMessages.set(messageId, {
+        ctx: group.ctx,
+        chatId: group.ctx.chat.id,
+        threadId: group.threadId,
+        telegramMessageId: group.telegramMessageIds[0],
+    });
+    for (const tmId of group.telegramMessageIds) {
+        telegramToQueueId.set(tmId, messageId);
+    }
+
+    log("INFO", `Queued media group (${group.canonicalPaths.length} photos) from ${group.sender} in thread ${group.threadId}`);
+}
 
 bot.on("message:photo").filter(
     (ctx) => ctx.from.id !== bot.botInfo.id,
@@ -894,15 +1024,15 @@ bot.on("message:photo").filter(
 
         // Download the image file — write to the target zone's images dir so queue-processor can read it
         const fileUrl = `https://api.telegram.org/file/bot${settings.telegram_bot_token}/${file.file_path}`;
-        const messageId = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+        const photoId = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
         // Determine file extension from path (e.g., "photos/file_123.jpg")
         const ext = path.extname(file.file_path || ".jpg") || ".jpg";
         const zoneImagesDir = resolveZoneImagesIncoming(threadId);
         if (!fs.existsSync(zoneImagesDir)) fs.mkdirSync(zoneImagesDir, { recursive: true });
-        const imagePath = path.join(zoneImagesDir, `${messageId}${ext}`);
+        const imagePath = path.join(zoneImagesDir, `${photoId}${ext}`);
         // Queue-processor sees /app/.borg/images/incoming/ (its own zone mount)
-        const canonicalImagePath = path.join(SCRIPT_DIR, ".borg/images/incoming", `${messageId}${ext}`);
+        const canonicalImagePath = path.join(SCRIPT_DIR, ".borg/images/incoming", `${photoId}${ext}`);
 
         try {
             const res = await fetch(fileUrl);
@@ -918,6 +1048,62 @@ bot.on("message:photo").filter(
             });
             return;
         }
+
+        // React with 👀 to acknowledge
+        try {
+            await bot.api.setMessageReaction(ctx.chat.id, ctx.msg.message_id,
+                [{ type: "emoji", emoji: "👀" as any }]);
+        } catch {
+            // Reactions may not be available
+        }
+
+        const mediaGroupId = ctx.msg.media_group_id;
+
+        // ─── Media group: buffer and flush after 800ms ───
+        if (mediaGroupId) {
+            const existing = mediaGroupBuffer.get(mediaGroupId);
+            if (existing) {
+                // Add to existing group
+                existing.imagePaths.push(imagePath);
+                existing.canonicalPaths.push(canonicalImagePath);
+                existing.telegramMessageIds.push(ctx.msg.message_id);
+                // Use caption from any photo that has one
+                if (!existing.caption && ctx.msg.caption) existing.caption = ctx.msg.caption;
+                // Reset timer
+                clearTimeout(existing.timer);
+                existing.timer = setTimeout(() => flushMediaGroup(mediaGroupId), 1500);
+                log("INFO", `Added photo to media group ${mediaGroupId} (${existing.canonicalPaths.length} so far)`);
+                return;
+            }
+
+            // First photo in group — start buffering
+            const isReplyToBot = ctx.msg.reply_to_message?.from?.id === bot.botInfo.id;
+            const stored = isReplyToBot && ctx.msg.reply_to_message
+                ? lookupMessageModel(ctx.msg.reply_to_message.message_id)
+                : undefined;
+
+            const entry: MediaGroupEntry = {
+                threadId,
+                ctx,
+                sender: ctx.from.first_name,
+                senderId: String(ctx.from.id),
+                caption: ctx.msg.caption || "",
+                imagePaths: [imagePath],
+                canonicalPaths: [canonicalImagePath],
+                isReplyToBot,
+                replyToModel: stored?.model,
+                replyToText: isReplyToBot ? ctx.msg.reply_to_message?.text : undefined,
+                topicName: topicNames.get(threadId),
+                telegramMessageIds: [ctx.msg.message_id],
+                timer: setTimeout(() => flushMediaGroup(mediaGroupId), 1500),
+            };
+            mediaGroupBuffer.set(mediaGroupId, entry);
+            log("INFO", `Started media group ${mediaGroupId} from ${ctx.from.first_name} in thread ${threadId}`);
+            return;
+        }
+
+        // ─── Single photo (no media group) — queue immediately ───
+        const messageId = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
         // Check reply-to-bot context (same as text/voice handler)
         const isReplyToBot = ctx.msg.reply_to_message?.from?.id === bot.botInfo.id;
@@ -961,14 +1147,6 @@ bot.on("message:photo").filter(
             telegramMessageId: ctx.msg.message_id,
         });
         telegramToQueueId.set(ctx.msg.message_id, messageId);
-
-        // React with 👀 to acknowledge
-        try {
-            await bot.api.setMessageReaction(ctx.chat.id, ctx.msg.message_id,
-                [{ type: "emoji", emoji: "👀" as any }]);
-        } catch {
-            // Reactions may not be available
-        }
 
         log("INFO", `Queued photo message from ${ctx.from.first_name} in thread ${threadId} (${file.file_size} bytes)`);
     },
@@ -1588,7 +1766,9 @@ async function pollStatusFiles(): Promise<void> {
                     pending.chatId,
                     pending.statusMessageId,
                     displayText,
-                    { reply_markup: cancelKeyboard },
+                    {
+                        reply_markup: cancelKeyboard,
+                    },
                 );
             } else {
                 // Send new status message as reply to original
@@ -2236,6 +2416,7 @@ bot.start({
             { command: "status", description: "Show all active threads and their status" },
             { command: "clear_team", description: "Reset all team member sessions" },
             { command: "compact_team", description: "Reset all team member sessions" },
+            { command: "do", description: "One-shot query: /do [haiku|sonnet|opus] <message>" },
             { command: "clear_all", description: "Reset all thread sessions" },
         ]);
         // Start task watcher
