@@ -1254,56 +1254,37 @@ async function pollOutgoingQueue(): Promise<void> {
                         const markdownV2Response = toTelegramMarkdownV2(data.message);
                         const chunks = splitMessage(markdownV2Response);
 
-                        if (pending.statusMessageId && chunks.length > 0) {
-                            // Edit the status message in-place with the first chunk
+                        // Delete the silent status message so the final response
+                        // arrives as a fresh message with a normal notification
+                        if (pending.statusMessageId) {
                             try {
-                                await bot.api.editMessageText(
-                                    pending.chatId,
-                                    pending.statusMessageId,
-                                    chunks[0],
-                                    { parse_mode: "MarkdownV2" },
-                                );
-                                firstSentId = pending.statusMessageId;
-                            } catch {
-                                // Status message may have been deleted — send normally instead
-                                firstSentId = undefined;
-                            }
+                                await bot.api.deleteMessage(pending.chatId, pending.statusMessageId);
+                            } catch { /* may already be deleted */ }
                         }
 
-                        if (firstSentId) {
-                            // First chunk was edited in-place — store model and react
-                            if (data.model) {
-                                // Store full text for all messages (single and multi-segment)
-                                // This lets Listen button distinguish between fresh single-segment messages
-                                // and cache-evicted multi-segment messages
-                                storeMessageModel(firstSentId, data.model, data.threadId, data.message);
-                                await reactWithModel(pending.chatId, firstSentId, data.model);
-                            }
-                            // Send remaining chunks as new messages
-                            for (let i = 1; i < chunks.length; i++) {
-                                const sent = await sendInThread(pending, chunks[i], "MarkdownV2");
+                        // Send all chunks as new messages, replying to the user's original
+                        const replyParams = pending.telegramMessageId > 0
+                            ? { reply_parameters: { message_id: pending.telegramMessageId } }
+                            : {};
+                        for (let i = 0; i < chunks.length; i++) {
+                            const opts: Record<string, unknown> = {
+                                message_thread_id: getThreadOpt(pending),
+                                parse_mode: "MarkdownV2" as const,
+                                ...(i === 0 ? replyParams : {}),
+                            };
+                            const sent = await bot.api.sendMessage(
+                                pending.chatId,
+                                chunks[i],
+                                opts,
+                            );
+                            if (i === 0) {
+                                firstSentId = sent.message_id;
                                 if (data.model) {
-                                    storeMessageModel(sent.message_id, data.model, data.threadId);
-                                }
-                            }
-                        } else {
-                            // No status message or edit failed — send all chunks normally
-                            for (const chunk of chunks) {
-                                const sent = await sendInThread(pending, chunk, "MarkdownV2");
-                                if (!firstSentId) {
-                                    firstSentId = sent.message_id;
-                                    // Store full text ONLY for multi-segment messages, on the first segment
-                                    if (data.model && chunks.length > 1) {
-                                        storeMessageModel(sent.message_id, data.model, data.threadId, data.message);
-                                        await reactWithModel(pending.chatId, sent.message_id, data.model);
-                                    } else if (data.model) {
-                                        storeMessageModel(sent.message_id, data.model, data.threadId);
-                                        await reactWithModel(pending.chatId, sent.message_id, data.model);
-                                    }
-                                } else if (data.model) {
-                                    storeMessageModel(sent.message_id, data.model, data.threadId);
+                                    storeMessageModel(sent.message_id, data.model, data.threadId, data.message);
                                     await reactWithModel(pending.chatId, sent.message_id, data.model);
                                 }
+                            } else if (data.model) {
+                                storeMessageModel(sent.message_id, data.model, data.threadId);
                             }
                         }
 
@@ -1586,6 +1567,7 @@ async function pollStatusFiles(): Promise<void> {
                     {
                         message_thread_id: getThreadOpt(pending),
                         reply_markup: cancelKeyboard,
+                        disable_notification: true,
                         ...replyOpts,
                     },
                 );
