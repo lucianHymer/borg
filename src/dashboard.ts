@@ -928,7 +928,7 @@ app.get("/api/usage", (_req, res) => {
 
     function friendlyModel(model: string | undefined): string {
         if (!model) return "Unknown";
-        const lower = model.toLowerCase();
+        const lower = model.toLowerCase().replace("[1m]", "");
         if (lower.includes("haiku")) return "Haiku";
         if (lower.includes("sonnet")) return "Sonnet";
         if (lower.includes("opus")) return "Opus";

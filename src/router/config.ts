@@ -122,8 +122,8 @@ export const DEFAULT_ROUTING_CONFIG: RoutingConfig = {
 
   tiers: {
     SIMPLE: "haiku",
-    MEDIUM: "sonnet",
-    COMPLEX: "opus",
+    MEDIUM: "sonnet[1m]",
+    COMPLEX: "opus[1m]",
   },
 
   overrides: {

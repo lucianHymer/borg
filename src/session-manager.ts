@@ -12,7 +12,7 @@ export interface ThreadConfig {
     name: string;
     cwd: string;
     sessionId?: string;
-    model: string;
+    model?: string;
     isMaster: boolean;
     lastActive: number;
     team?: string;          // Team identifier (e.g., "auth-feature")

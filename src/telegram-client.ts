@@ -497,6 +497,36 @@ bot.command("setdir", async (ctx) => {
     log("INFO", `Thread ${threadId} cwd set to ${dir} by ${ctx.from?.first_name ?? "unknown"}`);
 });
 
+// /model <haiku|sonnet|opus> — switch the thread's sticky model and reset session
+const VALID_MODEL_ARGS: Record<string, string> = {
+    haiku: "haiku",
+    sonnet: "sonnet[1m]",
+    opus: "opus[1m]",
+};
+bot.command("model", async (ctx) => {
+    if (String(ctx.chat?.id) !== settings.telegram_chat_id) return;
+    const threadId = ctx.msg.message_thread_id ?? 1;
+    const arg = ctx.match?.trim().toLowerCase();
+
+    if (!arg || !VALID_MODEL_ARGS[arg]) {
+        const current = loadThreads()[String(threadId)]?.model ?? "sonnet[1m]";
+        await ctx.reply(
+            `Current model: ${current}\nUsage: /model <haiku|sonnet|opus>`,
+            { message_thread_id: ctx.msg.message_thread_id },
+        );
+        return;
+    }
+
+    const newModel = VALID_MODEL_ARGS[arg];
+    configureThread(threadId, { model: newModel });
+    resetThread(threadId); // Clear session so new model starts fresh with full cache
+    await ctx.reply(
+        `Model set to ${newModel}. Session reset — recent history will be injected on next message.`,
+        { message_thread_id: ctx.msg.message_thread_id },
+    );
+    log("INFO", `Thread ${threadId} model set to ${newModel} by ${ctx.from?.first_name ?? "unknown"}`);
+});
+
 // /budget_on and /budget_off toggle budget mode (cheap model via Fireworks)
 // Writes to shared settings.json at project root - accessible by all zone containers
 for (const cmd of ["budget_on", "budget_off"] as const) {
@@ -698,14 +728,13 @@ bot.on("message:text").filter(
         for (const [threadIdStr] of mainThreads) {
             const threadId = Number(threadIdStr);
             const messageId = `broadcast_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-            // Prefix with [use opus] so router forces opus for evaluation
             const queueData = {
                 channel: "telegram",
                 source: "broadcast" as const,
                 threadId,
                 sender: ctx.from.first_name ?? "Broadcast",
                 senderId: String(ctx.from.id),
-                message: `[use opus] ${broadcastText}`,
+                message: broadcastText,
                 timestamp: Date.now(),
                 messageId,
             };
@@ -1044,7 +1073,8 @@ const VALID_MODELS = new Set(Object.keys(MODEL_REACTIONS));
 
 async function reactWithModel(chatId: string | number, messageId: number, model?: string): Promise<void> {
     if (!model) return;
-    const emoji = MODEL_REACTIONS[model];
+    const baseModel = model.replace("[1m]", "");
+    const emoji = MODEL_REACTIONS[baseModel];
     if (!emoji) return;
     try {
         await bot.api.setMessageReaction(chatId, messageId,
@@ -2213,6 +2243,7 @@ bot.start({
         await bot.api.setMyCommands([
             { command: "clear", description: "Reset session (recent history preserved)" },
             { command: "compact", description: "Reset session (recent history preserved)" },
+            { command: "model", description: "Set thread model: /model <haiku|sonnet|opus>" },
             { command: "setdir", description: "Set working directory for this thread" },
             { command: "budget_on", description: "Enable budget mode (cheap model)" },
             { command: "budget_off", description: "Disable budget mode" },

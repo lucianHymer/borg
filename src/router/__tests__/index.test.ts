@@ -28,7 +28,7 @@ describe("route() - Basic Routing", () => {
       undefined,
       { config },
     );
-    expect(result.model).toBe("opus");
+    expect(result.model).toBe("opus[1m]");
     expect(result.tier).toBe("COMPLEX");
   });
 
@@ -38,7 +38,7 @@ describe("route() - Basic Routing", () => {
       undefined,
       { config },
     );
-    expect(result.model).toBe("sonnet");
+    expect(result.model).toBe("sonnet[1m]");
     expect(result.tier).toBe("MEDIUM");
   });
 
@@ -73,7 +73,7 @@ describe("route() - Large Context Override", () => {
     const result = route(longPrompt, undefined, { config });
 
     expect(result.tier).toBe("COMPLEX");
-    expect(result.model).toBe("opus");
+    expect(result.model).toBe("opus[1m]");
     expect(result.confidence).toBe(0.95);
     expect(result.signals).toContain("large-context");
     expect(result.reasoning).toContain("100000 tokens");
@@ -85,7 +85,7 @@ describe("route() - Large Context Override", () => {
     const result = route(prompt, system, { config });
 
     expect(result.tier).toBe("COMPLEX");
-    expect(result.model).toBe("opus");
+    expect(result.model).toBe("opus[1m]");
   });
 
   it("should not trigger override for prompts just under threshold", () => {

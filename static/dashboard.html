@@ -976,6 +976,8 @@ tr.clickable { cursor: pointer; }
     <div class="stat-grid" id="usage-stats"></div>
     <h3 style="margin-bottom:8px;">Daily Cost Trend</h3>
     <div id="usage-daily"></div>
+    <h3 style="margin-top:16px;margin-bottom:8px;">Avg Cost per Query</h3>
+    <div id="usage-avg-cost-chart"></div>
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:16px;">
       <div>
         <h3 style="margin-bottom:8px;">By Thread</h3>
@@ -2738,6 +2740,58 @@ tr.clickable { cursor: pointer; }
       dailyHtml = '<div class="empty-state">No daily data</div>';
     }
     document.getElementById('usage-daily').innerHTML = dailyHtml;
+
+    // Avg cost per query line chart (SVG)
+    var avgChartHtml = '';
+    if (data.daily && data.daily.length > 1) {
+      // Reverse so oldest is first (data.daily comes newest-first)
+      var days = data.daily.slice().reverse();
+      var points = [];
+      var maxAvg = 0;
+      for (var i = 0; i < days.length; i++) {
+        var avg = days[i].queries > 0 ? days[i].costUSD / days[i].queries : 0;
+        if (avg > maxAvg) maxAvg = avg;
+        points.push({ date: days[i].date, avg: avg, queries: days[i].queries });
+      }
+      if (maxAvg === 0) maxAvg = 0.01;
+      var svgW = 600, svgH = 200, padL = 50, padR = 10, padT = 10, padB = 30;
+      var chartW = svgW - padL - padR, chartH = svgH - padT - padB;
+      var pathD = '';
+      var dotsSvg = '';
+      var labelsSvg = '';
+      var step = points.length > 1 ? chartW / (points.length - 1) : 0;
+      for (var i = 0; i < points.length; i++) {
+        var x = padL + i * step;
+        var y = padT + chartH - (points[i].avg / maxAvg * chartH);
+        if (i === 0) pathD += 'M' + x + ',' + y;
+        else pathD += 'L' + x + ',' + y;
+        dotsSvg += '<circle cx="' + x + '" cy="' + y + '" r="3" fill="var(--accent-blue)" title="' + points[i].date + ': ' + fmtUSD(points[i].avg) + '/q (' + points[i].queries + 'q)"><title>' + points[i].date.slice(5) + ': ' + fmtUSD(points[i].avg) + '/q (' + points[i].queries + 'q)</title></circle>';
+        // Show label every ~N points to avoid crowding
+        var labelInterval = Math.max(1, Math.floor(points.length / 8));
+        if (i % labelInterval === 0 || i === points.length - 1) {
+          labelsSvg += '<text x="' + x + '" y="' + (svgH - 5) + '" fill="var(--text-secondary)" font-size="10" text-anchor="middle">' + points[i].date.slice(5) + '</text>';
+        }
+      }
+      // Y-axis labels
+      var yAxisSvg = '';
+      for (var t = 0; t <= 4; t++) {
+        var val = maxAvg * t / 4;
+        var yy = padT + chartH - (t / 4 * chartH);
+        yAxisSvg += '<text x="' + (padL - 5) + '" y="' + (yy + 3) + '" fill="var(--text-secondary)" font-size="10" text-anchor="end">' + fmtUSD(val) + '</text>';
+        yAxisSvg += '<line x1="' + padL + '" y1="' + yy + '" x2="' + (svgW - padR) + '" y2="' + yy + '" stroke="var(--border)" stroke-dasharray="3,3" />';
+      }
+      avgChartHtml = '<svg viewBox="0 0 ' + svgW + ' ' + svgH + '" style="width:100%;max-width:600px;height:auto;">' +
+        yAxisSvg +
+        '<path d="' + pathD + '" fill="none" stroke="var(--accent-blue)" stroke-width="2" />' +
+        dotsSvg + labelsSvg +
+        '</svg>';
+    } else if (data.daily && data.daily.length === 1) {
+      var singleAvg = data.daily[0].queries > 0 ? data.daily[0].costUSD / data.daily[0].queries : 0;
+      avgChartHtml = '<div style="color:var(--text-secondary);font-size:13px;">' + data.daily[0].date + ': ' + fmtUSD(singleAvg) + '/query (' + data.daily[0].queries + ' queries)</div>';
+    } else {
+      avgChartHtml = '<div class="empty-state">No daily data</div>';
+    }
+    document.getElementById('usage-avg-cost-chart').innerHTML = avgChartHtml;
 
     // By Thread table
     var threadHtml = '<table><thead><tr><th>Thread</th><th>Cost</th><th>Tokens</th><th>Queries</th></tr></thead><tbody>';

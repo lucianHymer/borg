@@ -1,6 +1,6 @@
 # Borg
 
-Telegram forum-based multi-session Claude agent with SDK v2, smart routing, and cross-thread orchestration.
+Telegram forum-based multi-session Claude agent with SDK v2, sticky model selection, and cross-thread orchestration.
 
 ## Philosophy
 
@@ -9,9 +9,8 @@ Compound knowledge into repos. The repo should get smarter over time — workflo
 ## Architecture
 
 - **Telegram Client** (`src/telegram-client.ts`) — grammY bot handling all forum topics, I/O and routing log finalization
-- **Queue Processor** (`src/queue-processor.ts`) — SDK v2 sessions, routing, history injection
+- **Queue Processor** (`src/queue-processor.ts`) — SDK v2 sessions, sticky model, history injection
 - **Session Manager** (`src/session-manager.ts`) — threadId → session lifecycle, threads.json
-- **Router** (`src/router/`) — 14-dimension weighted scoring engine, model selection
 - **Message History** (`src/message-history.ts`) — shared JSONL log, tagged by threadId; carries optional token usage + cost fields on outgoing entries
 - **Routing Logger** (`src/routing-logger.ts`) — JSONL log of routing decisions
 - **Zone Config** (`src/zone-config.ts`) — zone-config.json loader, validation, mtime caching
@@ -30,8 +29,7 @@ Container-level isolation. Agents are separated into **Core** (trusted) and **Pe
 
 - `.borg/threads.json` — thread configurations (threadId → session mapping)
 - `.borg/message-history.jsonl` — all messages across all threads
-- `.borg/routing-log.jsonl` — routing decision audit trail
-- `.borg/message-models.json` — Telegram messageId → model mapping for reply routing
+- `.borg/message-models.json` — Telegram messageId → model mapping
 - `.borg/settings.json` — bot token, chat ID, timezone, intervals
 - `zone-config.json` — thread-to-zone mapping (see Security Zones)
 - `HEARTBEAT.md` — living task list for heartbeat checks (per-repo)
@@ -48,9 +46,9 @@ Agents communicate through the file queue system:
 
 Queue messages carry a `source` field: `"user"`, `"cross-thread"`, `"heartbeat"`, `"cli"`, `"system"`, `"broadcast"`.
 
-## Model Routing
+## Model Selection
 
-Smart routing uses 14 weighted dimensions to classify messages as SIMPLE (haiku), MEDIUM (sonnet), or COMPLEX (opus). Replies to bot messages can only upgrade the model. Fresh messages allow free model selection.
+Sticky per-thread model — each thread uses its configured model for all messages (`threadConfig.model`). Default: `sonnet[1m]`. Change via `/model <haiku|sonnet|opus>` (also resets the session to maximize prompt cache hits). The `[1m]` suffix enables 1M context window. Effort defaults to `medium`; include "ultrathink" in a message for `max` (opus) or `high` (sonnet). Heartbeats are always haiku one-shot sessions (no resume, no cache sharing with the main thread).
 
 ## Coding Conventions
 
@@ -63,7 +61,7 @@ Smart routing uses 14 weighted dimensions to classify messages as SIMPLE (haiku)
 
 ## Broadcasting
 
-Cross-repo knowledge sharing via a shared Telegram group. The `broadcast` MCP tool posts structured messages; incoming broadcasts fan out to all `mainThread: true` threads with `[use opus]` prefix. See `skills/global/broadcasting.md` for send/receive guidance. Requires `broadcast_chat_id` in settings.json and `mainThread: true` on primary repo threads.
+Cross-repo knowledge sharing via a shared Telegram group. The `broadcast` MCP tool posts structured messages; incoming broadcasts fan out to all `mainThread: true` threads. See `skills/global/broadcasting.md` for send/receive guidance. Requires `broadcast_chat_id` in settings.json and `mainThread: true` on primary repo threads.
 
 ## Build
 

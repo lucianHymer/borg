@@ -19,8 +19,6 @@ import type {
     Query,
     CanUseTool as SDKCanUseTool,
 } from "@anthropic-ai/claude-agent-sdk";
-import { route, DEFAULT_ROUTING_CONFIG, maxTier } from "./router/index.js";
-import type { Tier, RoutingDecision } from "./router/index.js";
 import { toErrorMessage, isValidSessionId, TASK_LISTS_FILENAME } from "./types.js";
 import type { IncomingMessage, OutgoingMessage, TaskListMapping } from "./types.js";
 import {
@@ -240,22 +238,8 @@ function buildRetryFilename(filename: string, retryNum: number): string {
 
 // ─── Tier / Model Mapping ───
 
-// Use router config as single source of truth for tier → model mapping
-const TIER_TO_MODEL = DEFAULT_ROUTING_CONFIG.tiers;
-
-const MODEL_TO_TIER: Record<string, Tier> = {
-    haiku: "SIMPLE",
-    sonnet: "MEDIUM",
-    opus: "COMPLEX",
-};
-
-function modelToTier(model: string): Tier {
-    return MODEL_TO_TIER[model] ?? "MEDIUM";
-}
-
-function tierToModel(tier: Tier): string {
-    return TIER_TO_MODEL[tier];
-}
+// Default model for threads that don't have one explicitly set
+const DEFAULT_THREAD_MODEL = "sonnet[1m]";
 
 // ─── Session Log Sync ───
 
@@ -611,6 +595,7 @@ async function buildQueryOptions(
     threadConfig: ThreadConfig,
     effectiveModel: string,
     stderrLines?: string[],
+    messageText?: string,
 ): Promise<Options> {
     // Enable SDK task tracking
     const taskListId = getTaskListId(threadId, threadConfig);
@@ -620,8 +605,16 @@ async function buildQueryOptions(
     // Update task-lists mapping so telegram-client can find which threads use which task list
     updateTaskListMapping(threadId, taskListId, threadConfig.team);
 
+    // Effort: default medium, "ultrathink" in message bumps to max (opus) or high (sonnet)
+    const isUltrathink = messageText ? /\bultrathink\b/i.test(messageText) : false;
+    let effort: "low" | "medium" | "high" | "max" = "medium";
+    if (isUltrathink) {
+        effort = effectiveModel.includes("opus") ? "max" : "high";
+    }
+
     const opts: Options = {
         model: effectiveModel,
+        effort,
         cwd: threadConfig.cwd,
         canUseTool: sdkCanUseTool,
         settingSources: ["project", "user"],
@@ -970,49 +963,6 @@ async function processHeartbeat(msg: IncomingMessage): Promise<{ text: string; u
     }
 }
 
-// ─── Route a message to the right model ───
-
-function routeMessage(
-    msg: IncomingMessage,
-): { effectiveModel: string; decision: RoutingDecision } {
-    // Check budget mode first - bypass normal routing
-    if (isBudgetMode()) {
-        return {
-            effectiveModel: BUDGET_MODEL,
-            decision: {
-                tier: "SIMPLE" as Tier,
-                model: BUDGET_MODEL,
-                confidence: 1.0,
-                method: "rules",
-                reasoning: "budget_mode_enabled",
-                signals: ["budget_mode"],
-                estimatedTokens: 0,
-            },
-        };
-    }
-
-    // Route on current message only — history context was inflating scores,
-    // making model selection "sticky" even for simple follow-ups.
-    // Reply-to stickiness (isReply + replyToModel → maxTier below) already
-    // handles "continuing a complex conversation" intentionally.
-    const decision = route(msg.message, undefined, {
-        config: DEFAULT_ROUTING_CONFIG,
-    });
-
-    let effectiveTier: Tier;
-
-    if (msg.isReply && msg.replyToModel) {
-        const originalTier = modelToTier(msg.replyToModel);
-        effectiveTier = maxTier(originalTier, decision.tier);
-    } else {
-        effectiveTier = decision.tier;
-    }
-
-    const effectiveModel = tierToModel(effectiveTier);
-
-    return { effectiveModel, decision };
-}
-
 // ─── Process a Single Message ───
 
 async function processMessage(messageFile: string): Promise<void> {
@@ -1153,7 +1103,6 @@ async function processMessage(messageFile: string): Promise<void> {
     let responseText: string;
     let budgetUsageId: string | undefined;
     let effectiveModel: string;
-    let routingResult: { effectiveModel: string; decision: RoutingDecision } | undefined;
     let usageData: QueryUsageData | undefined;
 
     try {
@@ -1215,16 +1164,6 @@ async function processMessage(messageFile: string): Promise<void> {
                 return;
             }
         } else {
-            // ─── Route the message ───
-            routingResult = routeMessage(msg);
-            effectiveModel = routingResult.effectiveModel;
-
-            log(
-                "INFO",
-                `Routed thread=${threadId}: tier=${routingResult.decision.tier} model=${effectiveModel} ` +
-                    `confidence=${routingResult.decision.confidence.toFixed(2)} signals=[${routingResult.decision.signals.join(", ")}]`,
-            );
-
             // ─── Load thread config ───
             const threads = loadThreads();
             const key = String(threadId);
@@ -1250,10 +1189,15 @@ async function processMessage(messageFile: string): Promise<void> {
             // Update lastActive
             threads[key].lastActive = Date.now();
 
-            // Apply thread-level model override (e.g. explicit Fireworks model on the thread)
-            if (threadConfig.model?.includes("fireworks")) {
-                effectiveModel = threadConfig.model;
+            // ─── Sticky model: use thread's configured model (set via /model command) ───
+            // Budget mode overrides thread model; otherwise use thread config or default
+            if (isBudgetMode()) {
+                effectiveModel = BUDGET_MODEL;
+            } else {
+                effectiveModel = threadConfig.model || DEFAULT_THREAD_MODEL;
             }
+
+            log("INFO", `Thread ${threadId}: model=${effectiveModel}`);
 
             // ─── Build the full prompt ───
             const now = formatCurrentTime();
@@ -1287,7 +1231,7 @@ async function processMessage(messageFile: string): Promise<void> {
 
             // ─── Send query ───
             const stderrLines: string[] = [];
-            const options = await buildQueryOptions(threadId, threadConfig, effectiveModel, stderrLines);
+            const options = await buildQueryOptions(threadId, threadConfig, effectiveModel, stderrLines, msg.message);
 
             // Create pending usage file for budget mode or thread-level Fireworks model correlation
             if (isBudgetMode() || effectiveModel.includes("fireworks")) {
@@ -1505,16 +1449,6 @@ async function processMessage(messageFile: string): Promise<void> {
             timestamp: Date.now(),
             messageId,
             model: effectiveModel,
-            ...(source !== "heartbeat" && routingResult ? {
-                routingMetadata: {
-                    tier: routingResult.decision.tier,
-                    model: effectiveModel,
-                    confidence: routingResult.decision.confidence,
-                    signals: routingResult.decision.signals,
-                    tokens: routingResult.decision.estimatedTokens,
-                    prompt: msg.message,
-                },
-            } : {}),
             ...(msg.telegramMessageId && msg.voiceDuration ? {
                 replyToMessageId: msg.telegramMessageId,
                 replyToVoice: true,
