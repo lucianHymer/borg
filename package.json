@@ -13,7 +13,7 @@
     "test:coverage": "vitest --coverage"
   },
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "^0.2.38",
+    "@anthropic-ai/claude-agent-sdk": "^0.2.76",
     "@grammyjs/auto-retry": "^2.0.2",
     "express": "^5.1.0",
     "grammy": "^1.37.1",
