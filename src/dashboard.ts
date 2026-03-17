@@ -1196,6 +1196,242 @@ app.get("/api/scheduled-tasks", (_req, res) => {
     res.json({ tasks: tasksWithNext });
 });
 
+// ─── Single Response Detail ───
+
+// GET /response/:messageId — serve the response detail HTML page
+app.get("/response/:messageId", (_req, res) => {
+    const htmlPath = path.join(STATIC_DIR, "response.html");
+    if (fs.existsSync(htmlPath)) {
+        res.sendFile(htmlPath);
+    } else {
+        res.status(404).send("Response detail page not found.");
+    }
+});
+
+/**
+ * Find message history entries by messageId across all zone directories.
+ * Returns { incoming, outgoing } pair if found.
+ */
+function findResponseByMessageId(messageId: string): {
+    incoming: Record<string, unknown> | null;
+    outgoing: Record<string, unknown> | null;
+    sessionId: string | undefined;
+} {
+    const zoneDirs = [
+        BORG_DIR,
+        path.join(SCRIPT_DIR, ".borg-core"),
+        path.join(SCRIPT_DIR, ".borg-perimeter"),
+    ];
+
+    let incoming: Record<string, unknown> | null = null;
+    let outgoing: Record<string, unknown> | null = null;
+    let sessionId: string | undefined;
+
+    for (const dir of zoneDirs) {
+        const histFile = path.join(dir, "message-history.jsonl");
+        if (!fs.existsSync(histFile)) continue;
+        try {
+            const content = fs.readFileSync(histFile, "utf8");
+            for (const line of content.split("\n")) {
+                if (!line.trim()) continue;
+                try {
+                    const entry = JSON.parse(line) as Record<string, unknown>;
+                    if (entry.messageId !== messageId) continue;
+                    if (entry.direction === "in") {
+                        incoming = entry;
+                    } else if (entry.direction === "out") {
+                        outgoing = entry;
+                        if (entry.sessionId) sessionId = entry.sessionId as string;
+                    }
+                } catch { /* skip malformed */ }
+            }
+        } catch { /* file read error */ }
+    }
+
+    return { incoming, outgoing, sessionId };
+}
+
+/**
+ * Quick tail-read to find an outgoing entry by messageId.
+ * Reads only last 128KB of each history file — much cheaper than full scan.
+ */
+function findResponseInTail(messageId: string): Record<string, unknown> | null {
+    const zoneDirs = [
+        BORG_DIR,
+        path.join(SCRIPT_DIR, ".borg-core"),
+        path.join(SCRIPT_DIR, ".borg-perimeter"),
+    ];
+    const TAIL_BYTES = 128 * 1024;
+    for (const dir of zoneDirs) {
+        const histFile = path.join(dir, "message-history.jsonl");
+        if (!fs.existsSync(histFile)) continue;
+        try {
+            const stat = fs.statSync(histFile);
+            const readStart = Math.max(0, stat.size - TAIL_BYTES);
+            const fd = fs.openSync(histFile, "r");
+            try {
+                const buf = Buffer.alloc(Math.min(TAIL_BYTES, stat.size));
+                fs.readSync(fd, buf, 0, buf.length, readStart);
+                const lines = buf.toString("utf8").split("\n");
+                // Scan backwards for faster match
+                for (let i = lines.length - 1; i >= 0; i--) {
+                    if (!lines[i].trim()) continue;
+                    try {
+                        const entry = JSON.parse(lines[i]) as Record<string, unknown>;
+                        if (entry.messageId === messageId && entry.direction === "out") return entry;
+                    } catch { /* skip */ }
+                }
+            } finally {
+                fs.closeSync(fd);
+            }
+        } catch { /* file read error */ }
+    }
+    return null;
+}
+
+// GET /api/response/:messageId — full response detail data
+app.get("/api/response/:messageId", (req, res) => {
+    const { messageId } = req.params;
+    const threads = readJsonSafe<Record<string, { name?: string; sessionId?: string }>>(
+        THREADS_FILE,
+        {},
+    );
+
+    const { incoming, outgoing, sessionId } = findResponseByMessageId(messageId);
+
+    if (!incoming && !outgoing) {
+        res.status(404).json({ error: "Response not found" });
+        return;
+    }
+
+    // Get session logs if we have a sessionId
+    let sessionLogs: string[] = [];
+    const resolvedSessionId = sessionId
+        || (outgoing?.threadId ? threads[String(outgoing.threadId)]?.sessionId : undefined);
+    if (resolvedSessionId) {
+        const logFile = findSessionLogFile(resolvedSessionId);
+        if (logFile) {
+            sessionLogs = tailLines(logFile, 500);
+        }
+    }
+
+    const threadId = (outgoing?.threadId ?? incoming?.threadId) as number | undefined;
+    const threadName = threadId ? (threads[String(threadId)]?.name ?? `Thread ${threadId}`) : undefined;
+
+    res.json({
+        messageId,
+        threadId,
+        threadName,
+        incoming,
+        outgoing,
+        sessionId: resolvedSessionId,
+        sessionLogs,
+    });
+});
+
+// GET /api/response/:messageId/feed — SSE stream for live response updates
+app.get("/api/response/:messageId/feed", (req, res) => {
+    const { messageId } = req.params;
+
+    res.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive",
+    });
+    res.write(":\n\n");
+
+    // Find the status file for this messageId (zone-aware)
+    function findStatusFile(): string | null {
+        const zoneDirs = [
+            BORG_DIR,
+            path.join(SCRIPT_DIR, ".borg-core"),
+            path.join(SCRIPT_DIR, ".borg-perimeter"),
+        ];
+        for (const dir of zoneDirs) {
+            const statusFile = path.join(dir, "status", `${messageId}.json`);
+            if (fs.existsSync(statusFile)) return statusFile;
+        }
+        return null;
+    }
+
+    // Find session log file for this messageId's thread
+    function findSessionLogForMessage(): { logFile: string; sessionId: string } | null {
+        const threads = readJsonSafe<Record<string, { sessionId?: string }>>(THREADS_FILE, {});
+        const { outgoing, sessionId } = findResponseByMessageId(messageId);
+        const resolvedSessionId = sessionId
+            || (outgoing?.threadId ? threads[String(outgoing.threadId)]?.sessionId : undefined);
+        if (!resolvedSessionId) return null;
+        const logFile = findSessionLogFile(resolvedSessionId);
+        if (!logFile) return null;
+        return { logFile, sessionId: resolvedSessionId };
+    }
+
+    let sessionLogTail: TailState = { offset: 0 };
+    let sessionLogFile: string | null = null;
+    let lastStatusJson = "";
+    let completeSent = false;
+
+    // Initialize session log offset to current EOF
+    const sessionInfo = findSessionLogForMessage();
+    if (sessionInfo) {
+        sessionLogFile = sessionInfo.logFile;
+        if (fs.existsSync(sessionLogFile)) {
+            sessionLogTail.offset = fs.statSync(sessionLogFile).size;
+        }
+    }
+
+    const interval = setInterval(() => {
+        if (completeSent) return;
+
+        // Check status file
+        const statusFile = findStatusFile();
+        if (statusFile) {
+            try {
+                const json = fs.readFileSync(statusFile, "utf8");
+                if (json !== lastStatusJson) {
+                    lastStatusJson = json;
+                    res.write(`event: status\ndata: ${json}\n\n`);
+                }
+            } catch { /* best effort */ }
+        }
+
+        // Check for new session log entries
+        if (!sessionLogFile) {
+            const info = findSessionLogForMessage();
+            if (info) {
+                sessionLogFile = info.logFile;
+                sessionLogTail.offset = 0; // Read all existing entries on first find
+            }
+        }
+
+        if (sessionLogFile) {
+            const newData = readNewBytes(sessionLogFile, sessionLogTail);
+            if (newData) {
+                for (const line of newData.split("\n")) {
+                    if (!line.trim()) continue;
+                    res.write(`event: session-log\ndata: ${line}\n\n`);
+                }
+            }
+        }
+
+        // Check if response is complete: status file gone = processing finished
+        // Use tail-read of history (last 64KB) to find the outgoing entry — avoids full file scan
+        if (!statusFile && lastStatusJson) {
+            // Status file existed before but is now gone — response should be in history
+            const outgoing = findResponseInTail(messageId);
+            if (outgoing) {
+                res.write(`event: complete\ndata: ${JSON.stringify(outgoing)}\n\n`);
+                completeSent = true;
+                clearInterval(interval);
+            }
+        }
+    }, 2000);
+
+    req.on("close", () => {
+        clearInterval(interval);
+    });
+});
+
 // ─── Start Server ───
 
 const server = http.createServer(app);

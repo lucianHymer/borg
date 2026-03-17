@@ -326,7 +326,7 @@ function splitMessage(text: string, maxLength = 4096): string[] {
 
 // ─── Reply Keyboard Builder ───
 
-function buildReplyKeyboard(botMessageId: number, replyToMessageId?: number, replyToVoice?: boolean): InlineKeyboard {
+function buildReplyKeyboard(botMessageId: number, replyToMessageId?: number, replyToVoice?: boolean, queueMessageId?: string): InlineKeyboard {
     const keyboard = new InlineKeyboard();
 
     // Add voice transcript buttons if replying to a voice message
@@ -337,6 +337,12 @@ function buildReplyKeyboard(botMessageId: number, replyToMessageId?: number, rep
 
     // Always add Listen button for bot response
     keyboard.text("🔊 Listen", `listen:${botMessageId}`);
+
+    // Add dashboard link if configured
+    if (settings.dashboard_url && queueMessageId) {
+        const url = `${settings.dashboard_url.replace(/\/$/, '')}/response/${queueMessageId}`;
+        keyboard.url("📊 Dashboard", url);
+    }
 
     return keyboard;
 }
@@ -1499,7 +1505,7 @@ async function pollOutgoingQueue(): Promise<void> {
                         // Add buttons to the first response message (user-facing only)
                         if (firstSentId) {
                             try {
-                                const keyboard = buildReplyKeyboard(firstSentId, data.replyToMessageId, data.replyToVoice);
+                                const keyboard = buildReplyKeyboard(firstSentId, data.replyToMessageId, data.replyToVoice, data.messageId);
                                 await bot.api.editMessageReplyMarkup(pending.chatId, firstSentId, {
                                     reply_markup: keyboard,
                                 });
@@ -1550,7 +1556,7 @@ async function pollOutgoingQueue(): Promise<void> {
 
                         if (firstSentId) {
                             try {
-                                const keyboard = buildReplyKeyboard(firstSentId, data.replyToMessageId, data.replyToVoice);
+                                const keyboard = buildReplyKeyboard(firstSentId, data.replyToMessageId, data.replyToVoice, data.messageId);
                                 await bot.api.editMessageReplyMarkup(settings.telegram_chat_id, firstSentId, {
                                     reply_markup: keyboard,
                                 });
@@ -1755,9 +1761,14 @@ async function pollStatusFiles(): Promise<void> {
         // Throttle: label/preview changes edit immediately, timer-only throttle to 20s
         if (!labelChanged && !previewChanged && !isStale && timeSinceLastEdit < 20_000) continue;
 
-        const cancelKeyboard = statusData.label !== "Cancelled"
-            ? new InlineKeyboard().text("✕ Cancel", `cancel:${messageId}`)
-            : undefined;
+        let cancelKeyboard: InlineKeyboard | undefined;
+        if (statusData.label !== "Cancelled") {
+            cancelKeyboard = new InlineKeyboard().text("✕ Cancel", `cancel:${messageId}`);
+            if (settings.dashboard_url) {
+                const dashUrl = `${settings.dashboard_url.replace(/\/$/, '')}/response/${messageId}`;
+                cancelKeyboard.url("📊 Live", dashUrl);
+            }
+        }
 
         try {
             if (pending.statusMessageId) {
