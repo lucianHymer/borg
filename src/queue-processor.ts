@@ -702,9 +702,18 @@ async function buildQueryOptions(
         delete process.env.ANTHROPIC_BASE_URL;
     }
 
-    // Resume existing session if available
-    if (threadConfig.sessionId) {
-        opts.resume = threadConfig.sessionId;
+    // Resume existing session if available — but only if the session file exists.
+    // After container restarts, session JSONL files may be gone, causing
+    // "No conversation found with session ID" errors from the SDK.
+    if (threadConfig.sessionId && isValidSessionId(threadConfig.sessionId)) {
+        const slug = cwdToProjectSlug(threadConfig.cwd);
+        const sessionFile = path.join(CLAUDE_HOME, "projects", slug, `${threadConfig.sessionId}.jsonl`);
+        if (fs.existsSync(sessionFile)) {
+            opts.resume = threadConfig.sessionId;
+        } else {
+            log("WARN", `Session file missing for thread ${threadId} (${threadConfig.sessionId}) — starting fresh`);
+            deleteThreadField(threadId, "sessionId");
+        }
     }
 
     return opts;

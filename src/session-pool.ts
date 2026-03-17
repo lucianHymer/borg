@@ -2,8 +2,10 @@
  * Session Pool — Persistent V1 SDK sessions per thread.
  *
  * Keeps Query instances alive across messages for the same thread.
- * First message creates the session with an AsyncIterable prompt (streaming mode).
- * Subsequent messages injected via streamInput() — near-zero latency.
+ * First message creates the session with a string prompt (standard mode).
+ * Subsequent messages injected via streamInput() for session reuse.
+ * If streamInput() fails (e.g., not in streaming mode), falls back to
+ * creating a new query with resume — functionally identical, just slower.
  *
  * When a session is busy (background tasks consuming the iterator), new messages
  * fall back to creating a new query with resume.
@@ -15,7 +17,6 @@ import type {
     Options,
     Query,
 } from "@anthropic-ai/claude-agent-sdk";
-import { toErrorMessage } from "./types.js";
 
 export type SessionState = "idle" | "processing" | "monitoring_background";
 
@@ -30,64 +31,12 @@ export interface ManagedSession {
     createdAt: number;
 }
 
-// ─── Message Channel ───
-// Creates an async iterable that yields exactly one message (the first prompt),
-// then stays open indefinitely. This keeps the SDK subprocess alive in streaming mode.
-
-interface MessageChannel {
-    iterable: AsyncIterable<SDKUserMessage>;
-    close: () => void;
-}
-
-function createMessageChannel(firstPrompt: string, sessionId: string): MessageChannel {
-    let closed = false;
-    let resolve: (() => void) | null = null;
-    let firstConsumed = false;
-
-    const msg: SDKUserMessage = {
-        type: "user",
-        message: { role: "user", content: firstPrompt },
-        parent_tool_use_id: null,
-        session_id: sessionId,
-    };
-
-    const iterable: AsyncIterable<SDKUserMessage> = {
-        [Symbol.asyncIterator]() {
-            return {
-                async next(): Promise<IteratorResult<SDKUserMessage, void>> {
-                    if (!firstConsumed) {
-                        firstConsumed = true;
-                        return { done: false, value: msg };
-                    }
-                    // Block forever — keep the subprocess alive.
-                    // New messages arrive via streamInput(), not this channel.
-                    if (closed) {
-                        return { done: true, value: undefined };
-                    }
-                    await new Promise<void>((r) => { resolve = r; });
-                    return { done: true, value: undefined };
-                },
-            };
-        },
-    };
-
-    return {
-        iterable,
-        close() {
-            closed = true;
-            resolve?.();
-            resolve = null;
-        },
-    };
-}
-
 // ─── Session Pool ───
 
 type LogFn = (level: string, message: string) => void;
 
 export class SessionPool {
     private sessions = new Map<number, ManagedSession>();
-    private channels = new Map<number, MessageChannel>();
     private idleTimeoutMs: number;
     private maxSessions: number;
     private idleTimer: ReturnType<typeof setInterval> | null = null;
@@ -144,17 +93,15 @@ export class SessionPool {
             }
         }
 
-        // Generate a session ID for the message channel
-        // (The SDK will assign the real session ID, which we capture from events)
-        const placeholderSessionId = options.resume ?? crypto.randomUUID();
-
-        const channel = createMessageChannel(firstPrompt, placeholderSessionId);
-        const q = query({ prompt: channel.iterable, options });
+        // Use string prompt (not AsyncIterable) — the SDK emits result normally
+        // with string prompts. The Query object stays alive after result for
+        // subsequent streamInput() calls.
+        const q = query({ prompt: firstPrompt, options });
 
         const session: ManagedSession = {
             threadId,
             query: q,
-            sessionId: placeholderSessionId,
+            sessionId: options.resume ?? "",
             model,
             cwd,
             state: "processing",
@@ -163,7 +110,6 @@ export class SessionPool {
         };
 
         this.sessions.set(threadId, session);
-        this.channels.set(threadId, channel);
 
         this.log("INFO", `Session pool: created session for thread ${threadId} (model=${model})`);
         return q;
@@ -199,12 +145,6 @@ export class SessionPool {
     close(threadId: number): void {
         const session = this.sessions.get(threadId);
         if (!session) return;
-
-        const channel = this.channels.get(threadId);
-        if (channel) {
-            channel.close();
-            this.channels.delete(threadId);
-        }
 
         try {
             session.query.close();
