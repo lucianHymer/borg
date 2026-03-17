@@ -187,6 +187,9 @@ services:
       - ./.borg-core:/app/.borg-core:ro
       - ./.borg-perimeter:/app/.borg-perimeter:ro
       - ./.borg-infra:/app/.borg-infra:ro
+      # rw mounts for background task stop signals (dashboard writes, queue-processor reads)
+      - ./.borg-core/queue/task-stop:/app/.borg-core/queue/task-stop
+      - ./.borg-perimeter/queue/task-stop:/app/.borg-perimeter/queue/task-stop
       - ./threads.json:/app/threads.json:ro
       - ./zone-config.json:/app/zone-config.json:ro
       - ${WORKSPACE_ROOT:-/home/lucian/workspace}:/home/lucian/workspace:ro

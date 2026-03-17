@@ -725,24 +725,28 @@ function renderBackgroundTasks(taskData) {
           </div>
           ${t.summary ? `<div class="task-summary">${escapeHtml(t.summary)}</div>` : ''}
         </div>
-        ${showStop ? `<button class="task-stop-btn" onclick="stopTask('${escapeHtml(t.taskId)}', this)">Stop</button>` : ''}
+        ${showStop ? `<button class="task-stop-btn" data-stop-task="${escapeHtml(t.taskId)}">Stop</button>` : ''}
       </li>
     `;
   }).join('');
 }
 
-async function stopTask(taskId, btn) {
+// Event delegation for stop buttons (avoids inline onclick XSS vector)
+document.addEventListener('click', async (e) => {
+  const btn = e.target.closest('[data-stop-task]');
+  if (!btn) return;
+  const taskId = btn.dataset.stopTask;
   btn.disabled = true;
   btn.textContent = 'Stopping...';
   try {
-    const resp = await fetch(`/api/background-tasks/${taskId}/stop`, { method: 'POST' });
+    const resp = await fetch(`/api/background-tasks/${encodeURIComponent(taskId)}/stop`, { method: 'POST' });
     if (!resp.ok) {
       btn.textContent = 'Failed';
     }
   } catch {
     btn.textContent = 'Error';
   }
-}
+});
 
 function setBadge(status, text) {
   badge.className = `status-${status}`;

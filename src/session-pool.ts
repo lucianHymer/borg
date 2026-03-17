@@ -15,7 +15,6 @@ import type {
     Options,
     Query,
 } from "@anthropic-ai/claude-agent-sdk";
-import type { UUID } from "crypto";
 import { toErrorMessage } from "./types.js";
 
 export type SessionState = "idle" | "processing" | "monitoring_background";
@@ -90,11 +89,13 @@ export class SessionPool {
     private sessions = new Map<number, ManagedSession>();
     private channels = new Map<number, MessageChannel>();
     private idleTimeoutMs: number;
+    private maxSessions: number;
     private idleTimer: ReturnType<typeof setInterval> | null = null;
     private log: LogFn;
 
-    constructor(opts: { idleTimeoutMinutes?: number; log: LogFn }) {
+    constructor(opts: { idleTimeoutMinutes?: number; maxSessions?: number; log: LogFn }) {
         this.idleTimeoutMs = (opts.idleTimeoutMinutes ?? 30) * 60 * 1000;
+        this.maxSessions = opts.maxSessions ?? 8;
         this.log = opts.log;
 
         // Check for idle sessions every 60 seconds
@@ -102,23 +103,14 @@ export class SessionPool {
     }
 
     /**
-     * Check if a thread has a reusable session (idle, matching model and cwd).
+     * Atomically check and claim an idle session matching the given model and cwd.
+     * Returns the Query object if a reusable session exists, null otherwise.
      */
-    hasReusableSession(threadId: number, model: string, cwd: string): boolean {
+    tryClaimSession(threadId: number, model: string, cwd: string): { query: Query; sessionId: string } | null {
         const session = this.sessions.get(threadId);
-        if (!session) return false;
-        if (session.model !== model || session.cwd !== cwd) return false;
-        if (session.state !== "idle") return false;
-        return true;
-    }
-
-    /**
-     * Get an existing idle session for reuse. Returns the Query object.
-     * The caller is responsible for calling streamInput() and consuming the response.
-     */
-    claimSession(threadId: number): { query: Query; sessionId: string } | null {
-        const session = this.sessions.get(threadId);
-        if (!session || session.state !== "idle") return null;
+        if (!session) return null;
+        if (session.model !== model || session.cwd !== cwd) return null;
+        if (session.state !== "idle") return null;
         session.state = "processing";
         session.lastActivity = Date.now();
         return { query: session.query, sessionId: session.sessionId };
@@ -137,6 +129,20 @@ export class SessionPool {
     ): Query {
         // Close any existing session for this thread
         this.close(threadId);
+
+        // Evict oldest idle session if at capacity
+        if (this.sessions.size >= this.maxSessions) {
+            let oldestIdle: { threadId: number; lastActivity: number } | null = null;
+            for (const [tid, s] of this.sessions) {
+                if (s.state === "idle" && (!oldestIdle || s.lastActivity < oldestIdle.lastActivity)) {
+                    oldestIdle = { threadId: tid, lastActivity: s.lastActivity };
+                }
+            }
+            if (oldestIdle) {
+                this.log("INFO", `Session pool: evicting idle session for thread ${oldestIdle.threadId} (at capacity ${this.maxSessions})`);
+                this.close(oldestIdle.threadId);
+            }
+        }
 
         // Generate a session ID for the message channel
         // (The SDK will assign the real session ID, which we capture from events)

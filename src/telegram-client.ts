@@ -752,9 +752,10 @@ bot.on("message:text").filter(
 
         // React with emoji: 👍 if thread is already busy (message queued behind another),
         // 👀 if this is the first/only message for the thread
-        const threadBusy = [...pendingMessages.values()].some(
-            p => p.threadId === threadId && pendingMessages.get(messageId) !== p
-        );
+        let threadBusy = false;
+        for (const [id, p] of pendingMessages) {
+            if (p.threadId === threadId && id !== messageId) { threadBusy = true; break; }
+        }
         try {
             const emoji = threadBusy ? "👍" : "👀";
             await bot.api.setMessageReaction(ctx.chat.id, ctx.msg.message_id,

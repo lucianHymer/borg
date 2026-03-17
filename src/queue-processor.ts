@@ -506,6 +506,7 @@ const activeBackgroundMonitors = new Map<number, Promise<void>>();
 // Persistent session pool for reusing SDK sessions across messages
 const sessionPool = new SessionPool({
     idleTimeoutMinutes: 30,
+    maxSessions: 16,
     log,
 });
 
@@ -802,6 +803,56 @@ interface MessageProcessingState {
     observer: QueryEventObserver | undefined;
 }
 
+// ─── Shared task event handler (used by both primary collection and background monitor) ───
+
+function applyTaskEvent(
+    msg: SDKMessage,
+    activeTasks: Map<string, BackgroundTaskInfo>,
+    observer?: QueryEventObserver,
+): void {
+    if (msg.type !== "system" || !("subtype" in msg)) return;
+    if (msg.subtype === "task_started") {
+        const taskMsg = msg as SDKTaskStartedMessage;
+        activeTasks.set(taskMsg.task_id, {
+            taskId: taskMsg.task_id,
+            description: taskMsg.description,
+            startedAt: Date.now(),
+            status: "running",
+        });
+        observer?.onTaskStarted?.(taskMsg.task_id, taskMsg.description);
+    }
+    if (msg.subtype === "task_progress") {
+        const taskMsg = msg as SDKTaskProgressMessage;
+        const existing = activeTasks.get(taskMsg.task_id);
+        if (existing) {
+            existing.summary = taskMsg.summary;
+            existing.lastToolName = taskMsg.last_tool_name;
+            existing.usage = {
+                totalTokens: taskMsg.usage.total_tokens,
+                toolUses: taskMsg.usage.tool_uses,
+                durationMs: taskMsg.usage.duration_ms,
+            };
+        }
+        observer?.onTaskProgress?.(taskMsg.task_id, taskMsg.summary);
+    }
+    if (msg.subtype === "task_notification") {
+        const taskMsg = msg as SDKTaskNotificationMessage;
+        const existing = activeTasks.get(taskMsg.task_id);
+        if (existing) {
+            existing.status = taskMsg.status;
+            existing.summary = taskMsg.summary;
+            if (taskMsg.usage) {
+                existing.usage = {
+                    totalTokens: taskMsg.usage.total_tokens,
+                    toolUses: taskMsg.usage.tool_uses,
+                    durationMs: taskMsg.usage.duration_ms,
+                };
+            }
+        }
+        observer?.onTaskCompleted?.(taskMsg.task_id, taskMsg.status, taskMsg.summary);
+    }
+}
+
 function processSDKMessage(msg: SDKMessage, state: MessageProcessingState): void {
     // Always capture the latest session_id (it may change after compaction)
     if ("session_id" in msg && msg.session_id) {
@@ -854,49 +905,7 @@ function processSDKMessage(msg: SDKMessage, state: MessageProcessingState): void
     }
 
     // Track background tasks
-    if (msg.type === "system" && "subtype" in msg) {
-        if (msg.subtype === "task_started") {
-            const taskMsg = msg as SDKTaskStartedMessage;
-            const taskInfo: BackgroundTaskInfo = {
-                taskId: taskMsg.task_id,
-                description: taskMsg.description,
-                startedAt: Date.now(),
-                status: "running",
-            };
-            state.activeTasks.set(taskMsg.task_id, taskInfo);
-            state.observer?.onTaskStarted?.(taskMsg.task_id, taskMsg.description);
-        }
-        if (msg.subtype === "task_progress") {
-            const taskMsg = msg as SDKTaskProgressMessage;
-            const existing = state.activeTasks.get(taskMsg.task_id);
-            if (existing) {
-                existing.summary = taskMsg.summary;
-                existing.lastToolName = taskMsg.last_tool_name;
-                existing.usage = {
-                    totalTokens: taskMsg.usage.total_tokens,
-                    toolUses: taskMsg.usage.tool_uses,
-                    durationMs: taskMsg.usage.duration_ms,
-                };
-            }
-            state.observer?.onTaskProgress?.(taskMsg.task_id, taskMsg.summary);
-        }
-        if (msg.subtype === "task_notification") {
-            const taskMsg = msg as SDKTaskNotificationMessage;
-            const existing = state.activeTasks.get(taskMsg.task_id);
-            if (existing) {
-                existing.status = taskMsg.status;
-                existing.summary = taskMsg.summary;
-                if (taskMsg.usage) {
-                    existing.usage = {
-                        totalTokens: taskMsg.usage.total_tokens,
-                        toolUses: taskMsg.usage.tool_uses,
-                        durationMs: taskMsg.usage.duration_ms,
-                    };
-                }
-            }
-            state.observer?.onTaskCompleted?.(taskMsg.task_id, taskMsg.status, taskMsg.summary);
-        }
-    }
+    applyTaskEvent(msg, state.activeTasks, state.observer);
 
     if (msg.type === "result") {
         const result = msg as SDKResultMessage;
@@ -1055,9 +1064,11 @@ async function monitorBackgroundTasks(
     messageId: string,
 ): Promise<void> {
     const alertedTaskIds = new Set<string>();
+    let lastWrittenTaskJson = "";
 
     // Write initial task state for dashboard
     writeTaskState(messageId, threadId, activeTasks);
+    lastWrittenTaskJson = JSON.stringify(Object.fromEntries(activeTasks));
 
     const iterator = q[Symbol.asyncIterator]();
 
@@ -1122,8 +1133,9 @@ async function monitorBackgroundTasks(
             }
 
             // Poll for next event with 5s timeout (to recheck stop signals and alerts)
+            let timeoutHandle: ReturnType<typeof setTimeout>;
             const timeoutPromise = new Promise<"timeout">((resolve) => {
-                setTimeout(() => resolve("timeout"), 5_000);
+                timeoutHandle = setTimeout(() => resolve("timeout"), 5_000);
             });
             const winner = await Promise.race([
                 iterator.next().then((r) => ({ kind: "event" as const, result: r })),
@@ -1131,56 +1143,20 @@ async function monitorBackgroundTasks(
             ]);
 
             if (winner.kind === "timeout") {
-                // Update task state file for dashboard even on timeout (refreshes timestamps)
-                writeTaskState(messageId, threadId, activeTasks);
                 continue;
             }
+            clearTimeout(timeoutHandle!);
 
             const iterResult = winner.result;
             if (iterResult.done) break;
 
             const msg = iterResult.value;
 
-            // Handle task events
-            if (msg.type === "system" && "subtype" in msg) {
-                if (msg.subtype === "task_started") {
-                    const taskMsg = msg as SDKTaskStartedMessage;
-                    activeTasks.set(taskMsg.task_id, {
-                        taskId: taskMsg.task_id,
-                        description: taskMsg.description,
-                        startedAt: Date.now(),
-                        status: "running",
-                    });
-                }
-                if (msg.subtype === "task_progress") {
-                    const taskMsg = msg as SDKTaskProgressMessage;
-                    const existing = activeTasks.get(taskMsg.task_id);
-                    if (existing) {
-                        existing.summary = taskMsg.summary;
-                        existing.lastToolName = taskMsg.last_tool_name;
-                        existing.usage = {
-                            totalTokens: taskMsg.usage.total_tokens,
-                            toolUses: taskMsg.usage.tool_uses,
-                            durationMs: taskMsg.usage.duration_ms,
-                        };
-                    }
-                }
-                if (msg.subtype === "task_notification") {
-                    const taskMsg = msg as SDKTaskNotificationMessage;
-                    const existing = activeTasks.get(taskMsg.task_id);
-                    if (existing) {
-                        existing.status = taskMsg.status;
-                        existing.summary = taskMsg.summary;
-                        if (taskMsg.usage) {
-                            existing.usage = {
-                                totalTokens: taskMsg.usage.total_tokens,
-                                toolUses: taskMsg.usage.tool_uses,
-                                durationMs: taskMsg.usage.duration_ms,
-                            };
-                        }
-                    }
-                    log("INFO", `Background task ${taskMsg.task_id} ${taskMsg.status}: ${taskMsg.summary}`);
-                }
+            // Handle task events via shared handler
+            applyTaskEvent(msg, activeTasks);
+            if (msg.type === "system" && "subtype" in msg && msg.subtype === "task_notification") {
+                const taskMsg = msg as SDKTaskNotificationMessage;
+                log("INFO", `Background task ${taskMsg.task_id} ${taskMsg.status}: ${taskMsg.summary}`);
             }
 
             // Capture final usage from result message
@@ -1194,8 +1170,12 @@ async function monitorBackgroundTasks(
                 log("INFO", `Background tasks complete for ${messageId}: cost=$${finalUsage.totalCostUSD.toFixed(4)}`);
             }
 
-            // Update task state file for dashboard
-            writeTaskState(messageId, threadId, activeTasks);
+            // Update task state file for dashboard (only if changed)
+            const currentTaskJson = JSON.stringify(Object.fromEntries(activeTasks));
+            if (currentTaskJson !== lastWrittenTaskJson) {
+                writeTaskState(messageId, threadId, activeTasks);
+                lastWrittenTaskJson = currentTaskJson;
+            }
 
             // Check if all tasks are done
             const stillRunning = [...activeTasks.values()].some(t => t.status === "running");
@@ -1763,28 +1743,24 @@ async function processMessage(messageFile: string): Promise<void> {
 
             // Try to reuse an existing persistent session for this thread
             let q: Query;
-            const canReuse = sessionPool.hasReusableSession(threadId, effectiveModel, threadConfig.cwd);
-            if (canReuse) {
-                const claimed = sessionPool.claimSession(threadId);
-                if (claimed) {
-                    q = claimed.query;
-                    // Inject the new message via streamInput (async iterable that yields one message)
-                    const userMsg: SDKUserMessage = {
-                        type: "user",
-                        message: { role: "user", content: fullPrompt },
-                        parent_tool_use_id: null,
-                        session_id: claimed.sessionId,
-                    };
-                    try {
-                        await q.streamInput((async function* () { yield userMsg; })());
-                        log("INFO", `Session pool: reused session for thread ${threadId}`);
-                    } catch (err) {
-                        // streamInput failed — fall back to new session
-                        log("WARN", `Session pool: streamInput failed for thread ${threadId}: ${toErrorMessage(err)} — creating new session`);
-                        sessionPool.close(threadId);
-                        q = sessionPool.createSession(threadId, fullPrompt, options, effectiveModel, threadConfig.cwd);
-                    }
-                } else {
+            // Try to reuse an existing persistent session for this thread
+            const claimed = sessionPool.tryClaimSession(threadId, effectiveModel, threadConfig.cwd);
+            if (claimed) {
+                q = claimed.query;
+                // Inject the new message via streamInput (async iterable that yields one message)
+                const userMsg: SDKUserMessage = {
+                    type: "user",
+                    message: { role: "user", content: fullPrompt },
+                    parent_tool_use_id: null,
+                    session_id: claimed.sessionId,
+                };
+                try {
+                    await q.streamInput((async function* () { yield userMsg; })());
+                    log("INFO", `Session pool: reused session for thread ${threadId}`);
+                } catch (err) {
+                    // streamInput failed — fall back to new session
+                    log("WARN", `Session pool: streamInput failed for thread ${threadId}: ${toErrorMessage(err)} — creating new session`);
+                    sessionPool.close(threadId);
                     q = sessionPool.createSession(threadId, fullPrompt, options, effectiveModel, threadConfig.cwd);
                 }
             } else {
