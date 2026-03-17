@@ -52,7 +52,7 @@ import {
     resetProxyAvailable,
 } from "./session-manager.js";
 import type { ThreadConfig, HeartbeatTier, HeartbeatSections } from "./session-manager.js";
-import { loadTasks, getDueTasks, markTaskComplete } from "./scheduled-tasks.js";
+import { loadTasks, getDueTasks, markTaskComplete, markTaskQueued } from "./scheduled-tasks.js";
 import type { ScheduledTask } from "./scheduled-tasks.js";
 import { z } from "zod/v4";
 
@@ -2117,6 +2117,8 @@ function runScheduledTasksCycle(): void {
             const final_ = path.join(QUEUE_INCOMING, `${messageId}.json`);
             fs.writeFileSync(tmp, JSON.stringify(incoming));
             fs.renameSync(tmp, final_);
+            // Mark queued immediately so next cycle won't re-detect this task
+            markTaskQueued(task.id);
         }
 
         log("INFO", `Scheduled tasks: queued ${dueTasks.length} due task(s)`);

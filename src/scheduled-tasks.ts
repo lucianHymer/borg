@@ -159,14 +159,22 @@ export function getDueTasks(): ScheduledTask[] {
 }
 
 /**
- * Mark a task as completed. Updates lastRunTs, lastResult, lastCostUSD.
+ * Mark a task as queued. Sets lastRunTs immediately so getDueTasks()
+ * won't re-detect it while it's still executing.
+ */
+export function markTaskQueued(id: string): void {
+    if (!loadTasks().find(t => t.id === id)) return;
+    updateTask(id, { lastRunTs: Date.now() });
+}
+
+/**
+ * Mark a task as completed. Updates lastResult and lastCostUSD.
  * Auto-deletes non-recurring tasks.
  */
 export function markTaskComplete(id: string, result: "success" | "error", costUSD: number): void {
     if (!loadTasks().find(t => t.id === id)) return;
 
     const task = updateTask(id, {
-        lastRunTs: Date.now(),
         lastResult: result,
         lastCostUSD: costUSD,
     });
