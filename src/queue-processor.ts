@@ -1,10 +1,13 @@
 #!/usr/bin/env node
 /**
- * Queue Processor - Agent SDK v1 query() API
+ * Queue Processor - Agent SDK v1 query() API with persistent sessions
  *
  * Processes messages from all channels (Telegram, CLI, heartbeat, cross-thread, etc.)
- * one at a time via a file-based queue. Each thread gets its own persistent session
- * via the resume mechanism. Smart routing selects the cheapest model per message.
+ * via a file-based queue. Regular messages use persistent sessions (SessionPool) —
+ * the SDK subprocess stays alive across messages for near-zero latency on consecutive
+ * messages and better prompt caching. Heartbeats, scheduled tasks, and one-shots use
+ * standalone query() calls. Background tasks are monitored asynchronously after end_turn
+ * without blocking the thread slot.
  */
 
 import fs from "fs";
@@ -18,10 +21,12 @@ import type {
     SDKTaskProgressMessage,
     SDKTaskNotificationMessage,
     SDKMessage,
+    SDKUserMessage,
     Options,
     Query,
     CanUseTool as SDKCanUseTool,
 } from "@anthropic-ai/claude-agent-sdk";
+import { SessionPool } from "./session-pool.js";
 import { toErrorMessage, isValidSessionId, TASK_LISTS_FILENAME } from "./types.js";
 import type { IncomingMessage, OutgoingMessage, TaskListMapping, BackgroundTaskInfo, BackgroundTaskState } from "./types.js";
 import {
@@ -497,6 +502,12 @@ let activeScheduledTaskCount = 0;
 
 // Background task monitors that run independently after end_turn
 const activeBackgroundMonitors = new Map<number, Promise<void>>();
+
+// Persistent session pool for reusing SDK sessions across messages
+const sessionPool = new SessionPool({
+    idleTimeoutMinutes: 30,
+    log,
+});
 
 // ─── SDK canUseTool Adapter ───
 
@@ -1737,7 +1748,7 @@ async function processMessage(messageFile: string): Promise<void> {
                 promptLength: fullPrompt.length,
             });
 
-            // ─── Send query ───
+            // ─── Send query (persistent session or new) ───
             const stderrLines: string[] = [];
             const options = await buildQueryOptions(threadId, threadConfig, effectiveModel, stderrLines, msg.message);
 
@@ -1750,7 +1761,35 @@ async function processMessage(messageFile: string): Promise<void> {
                 process.env.ANTHROPIC_BASE_URL = `${BUDGET_PROXY_URL}/${budgetUsageId}`;
             }
 
-            const q = query({ prompt: fullPrompt, options });
+            // Try to reuse an existing persistent session for this thread
+            let q: Query;
+            const canReuse = sessionPool.hasReusableSession(threadId, effectiveModel, threadConfig.cwd);
+            if (canReuse) {
+                const claimed = sessionPool.claimSession(threadId);
+                if (claimed) {
+                    q = claimed.query;
+                    // Inject the new message via streamInput (async iterable that yields one message)
+                    const userMsg: SDKUserMessage = {
+                        type: "user",
+                        message: { role: "user", content: fullPrompt },
+                        parent_tool_use_id: null,
+                        session_id: claimed.sessionId,
+                    };
+                    try {
+                        await q.streamInput((async function* () { yield userMsg; })());
+                        log("INFO", `Session pool: reused session for thread ${threadId}`);
+                    } catch (err) {
+                        // streamInput failed — fall back to new session
+                        log("WARN", `Session pool: streamInput failed for thread ${threadId}: ${toErrorMessage(err)} — creating new session`);
+                        sessionPool.close(threadId);
+                        q = sessionPool.createSession(threadId, fullPrompt, options, effectiveModel, threadConfig.cwd);
+                    }
+                } else {
+                    q = sessionPool.createSession(threadId, fullPrompt, options, effectiveModel, threadConfig.cwd);
+                }
+            } else {
+                q = sessionPool.createSession(threadId, fullPrompt, options, effectiveModel, threadConfig.cwd);
+            }
 
             // Write initial status; the telegram-client computes elapsed time from startTs
             const statusStartTime = Date.now();
@@ -1851,12 +1890,16 @@ async function processMessage(messageFile: string): Promise<void> {
                         ? `${fullAccumulatedText}\n\n---\n🚫 Processing was cancelled.`
                         : "🚫 Processing was cancelled.";
                     clearStatus(messageId);
+                    // Interrupt kills the subprocess — session is no longer reusable
+                    sessionPool.close(threadId);
                 } else if (cancelled) {
                     // Cancelled but collectPrimaryResponse returned normally
                     responseText = fullAccumulatedText
                         ? `${fullAccumulatedText}\n\n---\n🚫 Processing was cancelled.`
                         : "🚫 Processing was cancelled.";
                     clearStatus(messageId);
+                    // Interrupt kills the subprocess — session is no longer reusable
+                    sessionPool.close(threadId);
                     usageData = result.usage;
                     if (result.sessionId) {
                         resolvedSessionId = result.sessionId;
@@ -1871,6 +1914,8 @@ async function processMessage(messageFile: string): Promise<void> {
 
                     if (result.stallRecovered) {
                         responseText += `\n\n---\n⚠️ _Stall recovered: session hung after end\\_turn (${END_TURN_STALL_TIMEOUT_MS / 1000}s timeout). Response above may be incomplete._`;
+                        // Stall recovery calls interrupt() which kills the subprocess
+                        sessionPool.close(threadId);
                     }
 
                     // Persist session ID for future resume (atomic to avoid clobbering team/role)
@@ -1886,6 +1931,7 @@ async function processMessage(messageFile: string): Promise<void> {
 
                     // Fire off background task monitoring if there are active tasks
                     if (result.hasBackgroundTasks) {
+                        sessionPool.markMonitoring(threadId);
                         const monitor = monitorBackgroundTasks(
                             result.query,
                             result.activeTasks,
@@ -1895,8 +1941,13 @@ async function processMessage(messageFile: string): Promise<void> {
                         activeBackgroundMonitors.set(threadId, monitor);
                         monitor.finally(() => {
                             activeBackgroundMonitors.delete(threadId);
+                            // Session returns to idle after background tasks complete
+                            sessionPool.markIdle(threadId, result.sessionId);
                         });
                         log("INFO", `Started background task monitor for thread ${threadId} (${result.activeTasks.size} task(s))`);
+                    } else {
+                        // No background tasks — session is ready for next message
+                        sessionPool.markIdle(threadId, result.sessionId);
                     }
                 }
             } catch (queryErr) {
@@ -1915,6 +1966,9 @@ async function processMessage(messageFile: string): Promise<void> {
                         `Query error for thread ${threadId}: ${toErrorMessage(queryErr)}` +
                             (stderrOutput ? `\n  stderr: ${stderrOutput.slice(0, 2000)}` : ""),
                     );
+
+                    // Close the persistent session on error
+                    sessionPool.close(threadId);
 
                     // Clear stale sessionId on error so retries start a fresh session (atomic)
                     deleteThreadField(threadId, "sessionId");
@@ -2128,9 +2182,11 @@ async function processCommands(): Promise<void> {
             const data = parsed.data;
 
             if (data.command === "reset") {
+                sessionPool.close(data.threadId);
                 resetThread(data.threadId);
                 log("INFO", `Command: reset thread ${data.threadId}`);
             } else if (data.command === "setdir" && data.args?.cwd) {
+                sessionPool.close(data.threadId);
                 configureThread(data.threadId, { cwd: data.args.cwd });
                 log(
                     "INFO",
@@ -2313,11 +2369,12 @@ async function shutdown(signal: string): Promise<void> {
 
     log(
         "INFO",
-        `Received ${signal}. Shutting down... (${activeCount} active session(s), ${activeBackgroundMonitors.size} background monitor(s))`,
+        `Received ${signal}. Shutting down... (${activeCount} active session(s), ${activeBackgroundMonitors.size} background monitor(s), ${sessionPool.size} pooled session(s))`,
     );
 
     clearInterval(queueInterval);
     clearInterval(sessionSyncInterval);
+    sessionPool.closeAll();
 
     try {
         const threads = loadThreads();
