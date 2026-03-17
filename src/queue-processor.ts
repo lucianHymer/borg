@@ -21,7 +21,6 @@ import type {
     SDKTaskProgressMessage,
     SDKTaskNotificationMessage,
     SDKMessage,
-    SDKUserMessage,
     Options,
     Query,
     CanUseTool as SDKCanUseTool,
@@ -808,6 +807,7 @@ interface MessageProcessingState {
     usageData: QueryUsageData | undefined;
     sawEndTurn: boolean;
     endTurnSeenAt: number;
+    sawResult: boolean;
     activeTasks: Map<string, BackgroundTaskInfo>;
     observer: QueryEventObserver | undefined;
 }
@@ -928,6 +928,7 @@ function processSDKMessage(msg: SDKMessage, state: MessageProcessingState): void
             }
         }
         state.usageData = extractUsageData(result);
+        state.sawResult = true;
     }
 }
 
@@ -943,6 +944,7 @@ async function collectPrimaryResponse(
         usageData: undefined,
         sawEndTurn: false,
         endTurnSeenAt: 0,
+        sawResult: false,
         activeTasks: new Map(),
         observer,
     };
@@ -983,8 +985,9 @@ async function collectPrimaryResponse(
             }
             const remaining = END_TURN_STALL_TIMEOUT_MS - elapsed;
             const pollTimeout = Math.min(POST_END_TURN_POLL_MS, remaining);
+            let timeoutHandle: ReturnType<typeof setTimeout>;
             const timeoutPromise = new Promise<"timeout">((resolve) => {
-                setTimeout(() => resolve("timeout"), pollTimeout);
+                timeoutHandle = setTimeout(() => resolve("timeout"), pollTimeout);
             });
             const winner = await Promise.race([
                 iterator.next().then((r) => ({ kind: "event" as const, result: r })),
@@ -993,6 +996,7 @@ async function collectPrimaryResponse(
             if (winner.kind === "timeout") {
                 continue;
             }
+            clearTimeout(timeoutHandle!);
             iterResult = winner.result;
         } else {
             iterResult = await iterator.next();
@@ -1000,6 +1004,11 @@ async function collectPrimaryResponse(
 
         if (iterResult.done) break;
         processSDKMessage(iterResult.value, state);
+
+        // In streaming mode (AsyncIterable prompt), the iterator stays open
+        // after result. We must return here — NOT wait for done — otherwise
+        // we'll block forever waiting for the next message from the generator.
+        if (state.sawResult) break;
     }
 
     // Clean up hung process on stall
@@ -1750,28 +1759,13 @@ async function processMessage(messageFile: string): Promise<void> {
                 process.env.ANTHROPIC_BASE_URL = `${BUDGET_PROXY_URL}/${budgetUsageId}`;
             }
 
-            // Try to reuse an existing persistent session for this thread
+            // Try to reuse an existing persistent session, or create a new one.
+            // The session pool uses AsyncIterable prompt mode — the generator
+            // stays open between turns, keeping the SDK subprocess alive.
             let q: Query;
-            // Try to reuse an existing persistent session for this thread
-            const claimed = sessionPool.tryClaimSession(threadId, effectiveModel, threadConfig.cwd);
+            const claimed = sessionPool.tryClaimSession(threadId, effectiveModel, threadConfig.cwd, fullPrompt);
             if (claimed) {
                 q = claimed.query;
-                // Inject the new message via streamInput (async iterable that yields one message)
-                const userMsg: SDKUserMessage = {
-                    type: "user",
-                    message: { role: "user", content: fullPrompt },
-                    parent_tool_use_id: null,
-                    session_id: claimed.sessionId,
-                };
-                try {
-                    await q.streamInput((async function* () { yield userMsg; })());
-                    log("INFO", `Session pool: reused session for thread ${threadId}`);
-                } catch (err) {
-                    // streamInput failed — fall back to new session
-                    log("WARN", `Session pool: streamInput failed for thread ${threadId}: ${toErrorMessage(err)} — creating new session`);
-                    sessionPool.close(threadId);
-                    q = sessionPool.createSession(threadId, fullPrompt, options, effectiveModel, threadConfig.cwd);
-                }
             } else {
                 q = sessionPool.createSession(threadId, fullPrompt, options, effectiveModel, threadConfig.cwd);
             }
