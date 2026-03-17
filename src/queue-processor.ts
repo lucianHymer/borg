@@ -1256,6 +1256,7 @@ async function processMessage(messageFile: string): Promise<void> {
     let effectiveModel: string;
     let usageData: QueryUsageData | undefined;
     let scheduledTaskName: string | undefined;
+    let resolvedSessionId: string | undefined;
 
     try {
         // ─── One-Shot (/do): no session context, user-specified model ───
@@ -1526,6 +1527,7 @@ async function processMessage(messageFile: string): Promise<void> {
                     clearStatus(messageId);
                     usageData = result.usage;
                     if (result.sessionId) {
+                        resolvedSessionId = result.sessionId;
                         updateThread(threadId, {
                             sessionId: result.sessionId,
                             lastActive: Date.now(),
@@ -1541,6 +1543,7 @@ async function processMessage(messageFile: string): Promise<void> {
 
                     // Persist session ID for future resume (atomic to avoid clobbering team/role)
                     if (result.sessionId) {
+                        resolvedSessionId = result.sessionId;
                         updateThread(threadId, {
                             sessionId: result.sessionId,
                             lastActive: Date.now(),
@@ -1613,6 +1616,7 @@ async function processMessage(messageFile: string): Promise<void> {
             model: effectiveModel,
             source: source ?? "user",
             messageId,
+            ...(resolvedSessionId ? { sessionId: resolvedSessionId } : {}),
             ...(usageData ? {
                 costUSD: usageData.totalCostUSD,
                 inputTokens: usageData.inputTokens,

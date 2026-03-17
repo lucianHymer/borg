@@ -610,14 +610,22 @@ function findSessionLogFile(sessionId: string): string | null {
     if (!isValidSessionId(sessionId)) return null;
 
     const safeId = path.basename(sessionId); // defense in depth
-    const logFile = path.join(SESSIONS_DIR, `${safeId}.jsonl`);
 
-    // Verify resolved path stays within SESSIONS_DIR
-    const resolvedPath = path.resolve(logFile);
-    const resolvedSessionsDir = path.resolve(SESSIONS_DIR);
-    if (!resolvedPath.startsWith(resolvedSessionsDir + path.sep)) return null;
+    // Search across all zone session directories (infra, core, perimeter)
+    const sessionDirs = [
+        SESSIONS_DIR,
+        path.join(SCRIPT_DIR, ".borg-core", "sessions"),
+        path.join(SCRIPT_DIR, ".borg-perimeter", "sessions"),
+    ];
 
-    if (fs.existsSync(logFile)) return logFile;
+    for (const dir of sessionDirs) {
+        const logFile = path.join(dir, `${safeId}.jsonl`);
+        const resolvedPath = path.resolve(logFile);
+        const resolvedDir = path.resolve(dir);
+        if (!resolvedPath.startsWith(resolvedDir + path.sep)) continue;
+        if (fs.existsSync(logFile)) return logFile;
+    }
+
     return null;
 }
 
@@ -1311,7 +1319,7 @@ app.get("/api/response/:messageId", (req, res) => {
     if (resolvedSessionId) {
         const logFile = findSessionLogFile(resolvedSessionId);
         if (logFile) {
-            sessionLogs = tailLines(logFile, 500);
+            sessionLogs = tailLines(logFile, 2000);
         }
     }
 
