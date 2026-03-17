@@ -49,6 +49,7 @@ export interface Settings {
     tts_speed: number;
     budgetMode?: boolean;        // Use budget/cheap model instead of Claude tiers
     fireworks_api_key?: string;  // API key for Fireworks (budget mode proxy)
+    dashboard_url?: string;      // Public base URL for dashboard (e.g. https://borg.example.com)
 }
 
 // ─── Constants ───
