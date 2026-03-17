@@ -103,7 +103,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 2G
+          memory: 4G
 
   # ── Perimeter: agent SDK sessions for untrusted threads ──
   perimeter:

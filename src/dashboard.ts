@@ -1145,6 +1145,7 @@ app.get("/api/scheduled-tasks", (_req, res) => {
     interface TaskEntry {
         id: string;
         name: string;
+        prompt: string;
         model: string;
         cron: string;
         cwd: string;

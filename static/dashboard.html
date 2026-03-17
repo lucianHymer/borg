@@ -974,6 +974,21 @@ tr.clickable { cursor: pointer; }
     <div id="tasks-table"></div>
   </div>
 
+  <!-- Task Detail Modal -->
+  <div id="task-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:1000;align-items:center;justify-content:center;">
+    <div style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;max-width:700px;width:90%;max-height:80vh;display:flex;flex-direction:column;overflow:hidden;">
+      <div style="display:flex;justify-content:space-between;align-items:center;padding:16px 20px;border-bottom:1px solid var(--border);">
+        <span id="task-modal-name" style="font-weight:600;font-size:15px;"></span>
+        <button id="task-modal-close" style="background:none;border:none;color:var(--text-secondary);font-size:20px;cursor:pointer;padding:0;line-height:1;">×</button>
+      </div>
+      <div id="task-modal-meta" style="padding:12px 20px;border-bottom:1px solid var(--border);font-size:12px;color:var(--text-secondary);display:flex;flex-wrap:wrap;gap:16px;"></div>
+      <div style="padding:16px 20px;overflow-y:auto;flex:1;">
+        <div style="font-size:11px;color:var(--text-secondary);margin-bottom:6px;text-transform:uppercase;letter-spacing:0.05em;">Prompt</div>
+        <pre id="task-modal-prompt" style="margin:0;white-space:pre-wrap;word-break:break-word;font-family:monospace;font-size:12px;line-height:1.5;color:var(--text-primary);"></pre>
+      </div>
+    </div>
+  </div>
+
   <!-- View: Usage -->
   <div id="view-usage" class="view">
     <h2 style="margin-bottom:12px;">Token Usage & Cost</h2>
@@ -2665,8 +2680,43 @@ tr.clickable { cursor: pointer; }
 
   // ─── Scheduled Tasks View ───
 
+  var allTasksCache = [];
+
   function initTasks() {
+    document.getElementById('task-modal-close').onclick = closeTaskModal;
+    document.getElementById('task-modal').addEventListener('click', function(e) {
+      if (e.target === this) closeTaskModal();
+    });
+    document.addEventListener('keydown', function(e) {
+      if (e.key === 'Escape') closeTaskModal();
+    });
     fetchTasks();
+  }
+
+  function openTaskModal(taskId) {
+    var t = allTasksCache.find(function(x) { return x.id === taskId; });
+    if (!t) return;
+    var nextRun = t.nextRun ? fmtTime(new Date(t.nextRun).getTime()) : 'N/A';
+    var lastRun = t.lastRunTs ? fmtTime(t.lastRunTs) : 'never';
+    var lastCost = t.lastCostUSD != null ? fmtUSD(t.lastCostUSD) : '-';
+    var statusText = !t.enabled ? 'disabled' : t.lastResult || 'pending';
+    document.getElementById('task-modal-name').textContent = t.name;
+    document.getElementById('task-modal-meta').innerHTML =
+      '<span>Model: <strong>' + escapeHtml(t.model) + '</strong></span>' +
+      '<span>Cron: <code style="font-family:monospace;">' + escapeHtml(t.cron) + '</code></span>' +
+      '<span>Next: ' + nextRun + '</span>' +
+      '<span>Last: ' + lastRun + '</span>' +
+      '<span>Cost: ' + lastCost + '</span>' +
+      '<span>Status: ' + escapeHtml(statusText) + '</span>' +
+      '<span>CWD: <code style="font-family:monospace;">' + escapeHtml(t.cwd) + '</code></span>' +
+      '<span>Thread: ' + t.reportThreadId + '</span>';
+    document.getElementById('task-modal-prompt').textContent = t.prompt || '(no prompt)';
+    var modal = document.getElementById('task-modal');
+    modal.style.display = 'flex';
+  }
+
+  function closeTaskModal() {
+    document.getElementById('task-modal').style.display = 'none';
   }
 
   async function fetchTasks() {
@@ -2678,6 +2728,7 @@ tr.clickable { cursor: pointer; }
     }
 
     var tasks = data.tasks;
+    allTasksCache = tasks;
     document.getElementById('tasks-meta').textContent = tasks.length + ' task(s)' + (tasks.length > 0 ? ' · timezone: ' + (tasks[0].timezone || 'UTC') : '');
 
     if (tasks.length === 0) {
@@ -2694,7 +2745,7 @@ tr.clickable { cursor: pointer; }
       var statusColor = !t.enabled ? 'var(--text-secondary)' : t.lastResult === 'error' ? 'var(--accent-red, #ff6b6b)' : 'var(--accent-green)';
       var statusText = !t.enabled ? 'disabled' : t.lastResult || 'pending';
       var modelClass = modelColorClass(t.model.replace('[1m]', ''));
-      html += '<tr title="ID: ' + escapeHtml(t.id) + '\nCWD: ' + escapeHtml(t.cwd) + '\nReport to: Thread ' + t.reportThreadId + '\nRecurring: ' + t.recurring + '">' +
+      html += '<tr style="cursor:pointer;" onclick="openTaskModal(\'' + escapeHtml(t.id) + '\')">' +
         '<td>' + escapeHtml(t.name) + '</td>' +
         '<td class="' + modelClass + '">' + escapeHtml(t.model.replace('[1m]', '')) + '</td>' +
         '<td style="font-family:monospace;font-size:11px;">' + escapeHtml(t.cron) + '</td>' +
