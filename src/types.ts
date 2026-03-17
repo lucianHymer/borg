@@ -229,6 +229,28 @@ export function parseDevName(raw: string): DevName {
     return trimmed as DevName;
 }
 
+// ─── Background Task State (for dashboard visibility) ───
+
+export interface BackgroundTaskInfo {
+    taskId: string;
+    description: string;
+    startedAt: number;
+    status: "running" | "completed" | "failed" | "stopped";
+    summary?: string;
+    lastToolName?: string;
+    usage?: {
+        totalTokens: number;
+        toolUses: number;
+        durationMs: number;
+    };
+}
+
+export interface BackgroundTaskState {
+    threadId: number;
+    messageId: string;
+    tasks: Record<string, BackgroundTaskInfo>;
+}
+
 // ─── Message Model Cache Entry ───
 
 /** Message model cache entry (for routing feedback and TTS) */

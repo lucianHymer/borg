@@ -201,6 +201,98 @@ html, body {
   font-size: 13px;
 }
 
+/* ─── Background Tasks ─── */
+
+.task-list { list-style: none; }
+
+.task-item {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px 16px;
+  margin-bottom: 8px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.task-status-badge {
+  font-size: 10px;
+  font-weight: 700;
+  padding: 2px 8px;
+  border-radius: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  flex-shrink: 0;
+}
+
+.task-status-running {
+  background: rgba(63, 185, 80, 0.15);
+  color: var(--accent-green);
+  border: 1px solid rgba(63, 185, 80, 0.3);
+}
+
+.task-status-completed {
+  background: rgba(88, 166, 255, 0.15);
+  color: var(--accent-blue);
+  border: 1px solid rgba(88, 166, 255, 0.3);
+}
+
+.task-status-failed {
+  background: rgba(248, 81, 73, 0.15);
+  color: var(--accent-red);
+  border: 1px solid rgba(248, 81, 73, 0.3);
+}
+
+.task-status-stopped {
+  background: rgba(210, 153, 34, 0.15);
+  color: var(--accent-yellow);
+  border: 1px solid rgba(210, 153, 34, 0.3);
+}
+
+.task-info { flex: 1; min-width: 0; }
+
+.task-description {
+  font-size: 13px;
+  color: var(--text-primary);
+  margin-bottom: 2px;
+}
+
+.task-meta {
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.task-summary {
+  font-size: 11px;
+  color: var(--text-secondary);
+  margin-top: 4px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.task-stop-btn {
+  background: rgba(248, 81, 73, 0.15);
+  color: var(--accent-red);
+  border: 1px solid rgba(248, 81, 73, 0.3);
+  border-radius: 6px;
+  padding: 4px 12px;
+  font-size: 11px;
+  font-weight: 600;
+  font-family: var(--font-mono);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.task-stop-btn:hover {
+  background: rgba(248, 81, 73, 0.3);
+}
+
+.task-stop-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 /* ─── Model Usage Breakdown ─── */
 
 .model-breakdown {
@@ -364,6 +456,12 @@ html, body {
         </div>
         <div class="message-body" id="outgoing-body"></div>
       </div>
+    </div>
+
+    <!-- Background Tasks -->
+    <div class="section" id="tasks-section" style="display:none">
+      <div class="section-header">Background Tasks</div>
+      <ul class="task-list" id="task-list"></ul>
     </div>
 
     <!-- Model Usage Breakdown -->
@@ -599,6 +697,53 @@ function appendLogEntry(lineStr) {
   logEntries.appendChild(div);
 }
 
+function renderBackgroundTasks(taskData) {
+  if (!taskData || !taskData.tasks) return;
+  const tasks = Object.values(taskData.tasks);
+  if (tasks.length === 0) return;
+
+  document.getElementById('tasks-section').style.display = '';
+  const list = document.getElementById('task-list');
+
+  list.innerHTML = tasks.map(t => {
+    const elapsed = t.startedAt ? formatDuration(Date.now() - t.startedAt) : '';
+    const statusClass = `task-status-${t.status}`;
+    const showStop = t.status === 'running';
+    const usageInfo = t.usage
+      ? `${formatNumber(t.usage.totalTokens)} tokens, ${t.usage.toolUses} tools`
+      : '';
+
+    return `
+      <li class="task-item" data-task-id="${escapeHtml(t.taskId)}">
+        <span class="task-status-badge ${statusClass}">${escapeHtml(t.status)}</span>
+        <div class="task-info">
+          <div class="task-description">${escapeHtml(t.description)}</div>
+          <div class="task-meta">
+            ${elapsed ? `Running for ${elapsed}` : ''}
+            ${usageInfo ? ` | ${usageInfo}` : ''}
+            ${t.lastToolName ? ` | Last: ${escapeHtml(t.lastToolName)}` : ''}
+          </div>
+          ${t.summary ? `<div class="task-summary">${escapeHtml(t.summary)}</div>` : ''}
+        </div>
+        ${showStop ? `<button class="task-stop-btn" onclick="stopTask('${escapeHtml(t.taskId)}', this)">Stop</button>` : ''}
+      </li>
+    `;
+  }).join('');
+}
+
+async function stopTask(taskId, btn) {
+  btn.disabled = true;
+  btn.textContent = 'Stopping...';
+  try {
+    const resp = await fetch(`/api/background-tasks/${taskId}/stop`, { method: 'POST' });
+    if (!resp.ok) {
+      btn.textContent = 'Failed';
+    }
+  } catch {
+    btn.textContent = 'Error';
+  }
+}
+
 function setBadge(status, text) {
   badge.className = `status-${status}`;
   badge.innerHTML = status === 'live'
@@ -631,12 +776,18 @@ async function init() {
       renderBreakdown(data.outgoing.modelUsage);
     }
 
+    if (data.backgroundTasks) {
+      renderBackgroundTasks(data.backgroundTasks);
+    }
+
     if (data.sessionLogs && data.sessionLogs.length > 0) {
       renderSessionLogs(data.sessionLogs);
     }
 
-    // Determine if this is still live (no outgoing entry yet)
-    if (!data.outgoing) {
+    // Determine if this is still live (no outgoing entry yet, or background tasks running)
+    const hasRunningTasks = data.backgroundTasks?.tasks &&
+      Object.values(data.backgroundTasks.tasks).some(t => t.status === 'running');
+    if (!data.outgoing || hasRunningTasks) {
       setBadge('live', 'Processing');
       startLiveFeed();
     } else {
@@ -669,6 +820,13 @@ function startLiveFeed() {
         body.style.color = '';
         body.style.fontStyle = '';
       }
+    } catch { /* ignore */ }
+  });
+
+  es.addEventListener('background-tasks', (e) => {
+    try {
+      const data = JSON.parse(e.data);
+      renderBackgroundTasks(data);
     } catch { /* ignore */ }
   });
 

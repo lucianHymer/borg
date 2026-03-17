@@ -1204,6 +1204,112 @@ app.get("/api/scheduled-tasks", (_req, res) => {
     res.json({ tasks: tasksWithNext });
 });
 
+// ─── Background Tasks API ───
+
+// GET /api/background-tasks — returns all active background tasks across zones
+app.get("/api/background-tasks", (_req, res) => {
+    const zoneDirs = [
+        BORG_DIR,
+        path.join(SCRIPT_DIR, ".borg-core"),
+        path.join(SCRIPT_DIR, ".borg-perimeter"),
+    ];
+
+    interface TaskStateFile {
+        threadId: number;
+        messageId: string;
+        tasks: Record<string, {
+            taskId: string;
+            description: string;
+            startedAt: number;
+            status: string;
+            summary?: string;
+            lastToolName?: string;
+            usage?: { totalTokens: number; toolUses: number; durationMs: number };
+        }>;
+    }
+
+    const allStates: TaskStateFile[] = [];
+
+    for (const dir of zoneDirs) {
+        const tasksDir = path.join(dir, "queue/tasks");
+        if (!fs.existsSync(tasksDir)) continue;
+        try {
+            const files = fs.readdirSync(tasksDir).filter(f => f.endsWith(".json"));
+            for (const file of files) {
+                try {
+                    const data = JSON.parse(fs.readFileSync(path.join(tasksDir, file), "utf8")) as TaskStateFile;
+                    allStates.push(data);
+                } catch { /* skip malformed */ }
+            }
+        } catch { /* dir read error */ }
+    }
+
+    res.json({ taskStates: allStates });
+});
+
+// GET /api/background-tasks/:messageId — returns background tasks for a specific message
+app.get("/api/background-tasks/:messageId", (req, res) => {
+    const { messageId } = req.params;
+    const zoneDirs = [
+        BORG_DIR,
+        path.join(SCRIPT_DIR, ".borg-core"),
+        path.join(SCRIPT_DIR, ".borg-perimeter"),
+    ];
+
+    for (const dir of zoneDirs) {
+        const taskFile = path.join(dir, "queue/tasks", `${messageId}.json`);
+        if (fs.existsSync(taskFile)) {
+            try {
+                const data = JSON.parse(fs.readFileSync(taskFile, "utf8"));
+                res.json(data);
+                return;
+            } catch { /* fall through */ }
+        }
+    }
+
+    res.json({ threadId: 0, messageId, tasks: {} });
+});
+
+// POST /api/background-tasks/:taskId/stop — stop a running background task
+app.post("/api/background-tasks/:taskId/stop", (req, res) => {
+    const { taskId } = req.params;
+
+    // Find which zone this task belongs to by scanning task state files
+    const zoneDirs = [
+        { dir: BORG_DIR, zone: "infra" },
+        { dir: path.join(SCRIPT_DIR, ".borg-core"), zone: "core" },
+        { dir: path.join(SCRIPT_DIR, ".borg-perimeter"), zone: "perimeter" },
+    ];
+
+    for (const { dir } of zoneDirs) {
+        const tasksDir = path.join(dir, "queue/tasks");
+        if (!fs.existsSync(tasksDir)) continue;
+        try {
+            const files = fs.readdirSync(tasksDir).filter(f => f.endsWith(".json"));
+            for (const file of files) {
+                try {
+                    const data = JSON.parse(fs.readFileSync(path.join(tasksDir, file), "utf8"));
+                    if (data.tasks && data.tasks[taskId]) {
+                        // Found the task — write stop signal to this zone
+                        const stopDir = path.join(dir, "queue/task-stop");
+                        if (!fs.existsSync(stopDir)) {
+                            fs.mkdirSync(stopDir, { recursive: true });
+                        }
+                        const stopFile = path.join(stopDir, `${taskId}.json`);
+                        const tmpFile = stopFile + ".tmp";
+                        fs.writeFileSync(tmpFile, JSON.stringify({ ts: Date.now() }));
+                        fs.renameSync(tmpFile, stopFile);
+                        res.json({ ok: true, taskId });
+                        return;
+                    }
+                } catch { /* skip */ }
+            }
+        } catch { /* dir error */ }
+    }
+
+    res.status(404).json({ error: "Task not found" });
+});
+
 // ─── Single Response Detail ───
 
 // GET /response/:messageId — serve the response detail HTML page
@@ -1297,6 +1403,26 @@ function findResponseInTail(messageId: string): Record<string, unknown> | null {
     return null;
 }
 
+/**
+ * Find background task state for a given messageId across all zone directories.
+ */
+function findBackgroundTasks(messageId: string): Record<string, unknown> | null {
+    const zoneDirs = [
+        BORG_DIR,
+        path.join(SCRIPT_DIR, ".borg-core"),
+        path.join(SCRIPT_DIR, ".borg-perimeter"),
+    ];
+    for (const dir of zoneDirs) {
+        const taskFile = path.join(dir, "queue/tasks", `${messageId}.json`);
+        if (fs.existsSync(taskFile)) {
+            try {
+                return JSON.parse(fs.readFileSync(taskFile, "utf8"));
+            } catch { /* skip */ }
+        }
+    }
+    return null;
+}
+
 // GET /api/response/:messageId — full response detail data
 app.get("/api/response/:messageId", (req, res) => {
     const { messageId } = req.params;
@@ -1326,6 +1452,9 @@ app.get("/api/response/:messageId", (req, res) => {
     const threadId = (outgoing?.threadId ?? incoming?.threadId) as number | undefined;
     const threadName = threadId ? (threads[String(threadId)]?.name ?? `Thread ${threadId}`) : undefined;
 
+    // Look for background task state
+    const backgroundTasks = findBackgroundTasks(messageId);
+
     res.json({
         messageId,
         threadId,
@@ -1334,6 +1463,7 @@ app.get("/api/response/:messageId", (req, res) => {
         outgoing,
         sessionId: resolvedSessionId,
         sessionLogs,
+        backgroundTasks,
     });
 });
 
@@ -1377,6 +1507,7 @@ app.get("/api/response/:messageId/feed", (req, res) => {
     let sessionLogTail: TailState = { offset: 0 };
     let sessionLogFile: string | null = null;
     let lastStatusJson = "";
+    let lastTasksJson = "";
     let completeSent = false;
 
     // Initialize session log offset to current EOF
@@ -1419,6 +1550,16 @@ app.get("/api/response/:messageId/feed", (req, res) => {
                     if (!line.trim()) continue;
                     res.write(`event: session-log\ndata: ${line}\n\n`);
                 }
+            }
+        }
+
+        // Check for background task updates
+        const bgTasks = findBackgroundTasks(messageId);
+        if (bgTasks) {
+            const json = JSON.stringify(bgTasks);
+            if (json !== lastTasksJson) {
+                lastTasksJson = json;
+                res.write(`event: background-tasks\ndata: ${json}\n\n`);
             }
         }
 

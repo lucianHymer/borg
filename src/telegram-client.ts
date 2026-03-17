@@ -750,10 +750,15 @@ bot.on("message:text").filter(
         });
         telegramToQueueId.set(ctx.msg.message_id, messageId);
 
-        // React with 👀 to acknowledge we've seen the message
+        // React with emoji: 👍 if thread is already busy (message queued behind another),
+        // 👀 if this is the first/only message for the thread
+        const threadBusy = [...pendingMessages.values()].some(
+            p => p.threadId === threadId && pendingMessages.get(messageId) !== p
+        );
         try {
+            const emoji = threadBusy ? "👍" : "👀";
             await bot.api.setMessageReaction(ctx.chat.id, ctx.msg.message_id,
-                [{ type: "emoji", emoji: "👀" as any }]);
+                [{ type: "emoji", emoji: emoji as any }]);
         } catch {
             // Reactions may not be available — silently ignore
         }

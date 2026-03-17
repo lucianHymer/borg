@@ -14,13 +14,16 @@ import type {
     SDKAssistantMessage,
     SDKResultMessage,
     SDKToolProgressMessage,
+    SDKTaskStartedMessage,
+    SDKTaskProgressMessage,
+    SDKTaskNotificationMessage,
     SDKMessage,
     Options,
     Query,
     CanUseTool as SDKCanUseTool,
 } from "@anthropic-ai/claude-agent-sdk";
 import { toErrorMessage, isValidSessionId, TASK_LISTS_FILENAME } from "./types.js";
-import type { IncomingMessage, OutgoingMessage, TaskListMapping } from "./types.js";
+import type { IncomingMessage, OutgoingMessage, TaskListMapping, BackgroundTaskInfo, BackgroundTaskState } from "./types.js";
 import {
     appendHistory,
     buildHistoryContext,
@@ -99,6 +102,8 @@ const QUEUE_PROCESSING = path.join(BORG_DIR, "queue/processing");
 const QUEUE_DEAD_LETTER = path.join(BORG_DIR, "queue/dead-letter");
 const QUEUE_COMMANDS = path.join(BORG_DIR, "queue/commands");
 const QUEUE_CANCEL = path.join(BORG_DIR, "queue/cancel");
+const QUEUE_TASKS = path.join(BORG_DIR, "queue/tasks");
+const QUEUE_TASK_STOP = path.join(BORG_DIR, "queue/task-stop");
 const QUEUE_STATUS = path.join(BORG_DIR, "status");
 const LOG_FILE = path.join(BORG_DIR, "logs/queue.log");
 const PROMPTS_LOG = path.join(BORG_DIR, "logs/prompts.jsonl");
@@ -177,6 +182,8 @@ function readBudgetUsage(usageId: string): QueryUsageData | null {
     QUEUE_DEAD_LETTER,
     QUEUE_COMMANDS,
     QUEUE_CANCEL,
+    QUEUE_TASKS,
+    QUEUE_TASK_STOP,
     QUEUE_STATUS,
     path.dirname(LOG_FILE),
     SESSIONS_DIR,
@@ -488,6 +495,9 @@ let scanning = false;
 let activeHeartbeatCount = 0;
 let activeScheduledTaskCount = 0;
 
+// Background task monitors that run independently after end_turn
+const activeBackgroundMonitors = new Map<number, Promise<void>>();
+
 // ─── SDK canUseTool Adapter ───
 
 const sdkCanUseTool: SDKCanUseTool = async (toolName, input, _options) => {
@@ -717,48 +727,231 @@ interface QueryEventObserver {
     onCompacting?(): void;
     onStallDetected?(): void;
     onTextContent?(text: string): void;
+    onTaskStarted?(taskId: string, description: string): void;
+    onTaskProgress?(taskId: string, summary: string | undefined): void;
+    onTaskCompleted?(taskId: string, status: string, summary: string): void;
 }
 
-// If we see end_turn with content and no active subagents, and total elapsed time
-// since end_turn exceeds this window, assume the CLI process is hung and return.
-// Uses absolute time (not per-event) to handle background tasks that emit
-// tool_progress events indefinitely after end_turn.
+// Stall detection: if no active background tasks and end_turn seen, wait this long
+// before giving up. With active background tasks, we wait indefinitely.
 const END_TURN_STALL_TIMEOUT_MS = 90_000; // 90 seconds
-// Short poll interval: once end_turn is seen, don't wait forever for each event
 const POST_END_TURN_POLL_MS = 5_000; // 5 seconds per event poll
 
-async function collectQueryResponse(
+// Alert threshold for long-running background tasks (2 hours)
+const BACKGROUND_TASK_ALERT_MS = 2 * 60 * 60 * 1000;
+
+interface PrimaryResponseResult {
+    text: string;
+    sessionId: string | undefined;
+    stallRecovered: boolean;
+    usage?: QueryUsageData;
+    /** Active background tasks at end_turn (empty if none) */
+    activeTasks: Map<string, BackgroundTaskInfo>;
+    /** The query object, needed for background monitoring and stopTask */
+    query: Query;
+    /** Whether background tasks are still running and need monitoring */
+    hasBackgroundTasks: boolean;
+}
+
+// ─── Extract usage data from SDK result message ───
+
+function extractUsageData(result: SDKResultMessage): QueryUsageData {
+    const muValues = Object.values(result.modelUsage);
+    return {
+        totalCostUSD: result.total_cost_usd,
+        inputTokens: muValues.reduce((s, m) => s + m.inputTokens, 0) || result.usage.input_tokens,
+        outputTokens: muValues.reduce((s, m) => s + m.outputTokens, 0) || result.usage.output_tokens,
+        cacheReadInputTokens: muValues.reduce((s, m) => s + m.cacheReadInputTokens, 0) || (result.usage.cache_read_input_tokens ?? 0),
+        cacheCreationInputTokens: muValues.reduce((s, m) => s + m.cacheCreationInputTokens, 0) || (result.usage.cache_creation_input_tokens ?? 0),
+        durationMs: result.duration_ms,
+        durationApiMs: result.duration_api_ms,
+        numTurns: result.num_turns,
+        modelUsage: Object.fromEntries(
+            Object.entries(result.modelUsage).map(([model, mu]) => [model, {
+                inputTokens: mu.inputTokens,
+                outputTokens: mu.outputTokens,
+                cacheReadInputTokens: mu.cacheReadInputTokens,
+                cacheCreationInputTokens: mu.cacheCreationInputTokens,
+                costUSD: mu.costUSD,
+                webSearchRequests: mu.webSearchRequests,
+            }]),
+        ),
+    };
+}
+
+// ─── Process a single SDK message (shared between primary and background collection) ───
+
+interface MessageProcessingState {
+    parts: string[];
+    capturedSessionId: string | undefined;
+    usageData: QueryUsageData | undefined;
+    sawEndTurn: boolean;
+    endTurnSeenAt: number;
+    activeTasks: Map<string, BackgroundTaskInfo>;
+    observer: QueryEventObserver | undefined;
+}
+
+function processSDKMessage(msg: SDKMessage, state: MessageProcessingState): void {
+    // Always capture the latest session_id (it may change after compaction)
+    if ("session_id" in msg && msg.session_id) {
+        state.capturedSessionId = msg.session_id;
+    }
+
+    if (msg.type === "assistant") {
+        const assistantMsg = msg as SDKAssistantMessage;
+        const content = assistantMsg.message?.content;
+        if (Array.isArray(content)) {
+            for (const block of content) {
+                if (block.type === "text" && typeof block.text === "string") {
+                    state.parts.push(block.text);
+                    state.observer?.onTextContent?.(block.text);
+                }
+                if (block.type === "tool_use" && "name" in block) {
+                    state.observer?.onToolUse?.(block.name);
+                }
+            }
+        }
+        // Track end_turn on top-level assistant messages (not from subagents)
+        const stopReason = assistantMsg.message?.stop_reason;
+        if (stopReason === "end_turn" && assistantMsg.parent_tool_use_id === null) {
+            if (!state.sawEndTurn) {
+                state.endTurnSeenAt = Date.now();
+            }
+            state.sawEndTurn = true;
+        } else if (stopReason === "tool_use") {
+            state.sawEndTurn = false;
+            state.endTurnSeenAt = 0;
+        }
+    }
+
+    if (msg.type === "tool_progress") {
+        const toolMsg = msg as SDKToolProgressMessage;
+        state.observer?.onToolProgress?.(
+            toolMsg.tool_name,
+            toolMsg.elapsed_time_seconds,
+        );
+    }
+
+    if (
+        msg.type === "system" &&
+        "subtype" in msg &&
+        msg.subtype === "status" &&
+        "status" in msg &&
+        msg.status === "compacting"
+    ) {
+        state.observer?.onCompacting?.();
+    }
+
+    // Track background tasks
+    if (msg.type === "system" && "subtype" in msg) {
+        if (msg.subtype === "task_started") {
+            const taskMsg = msg as SDKTaskStartedMessage;
+            const taskInfo: BackgroundTaskInfo = {
+                taskId: taskMsg.task_id,
+                description: taskMsg.description,
+                startedAt: Date.now(),
+                status: "running",
+            };
+            state.activeTasks.set(taskMsg.task_id, taskInfo);
+            state.observer?.onTaskStarted?.(taskMsg.task_id, taskMsg.description);
+        }
+        if (msg.subtype === "task_progress") {
+            const taskMsg = msg as SDKTaskProgressMessage;
+            const existing = state.activeTasks.get(taskMsg.task_id);
+            if (existing) {
+                existing.summary = taskMsg.summary;
+                existing.lastToolName = taskMsg.last_tool_name;
+                existing.usage = {
+                    totalTokens: taskMsg.usage.total_tokens,
+                    toolUses: taskMsg.usage.tool_uses,
+                    durationMs: taskMsg.usage.duration_ms,
+                };
+            }
+            state.observer?.onTaskProgress?.(taskMsg.task_id, taskMsg.summary);
+        }
+        if (msg.subtype === "task_notification") {
+            const taskMsg = msg as SDKTaskNotificationMessage;
+            const existing = state.activeTasks.get(taskMsg.task_id);
+            if (existing) {
+                existing.status = taskMsg.status;
+                existing.summary = taskMsg.summary;
+                if (taskMsg.usage) {
+                    existing.usage = {
+                        totalTokens: taskMsg.usage.total_tokens,
+                        toolUses: taskMsg.usage.tool_uses,
+                        durationMs: taskMsg.usage.duration_ms,
+                    };
+                }
+            }
+            state.observer?.onTaskCompleted?.(taskMsg.task_id, taskMsg.status, taskMsg.summary);
+        }
+    }
+
+    if (msg.type === "result") {
+        const result = msg as SDKResultMessage;
+        if (
+            result.subtype === "success" &&
+            "result" in result &&
+            typeof result.result === "string"
+        ) {
+            if (state.parts.length === 0) {
+                state.parts.push(result.result);
+            }
+        }
+        state.usageData = extractUsageData(result);
+    }
+}
+
+// ─── Collect primary response (returns at end_turn if background tasks are active) ───
+
+async function collectPrimaryResponse(
     q: Query,
     observer?: QueryEventObserver,
-): Promise<{ text: string; sessionId: string | undefined; stallRecovered: boolean; usage?: QueryUsageData }> {
-    const parts: string[] = [];
-    let capturedSessionId: string | undefined;
-    let usageData: QueryUsageData | undefined;
+): Promise<PrimaryResponseResult> {
+    const state: MessageProcessingState = {
+        parts: [],
+        capturedSessionId: undefined,
+        usageData: undefined,
+        sawEndTurn: false,
+        endTurnSeenAt: 0,
+        activeTasks: new Map(),
+        observer,
+    };
 
-    // ─── Stall detection state ───
-    let sawEndTurn = false;
-    let endTurnSeenAt = 0; // absolute timestamp when end_turn was first seen
     let stallDetected = false;
-
     const iterator = q[Symbol.asyncIterator]();
 
     while (true) {
         let iterResult: IteratorResult<SDKMessage, void>;
 
-        if (sawEndTurn && parts.length > 0) {
-            // Check absolute time since end_turn (not reset by incoming events)
-            const elapsed = Date.now() - endTurnSeenAt;
+        if (state.sawEndTurn && state.parts.length > 0) {
+            // If there are active background tasks, return immediately —
+            // the background monitor will continue consuming the stream
+            const runningTasks = [...state.activeTasks.values()].filter(t => t.status === "running");
+            if (runningTasks.length > 0) {
+                log("INFO", `end_turn with ${runningTasks.length} active background task(s) — returning primary response`);
+                return {
+                    text: state.parts.join("\n\n"),
+                    sessionId: state.capturedSessionId,
+                    stallRecovered: false,
+                    usage: state.usageData,
+                    activeTasks: state.activeTasks,
+                    query: q,
+                    hasBackgroundTasks: true,
+                };
+            }
+
+            // No background tasks — use stall detection to avoid hanging indefinitely
+            const elapsed = Date.now() - state.endTurnSeenAt;
             if (elapsed >= END_TURN_STALL_TIMEOUT_MS) {
                 stallDetected = true;
                 observer?.onStallDetected?.();
                 log(
                     "WARN",
-                    `end_turn stall detected after ${Math.round(elapsed / 1000)}s — returning collected response (${parts.join("").length} chars)`,
+                    `end_turn stall detected after ${Math.round(elapsed / 1000)}s — returning collected response (${state.parts.join("").length} chars)`,
                 );
                 break;
             }
-            // Short poll: don't wait the full remaining time per event, so we can
-            // re-check the absolute deadline even if tool_progress keeps arriving
             const remaining = END_TURN_STALL_TIMEOUT_MS - elapsed;
             const pollTimeout = Math.min(POST_END_TURN_POLL_MS, remaining);
             const timeoutPromise = new Promise<"timeout">((resolve) => {
@@ -769,7 +962,6 @@ async function collectQueryResponse(
                 timeoutPromise.then(() => ({ kind: "timeout" as const })),
             ]);
             if (winner.kind === "timeout") {
-                // Don't break yet — loop back and check absolute deadline
                 continue;
             }
             iterResult = winner.result;
@@ -778,96 +970,7 @@ async function collectQueryResponse(
         }
 
         if (iterResult.done) break;
-        const msg = iterResult.value;
-
-        // Always capture the latest session_id (it may change after compaction)
-        if ("session_id" in msg && msg.session_id) {
-            capturedSessionId = msg.session_id;
-        }
-
-        if (msg.type === "assistant") {
-            const assistantMsg = msg as SDKAssistantMessage;
-            const content = assistantMsg.message?.content;
-            if (Array.isArray(content)) {
-                for (const block of content) {
-                    if (block.type === "text" && typeof block.text === "string") {
-                        parts.push(block.text);
-                        observer?.onTextContent?.(block.text);
-                    }
-                    if (block.type === "tool_use" && "name" in block) {
-                        observer?.onToolUse?.(block.name);
-                    }
-                }
-            }
-            // Track end_turn on top-level assistant messages (not from subagents)
-            const stopReason = assistantMsg.message?.stop_reason;
-            if (stopReason === "end_turn" && assistantMsg.parent_tool_use_id === null) {
-                if (!sawEndTurn) {
-                    endTurnSeenAt = Date.now();
-                }
-                sawEndTurn = true;
-            } else if (stopReason === "tool_use") {
-                sawEndTurn = false;
-                endTurnSeenAt = 0;
-            }
-        }
-
-        if (msg.type === "tool_progress") {
-            const toolMsg = msg as SDKToolProgressMessage;
-            observer?.onToolProgress?.(
-                toolMsg.tool_name,
-                toolMsg.elapsed_time_seconds,
-            );
-        }
-
-        if (
-            msg.type === "system" &&
-            "subtype" in msg &&
-            msg.subtype === "status" &&
-            "status" in msg &&
-            msg.status === "compacting"
-        ) {
-            observer?.onCompacting?.();
-        }
-
-        if (msg.type === "result") {
-            const result = msg as SDKResultMessage;
-            if (
-                result.subtype === "success" &&
-                "result" in result &&
-                typeof result.result === "string"
-            ) {
-                if (parts.length === 0) {
-                    parts.push(result.result);
-                }
-            }
-
-            // Capture usage data from both success and error result subtypes.
-            // Sum modelUsage instead of using result.usage — result.usage is top-level only
-            // and excludes subagent token usage. result.total_cost_usd is correct (Anthropic
-            // aggregates everything), so we need modelUsage totals to match.
-            const muValues = Object.values(result.modelUsage);
-            usageData = {
-                totalCostUSD: result.total_cost_usd,
-                inputTokens: muValues.reduce((s, m) => s + m.inputTokens, 0) || result.usage.input_tokens,
-                outputTokens: muValues.reduce((s, m) => s + m.outputTokens, 0) || result.usage.output_tokens,
-                cacheReadInputTokens: muValues.reduce((s, m) => s + m.cacheReadInputTokens, 0) || (result.usage.cache_read_input_tokens ?? 0),
-                cacheCreationInputTokens: muValues.reduce((s, m) => s + m.cacheCreationInputTokens, 0) || (result.usage.cache_creation_input_tokens ?? 0),
-                durationMs: result.duration_ms,
-                durationApiMs: result.duration_api_ms,
-                numTurns: result.num_turns,
-                modelUsage: Object.fromEntries(
-                    Object.entries(result.modelUsage).map(([model, mu]) => [model, {
-                        inputTokens: mu.inputTokens,
-                        outputTokens: mu.outputTokens,
-                        cacheReadInputTokens: mu.cacheReadInputTokens,
-                        cacheCreationInputTokens: mu.cacheCreationInputTokens,
-                        costUSD: mu.costUSD,
-                        webSearchRequests: mu.webSearchRequests,
-                    }]),
-                ),
-            };
-        }
+        processSDKMessage(iterResult.value, state);
     }
 
     // Clean up hung process on stall
@@ -879,7 +982,224 @@ async function collectQueryResponse(
         }
     }
 
-    return { text: parts.join("\n\n"), sessionId: capturedSessionId, stallRecovered: stallDetected, usage: usageData };
+    return {
+        text: state.parts.join("\n\n"),
+        sessionId: state.capturedSessionId,
+        stallRecovered: stallDetected,
+        usage: state.usageData,
+        activeTasks: state.activeTasks,
+        query: q,
+        hasBackgroundTasks: false,
+    };
+}
+
+// ─── Legacy wrapper for heartbeats/scheduled-tasks/one-shots ───
+
+async function collectQueryResponse(
+    q: Query,
+    observer?: QueryEventObserver,
+): Promise<{ text: string; sessionId: string | undefined; stallRecovered: boolean; usage?: QueryUsageData }> {
+    const result = await collectPrimaryResponse(q, observer);
+    return {
+        text: result.text,
+        sessionId: result.sessionId,
+        stallRecovered: result.stallRecovered,
+        usage: result.usage,
+    };
+}
+
+// ─── Background task state file management ───
+
+function writeTaskState(messageId: string, threadId: number, tasks: Map<string, BackgroundTaskInfo>): void {
+    try {
+        const state: BackgroundTaskState = {
+            threadId,
+            messageId,
+            tasks: Object.fromEntries(tasks),
+        };
+        const taskFile = path.join(QUEUE_TASKS, `${messageId}.json`);
+        const tmpFile = taskFile + ".tmp";
+        fs.writeFileSync(tmpFile, JSON.stringify(state, null, 2));
+        fs.renameSync(tmpFile, taskFile);
+    } catch {
+        // Best effort — dashboard visibility is not critical
+    }
+}
+
+function clearTaskState(messageId: string): void {
+    try {
+        const taskFile = path.join(QUEUE_TASKS, `${messageId}.json`);
+        if (fs.existsSync(taskFile)) fs.unlinkSync(taskFile);
+    } catch {
+        // Best effort
+    }
+}
+
+// ─── Background task monitoring (fire-and-forget after end_turn) ───
+
+async function monitorBackgroundTasks(
+    q: Query,
+    activeTasks: Map<string, BackgroundTaskInfo>,
+    threadId: number,
+    messageId: string,
+): Promise<void> {
+    const alertedTaskIds = new Set<string>();
+
+    // Write initial task state for dashboard
+    writeTaskState(messageId, threadId, activeTasks);
+
+    const iterator = q[Symbol.asyncIterator]();
+
+    try {
+        while (true) {
+            // Check for stop signal files
+            try {
+                for (const [taskId, task] of activeTasks) {
+                    if (task.status !== "running") continue;
+                    const stopFile = path.join(QUEUE_TASK_STOP, `${taskId}.json`);
+                    if (fs.existsSync(stopFile)) {
+                        log("INFO", `Stop signal for background task ${taskId} — stopping`);
+                        try {
+                            await q.stopTask(taskId);
+                        } catch (err) {
+                            log("WARN", `Failed to stop task ${taskId}: ${toErrorMessage(err)}`);
+                        }
+                        try { fs.unlinkSync(stopFile); } catch { /* best effort */ }
+                    }
+                }
+            } catch {
+                // Best effort stop signal check
+            }
+
+            // Check for 2-hour alert threshold
+            const now = Date.now();
+            for (const [taskId, task] of activeTasks) {
+                if (task.status !== "running") continue;
+                if (alertedTaskIds.has(taskId)) continue;
+                if (now - task.startedAt >= BACKGROUND_TASK_ALERT_MS) {
+                    alertedTaskIds.add(taskId);
+                    const threads = loadThreads();
+                    const threadName = threads[String(threadId)]?.name ?? `Thread ${threadId}`;
+                    const elapsed = Math.round((now - task.startedAt) / 60000);
+                    const settings = loadSettings();
+                    const dashUrl = settings.dashboard_url
+                        ? `${settings.dashboard_url.replace(/\/$/, '')}/response/${messageId}`
+                        : undefined;
+                    const alertMsg = `⚠️ Background task running for ${elapsed} minutes in ${threadName}: "${task.description}"${dashUrl ? `\n\n[View in dashboard](${dashUrl})` : ""}`;
+
+                    // Send alert to master thread (threadId 1)
+                    try {
+                        const alertData: OutgoingMessage = {
+                            channel: "system",
+                            threadId: 1,
+                            sender: "system",
+                            message: alertMsg,
+                            originalMessage: "(background task alert)",
+                            timestamp: now,
+                            messageId: `bg_alert_${taskId}_${now}`,
+                            model: "system",
+                        };
+                        const alertFile = path.join(QUEUE_OUTGOING, `bg_alert_${taskId}_${now}.json`);
+                        const tmpFile = alertFile + ".tmp";
+                        fs.writeFileSync(tmpFile, JSON.stringify(alertData, null, 2));
+                        fs.renameSync(tmpFile, alertFile);
+                        log("WARN", `Background task alert: ${task.description} running for ${elapsed}m in thread ${threadId}`);
+                    } catch {
+                        // Best effort alert
+                    }
+                }
+            }
+
+            // Poll for next event with 5s timeout (to recheck stop signals and alerts)
+            const timeoutPromise = new Promise<"timeout">((resolve) => {
+                setTimeout(() => resolve("timeout"), 5_000);
+            });
+            const winner = await Promise.race([
+                iterator.next().then((r) => ({ kind: "event" as const, result: r })),
+                timeoutPromise.then(() => ({ kind: "timeout" as const })),
+            ]);
+
+            if (winner.kind === "timeout") {
+                // Update task state file for dashboard even on timeout (refreshes timestamps)
+                writeTaskState(messageId, threadId, activeTasks);
+                continue;
+            }
+
+            const iterResult = winner.result;
+            if (iterResult.done) break;
+
+            const msg = iterResult.value;
+
+            // Handle task events
+            if (msg.type === "system" && "subtype" in msg) {
+                if (msg.subtype === "task_started") {
+                    const taskMsg = msg as SDKTaskStartedMessage;
+                    activeTasks.set(taskMsg.task_id, {
+                        taskId: taskMsg.task_id,
+                        description: taskMsg.description,
+                        startedAt: Date.now(),
+                        status: "running",
+                    });
+                }
+                if (msg.subtype === "task_progress") {
+                    const taskMsg = msg as SDKTaskProgressMessage;
+                    const existing = activeTasks.get(taskMsg.task_id);
+                    if (existing) {
+                        existing.summary = taskMsg.summary;
+                        existing.lastToolName = taskMsg.last_tool_name;
+                        existing.usage = {
+                            totalTokens: taskMsg.usage.total_tokens,
+                            toolUses: taskMsg.usage.tool_uses,
+                            durationMs: taskMsg.usage.duration_ms,
+                        };
+                    }
+                }
+                if (msg.subtype === "task_notification") {
+                    const taskMsg = msg as SDKTaskNotificationMessage;
+                    const existing = activeTasks.get(taskMsg.task_id);
+                    if (existing) {
+                        existing.status = taskMsg.status;
+                        existing.summary = taskMsg.summary;
+                        if (taskMsg.usage) {
+                            existing.usage = {
+                                totalTokens: taskMsg.usage.total_tokens,
+                                toolUses: taskMsg.usage.tool_uses,
+                                durationMs: taskMsg.usage.duration_ms,
+                            };
+                        }
+                    }
+                    log("INFO", `Background task ${taskMsg.task_id} ${taskMsg.status}: ${taskMsg.summary}`);
+                }
+            }
+
+            // Capture final usage from result message
+            if (msg.type === "result") {
+                const result = msg as SDKResultMessage;
+                const finalUsage = extractUsageData(result);
+                // Update message history with final usage data
+                // (The primary response was already logged with partial usage;
+                //  we could update it here but appending a correction entry is complex.
+                //  For now, log the final usage separately.)
+                log("INFO", `Background tasks complete for ${messageId}: cost=$${finalUsage.totalCostUSD.toFixed(4)}`);
+            }
+
+            // Update task state file for dashboard
+            writeTaskState(messageId, threadId, activeTasks);
+
+            // Check if all tasks are done
+            const stillRunning = [...activeTasks.values()].some(t => t.status === "running");
+            if (!stillRunning && msg.type !== "result") {
+                // All tasks finished, but we haven't seen the result yet — keep consuming
+                continue;
+            }
+        }
+    } catch (err) {
+        log("WARN", `Background task monitor error for ${messageId}: ${toErrorMessage(err)}`);
+    } finally {
+        // Clean up task state file when all monitoring is done
+        clearTaskState(messageId);
+        log("INFO", `Background task monitoring ended for ${messageId}`);
+    }
 }
 
 // ─── Heartbeat Processing (one-shot, no persistent session) ───
@@ -1445,7 +1765,7 @@ async function processMessage(messageFile: string): Promise<void> {
             let cancelled = false;
             const cancelFile = path.join(QUEUE_CANCEL, `${messageId}.json`);
 
-            // Cancel-aware: race collectQueryResponse against a cancel timeout
+            // Cancel-aware: race collectPrimaryResponse against a cancel timeout
             // so we're guaranteed to resolve even if the SDK hangs after interrupt()
             let cancelTimeoutResolve: (() => void) | undefined;
             const cancelTimeoutPromise = new Promise<"cancel-timeout">((resolve) => {
@@ -1466,7 +1786,7 @@ async function processMessage(messageFile: string): Promise<void> {
                     const interruptTimeout = new Promise<void>((r) => setTimeout(r, 10_000));
                     Promise.race([q.interrupt(), interruptTimeout]).catch(() => { /* process may be gone */ });
                     log("INFO", `Cancelled processing for ${messageId}`);
-                    // Safety net: if collectQueryResponse doesn't return within 30s
+                    // Safety net: if collectPrimaryResponse doesn't return within 30s
                     // after interrupt, resolve the cancel timeout to unblock the race
                     setTimeout(() => {
                         cancelTimeoutResolve?.();
@@ -1501,10 +1821,22 @@ async function processMessage(messageFile: string): Promise<void> {
                         ? "…" + fullAccumulatedText.slice(-500)
                         : fullAccumulatedText;
                 },
+                onTaskStarted(taskId: string, description: string) {
+                    currentStatusLabel = `Background: ${description}`;
+                    log("INFO", `Background task started: ${taskId} — ${description}`);
+                },
+                onTaskProgress(taskId: string, summary: string | undefined) {
+                    if (summary) {
+                        currentStatusLabel = `Background: ${summary.substring(0, 60)}`;
+                    }
+                },
+                onTaskCompleted(taskId: string, status: string, summary: string) {
+                    log("INFO", `Background task ${taskId} ${status}: ${summary}`);
+                },
             };
 
             try {
-                const queryPromise = collectQueryResponse(q, observer);
+                const queryPromise = collectPrimaryResponse(q, observer);
 
                 const result = await Promise.race([
                     queryPromise.then((r) => ({ kind: "response" as const, ...r })),
@@ -1514,13 +1846,13 @@ async function processMessage(messageFile: string): Promise<void> {
                 clearInterval(statusInterval);
 
                 if (result.kind === "cancel-timeout") {
-                    log("WARN", `Cancel timeout: collectQueryResponse did not return within 30s after interrupt for ${messageId}`);
+                    log("WARN", `Cancel timeout: collectPrimaryResponse did not return within 30s after interrupt for ${messageId}`);
                     responseText = fullAccumulatedText
                         ? `${fullAccumulatedText}\n\n---\n🚫 Processing was cancelled.`
                         : "🚫 Processing was cancelled.";
                     clearStatus(messageId);
                 } else if (cancelled) {
-                    // Cancelled but collectQueryResponse returned normally
+                    // Cancelled but collectPrimaryResponse returned normally
                     responseText = fullAccumulatedText
                         ? `${fullAccumulatedText}\n\n---\n🚫 Processing was cancelled.`
                         : "🚫 Processing was cancelled.";
@@ -1550,6 +1882,21 @@ async function processMessage(messageFile: string): Promise<void> {
                         });
                         const cwd = loadThreads()[String(threadId)]?.cwd;
                         if (cwd) syncSessionLog(result.sessionId, cwd);
+                    }
+
+                    // Fire off background task monitoring if there are active tasks
+                    if (result.hasBackgroundTasks) {
+                        const monitor = monitorBackgroundTasks(
+                            result.query,
+                            result.activeTasks,
+                            threadId,
+                            messageId,
+                        );
+                        activeBackgroundMonitors.set(threadId, monitor);
+                        monitor.finally(() => {
+                            activeBackgroundMonitors.delete(threadId);
+                        });
+                        log("INFO", `Started background task monitor for thread ${threadId} (${result.activeTasks.size} task(s))`);
                     }
                 }
             } catch (queryErr) {
@@ -1966,7 +2313,7 @@ async function shutdown(signal: string): Promise<void> {
 
     log(
         "INFO",
-        `Received ${signal}. Shutting down... (${activeCount} active session(s))`,
+        `Received ${signal}. Shutting down... (${activeCount} active session(s), ${activeBackgroundMonitors.size} background monitor(s))`,
     );
 
     clearInterval(queueInterval);

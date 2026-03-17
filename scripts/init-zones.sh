@@ -10,7 +10,7 @@ cd "$BASE_DIR"
 
 ZONE_DIRS=(
     queue/incoming queue/outgoing queue/processing queue/dead-letter
-    queue/commands queue/cancel sessions status
+    queue/commands queue/cancel queue/tasks queue/task-stop sessions status
     audio audio/incoming images images/incoming
     logs persistent
 )
