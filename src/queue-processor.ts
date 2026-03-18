@@ -1763,9 +1763,14 @@ async function processMessage(messageFile: string): Promise<void> {
             // The session pool uses AsyncIterable prompt mode — the generator
             // stays open between turns, keeping the SDK subprocess alive.
             let q: Query;
-            const claimed = sessionPool.tryClaimSession(threadId, effectiveModel, threadConfig.cwd, fullPrompt);
+            let pushReusedMessage: (() => void) | null = null;
+            const claimed = sessionPool.tryClaimSession(threadId, effectiveModel, threadConfig.cwd);
             if (claimed) {
                 q = claimed.query;
+                // DON'T push the message yet — the consumer (collectPrimaryResponse)
+                // must be set up first, otherwise the SDK processes the message and
+                // emits events before anyone is consuming them.
+                pushReusedMessage = () => claimed.pushMessage(fullPrompt);
             } else {
                 q = sessionPool.createSession(threadId, fullPrompt, options, effectiveModel, threadConfig.cwd);
             }
@@ -1854,7 +1859,16 @@ async function processMessage(messageFile: string): Promise<void> {
             };
 
             try {
+                // Start consumer FIRST — it calls iterator.next() and blocks waiting for events.
                 const queryPromise = collectPrimaryResponse(q, observer);
+
+                // NOW push the message for reused sessions. The consumer is already
+                // waiting on iterator.next(), so when the generator yields the message
+                // and the SDK processes it, events flow directly to the consumer.
+                if (pushReusedMessage) {
+                    pushReusedMessage();
+                    pushReusedMessage = null;
+                }
 
                 const result = await Promise.race([
                     queryPromise.then((r) => ({ kind: "response" as const, ...r })),

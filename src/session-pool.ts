@@ -122,10 +122,16 @@ export class SessionPool {
 
     /**
      * Atomically check and claim an idle session matching the given model and cwd.
-     * Pushes the new message into the session's input channel.
-     * Returns the Query object for consuming the response.
+     * Returns the Query object and a pushMessage callback. The caller MUST set up
+     * the response consumer (collectPrimaryResponse) BEFORE calling pushMessage —
+     * otherwise the SDK processes the message and emits events before anyone is
+     * consuming them, causing a race condition.
      */
-    tryClaimSession(threadId: number, model: string, cwd: string, prompt: string): { query: Query; sessionId: string } | null {
+    tryClaimSession(threadId: number, model: string, cwd: string): {
+        query: Query;
+        sessionId: string;
+        pushMessage: (prompt: string) => void;
+    } | null {
         const session = this.sessions.get(threadId);
         if (!session) return null;
         if (session.model !== model || session.cwd !== cwd) return null;
@@ -134,12 +140,14 @@ export class SessionPool {
         const channel = this.channels.get(threadId);
         if (!channel) return null;
 
-        // Push the message into the channel — the generator will yield it
-        channel.push(prompt, session.sessionId);
         session.state = "processing";
         session.lastActivity = Date.now();
         this.log("INFO", `Session pool: reusing session for thread ${threadId}`);
-        return { query: session.query, sessionId: session.sessionId };
+        return {
+            query: session.query,
+            sessionId: session.sessionId,
+            pushMessage: (prompt: string) => channel.push(prompt, session.sessionId),
+        };
     }
 
     /**
