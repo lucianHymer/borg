@@ -1204,6 +1204,16 @@ app.get("/api/scheduled-tasks", (_req, res) => {
     res.json({ tasks: tasksWithNext });
 });
 
+// GET /tasks — serve the background tasks overview page
+app.get("/tasks", (_req, res) => {
+    const htmlPath = path.join(STATIC_DIR, "tasks.html");
+    if (fs.existsSync(htmlPath)) {
+        res.sendFile(htmlPath);
+    } else {
+        res.status(404).send("Tasks page not found.");
+    }
+});
+
 // ─── Background Tasks API ───
 
 // Input validation: messageId and taskId must be safe for use in file paths
