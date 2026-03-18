@@ -1406,8 +1406,9 @@ app.get("/api/response/:messageId", (req, res) => {
 
     // Get session logs if we have a sessionId
     let sessionLogs: string[] = [];
+    const resolvedThreadId = (outgoing?.threadId ?? incoming?.threadId) as number | undefined;
     const resolvedSessionId = sessionId
-        || (outgoing?.threadId ? threads[String(outgoing.threadId)]?.sessionId : undefined);
+        || (resolvedThreadId ? threads[String(resolvedThreadId)]?.sessionId : undefined);
     if (resolvedSessionId) {
         const logFile = findSessionLogFile(resolvedSessionId);
         if (logFile) {
@@ -1461,9 +1462,11 @@ app.get("/api/response/:messageId/feed", (req, res) => {
     // Find session log file for this messageId's thread
     function findSessionLogForMessage(): { logFile: string; sessionId: string } | null {
         const threads = readJsonSafe<Record<string, { sessionId?: string }>>(THREADS_FILE, {});
-        const { outgoing, sessionId } = findResponseByMessageId(messageId);
+        const { incoming, outgoing, sessionId } = findResponseByMessageId(messageId);
+        // Try: sessionId from outgoing entry → thread's current sessionId (from either incoming or outgoing threadId)
+        const threadId = outgoing?.threadId ?? incoming?.threadId;
         const resolvedSessionId = sessionId
-            || (outgoing?.threadId ? threads[String(outgoing.threadId)]?.sessionId : undefined);
+            || (threadId ? threads[String(threadId)]?.sessionId : undefined);
         if (!resolvedSessionId) return null;
         const logFile = findSessionLogFile(resolvedSessionId);
         if (!logFile) return null;
