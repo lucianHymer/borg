@@ -1452,6 +1452,63 @@ async function processOneShot(msg: IncomingMessage): Promise<{ text: string; mod
 
 // ─── Process Message ───
 
+// ─── Slurp: scan queue for next message on a given thread ───
+
+function slurpNextMessage(threadId: number): { file: string; msg: IncomingMessage } | null {
+    if (!fs.existsSync(QUEUE_INCOMING)) return null;
+
+    const files = fs.readdirSync(QUEUE_INCOMING)
+        .filter(f => f.endsWith(".json"))
+        .map(f => ({ name: f, path: path.join(QUEUE_INCOMING, f) }));
+
+    // Find messages for this thread, apply coalescing
+    let primary: { name: string; path: string; msg: IncomingMessage } | null = null;
+    const coalesced: { name: string; path: string }[] = [];
+
+    for (const file of files) {
+        try {
+            const raw: unknown = JSON.parse(fs.readFileSync(file.path, "utf8"));
+            // Skip if retry backoff not ready
+            if (raw && typeof raw === "object" && "retryAfter" in raw) {
+                const retryAfter = (raw as any).retryAfter;
+                if (typeof retryAfter === "number" && Date.now() < retryAfter) continue;
+            }
+            const parsed = IncomingMessageSchema.safeParse(raw);
+            if (!parsed.success) continue;
+            const msg = parsed.data;
+            if (msg.threadId !== threadId) continue;
+            // Skip commands, heartbeats, scheduled tasks — only slurp user messages
+            if (msg.message.startsWith("/")) continue;
+            if (msg.source === "heartbeat" || msg.source === "scheduled-task" || msg.source === "one-shot") continue;
+
+            if (!primary) {
+                primary = { ...file, msg };
+            } else if (!msg.audioPath) {
+                // Coalesce additional text messages
+                primary.msg.message += "\n\n" + msg.message;
+                coalesced.push(file);
+            }
+        } catch { continue; }
+    }
+
+    if (!primary) return null;
+
+    // Rewrite primary file with coalesced text if needed
+    if (coalesced.length > 0) {
+        try {
+            const tmpFile = primary.path + ".tmp";
+            fs.writeFileSync(tmpFile, JSON.stringify(primary.msg, null, 2));
+            fs.renameSync(tmpFile, primary.path);
+        } catch { /* proceed with original */ }
+        for (const cf of coalesced) {
+            try { fs.unlinkSync(cf.path); } catch {}
+        }
+        log("INFO", `Slurp: coalesced ${coalesced.length + 1} messages for thread ${threadId}`);
+    }
+
+    return { file: primary.path, msg: primary.msg };
+}
+
 async function processMessage(messageFile: string): Promise<void> {
     const filename = path.basename(messageFile);
     const processingFile = path.join(QUEUE_PROCESSING, filename);
@@ -2080,6 +2137,134 @@ async function processMessage(messageFile: string): Promise<void> {
         // Clean up processing file
         if (fs.existsSync(processingFile)) {
             fs.unlinkSync(processingFile);
+        }
+
+        // ─── Slurp: check for queued messages that arrived while we were processing ───
+        // If the session is idle and there are more messages for this thread,
+        // consume them immediately instead of releasing the thread slot.
+        // Messages stay in the file queue until we're ready, preserving
+        // edit/delete and coalescing behavior.
+        if (source !== "heartbeat" && source !== "scheduled-task" && source !== "one-shot") {
+            while (sessionPool.getState(threadId) === "idle") {
+                const nextMsg = slurpNextMessage(threadId);
+                if (!nextMsg) break;
+
+                const { file: nextFile, msg: nextMsgData } = nextMsg;
+                const nextFilename = path.basename(nextFile);
+                const nextProcessingFile = path.join(QUEUE_PROCESSING, nextFilename);
+
+                try {
+                    fs.renameSync(nextFile, nextProcessingFile);
+                } catch {
+                    break; // File may have been picked up by someone else
+                }
+
+                log("INFO", `Slurp: consuming queued message for thread ${threadId} from ${nextMsgData.sender}`);
+
+                // Build prompt for the slurped message
+                const slurpNow = formatCurrentTime();
+                const slurpPrefix = buildSourcePrefix(nextMsgData);
+                const slurpPrompt = `[${slurpNow}] ${slurpPrefix} ${nextMsgData.message}`;
+                const slurpMessageId = nextMsgData.messageId;
+
+                // Log incoming
+                appendHistory({
+                    ts: Date.now(),
+                    threadId,
+                    channel: nextMsgData.channel,
+                    sender: nextMsgData.sender,
+                    direction: "in",
+                    message: nextMsgData.message,
+                    source: nextMsgData.source ?? "user",
+                    sourceThreadId: nextMsgData.sourceThreadId,
+                    messageId: slurpMessageId,
+                });
+
+                // Push into session and collect response
+                const slurpThreads = loadThreads();
+                const slurpCwd = slurpThreads[String(threadId)]?.cwd ?? process.cwd();
+                const claimed = sessionPool.tryClaimSession(threadId, effectiveModel, slurpCwd);
+                if (!claimed) break; // Session gone (model changed, etc.)
+
+                writeStatus(slurpMessageId, "Thinking", Date.now());
+
+                const slurpObserver: QueryEventObserver = {
+                    onToolUse(toolName: string) {
+                        writeStatus(slurpMessageId, `Using ${toolName}`, Date.now());
+                    },
+                    onTextContent() {},
+                };
+
+                const slurpPromise = collectPrimaryResponse(claimed.query, slurpObserver);
+                claimed.pushMessage(slurpPrompt);
+
+                try {
+                    const slurpResult = await slurpPromise;
+                    const slurpText = slurpResult.text.trim() || "(No response generated)";
+
+                    if (slurpResult.sessionId) {
+                        updateThread(threadId, { sessionId: slurpResult.sessionId, lastActive: Date.now() });
+                    }
+
+                    // Handle background tasks from slurped message
+                    if (slurpResult.hasBackgroundTasks) {
+                        sessionPool.markMonitoring(threadId);
+                        const monitor = monitorBackgroundTasks(
+                            slurpResult.query, slurpResult.activeTasks, threadId, slurpMessageId,
+                        );
+                        activeBackgroundMonitors.set(threadId, monitor);
+                        monitor.finally(() => {
+                            activeBackgroundMonitors.delete(threadId);
+                            sessionPool.markIdle(threadId, slurpResult.sessionId);
+                        });
+                    } else {
+                        sessionPool.markIdle(threadId, slurpResult.sessionId);
+                    }
+
+                    // Log and write outgoing
+                    appendHistory({
+                        ts: Date.now(), threadId, channel: nextMsgData.channel,
+                        sender: "assistant", direction: "out", message: slurpText,
+                        model: effectiveModel, source: nextMsgData.source ?? "user",
+                        messageId: slurpMessageId,
+                        ...(slurpResult.usage ? {
+                            costUSD: slurpResult.usage.totalCostUSD,
+                            inputTokens: slurpResult.usage.inputTokens,
+                            outputTokens: slurpResult.usage.outputTokens,
+                            cacheReadInputTokens: slurpResult.usage.cacheReadInputTokens,
+                            cacheCreationInputTokens: slurpResult.usage.cacheCreationInputTokens,
+                            durationMs: slurpResult.usage.durationMs,
+                            durationApiMs: slurpResult.usage.durationApiMs,
+                            numTurns: slurpResult.usage.numTurns,
+                            modelUsage: slurpResult.usage.modelUsage,
+                        } : {}),
+                    });
+
+                    const slurpOutgoing: OutgoingMessage = {
+                        channel: nextMsgData.channel, threadId, sender: nextMsgData.sender,
+                        message: slurpText, originalMessage: nextMsgData.message,
+                        timestamp: Date.now(), messageId: slurpMessageId, model: effectiveModel,
+                    };
+                    const slurpOutFile = path.join(QUEUE_OUTGOING, `${nextMsgData.channel}_${slurpMessageId}_${Date.now()}.json`);
+                    const slurpTmp = slurpOutFile + ".tmp";
+                    fs.writeFileSync(slurpTmp, JSON.stringify(slurpOutgoing, null, 2));
+                    fs.renameSync(slurpTmp, slurpOutFile);
+
+                    clearStatus(slurpMessageId);
+                    log("INFO", `Slurp response ready thread=${threadId} model=${effectiveModel} (${slurpText.length} chars)`);
+                } catch (slurpErr) {
+                    log("WARN", `Slurp error for thread ${threadId}: ${toErrorMessage(slurpErr)}`);
+                    clearStatus(slurpMessageId);
+                    // Put the message back for normal processing
+                    try { fs.renameSync(nextProcessingFile, nextFile); } catch {}
+                    sessionPool.close(threadId);
+                    break;
+                } finally {
+                    if (fs.existsSync(nextProcessingFile)) {
+                        try { fs.unlinkSync(nextProcessingFile); } catch {}
+                    }
+                }
+            }
         }
     } catch (error) {
         const errorMsg = toErrorMessage(error);
