@@ -502,6 +502,9 @@ let activeScheduledTaskCount = 0;
 // Background task monitors that run independently after end_turn
 const activeBackgroundMonitors = new Map<number, Promise<void>>();
 
+// Messages injected mid-turn into running sessions (threadId → count of pending responses)
+const injectedMessageCount = new Map<number, number>();
+
 // Persistent session pool for reusing SDK sessions across messages
 const sessionPool = new SessionPool({
     idleTimeoutMinutes: 30,
@@ -2300,6 +2303,90 @@ async function processMessage(messageFile: string): Promise<void> {
                     }
                 }
             }
+
+            // ─── Consume responses from messages injected mid-turn ───
+            // These were pushed into the channel by processQueue while we were
+            // processing. The SDK queued them and their responses are in the iterator.
+            const pendingInjected = injectedMessageCount.get(threadId) ?? 0;
+            if (pendingInjected > 0 && sessionPool.getState(threadId) === "idle") {
+                injectedMessageCount.delete(threadId);
+                log("INFO", `Consuming ${pendingInjected} injected message response(s) for thread ${threadId}`);
+
+                for (let i = 0; i < pendingInjected; i++) {
+                    const claimed = sessionPool.tryClaimSession(threadId, effectiveModel,
+                        loadThreads()[String(threadId)]?.cwd ?? process.cwd());
+                    if (!claimed) break;
+
+                    const injObserver: QueryEventObserver = {
+                        onToolUse(toolName: string) {
+                            log("DEBUG", `Injected response using ${toolName}`);
+                        },
+                        onTextContent() {},
+                    };
+
+                    const injPromise = collectPrimaryResponse(claimed.query, injObserver);
+                    // Don't push — message was already injected into the channel
+                    try {
+                        const injResult = await injPromise;
+                        const injText = injResult.text.trim() || "(No response generated)";
+
+                        if (injResult.sessionId) {
+                            updateThread(threadId, { sessionId: injResult.sessionId, lastActive: Date.now() });
+                        }
+
+                        if (injResult.hasBackgroundTasks) {
+                            sessionPool.markMonitoring(threadId);
+                            const monitor = monitorBackgroundTasks(
+                                injResult.query, injResult.activeTasks, threadId, messageId,
+                            );
+                            activeBackgroundMonitors.set(threadId, monitor);
+                            monitor.finally(() => {
+                                activeBackgroundMonitors.delete(threadId);
+                                sessionPool.markIdle(threadId, injResult.sessionId);
+                            });
+                        } else {
+                            sessionPool.markIdle(threadId, injResult.sessionId);
+                        }
+
+                        // Write response to outgoing
+                        appendHistory({
+                            ts: Date.now(), threadId, channel,
+                            sender: "assistant", direction: "out", message: injText,
+                            model: effectiveModel, source: source ?? "user",
+                            messageId: `injected_${threadId}_${Date.now()}`,
+                            ...(injResult.usage ? {
+                                costUSD: injResult.usage.totalCostUSD,
+                                inputTokens: injResult.usage.inputTokens,
+                                outputTokens: injResult.usage.outputTokens,
+                                cacheReadInputTokens: injResult.usage.cacheReadInputTokens,
+                                cacheCreationInputTokens: injResult.usage.cacheCreationInputTokens,
+                                durationMs: injResult.usage.durationMs,
+                                durationApiMs: injResult.usage.durationApiMs,
+                                numTurns: injResult.usage.numTurns,
+                                modelUsage: injResult.usage.modelUsage,
+                            } : {}),
+                        });
+
+                        const injOutgoing: OutgoingMessage = {
+                            channel, threadId, sender,
+                            message: injText, originalMessage: "(injected mid-turn)",
+                            timestamp: Date.now(),
+                            messageId: `injected_${threadId}_${Date.now()}`,
+                            model: effectiveModel,
+                        };
+                        const injFile = path.join(QUEUE_OUTGOING, `injected_${threadId}_${Date.now()}.json`);
+                        const injTmp = injFile + ".tmp";
+                        fs.writeFileSync(injTmp, JSON.stringify(injOutgoing, null, 2));
+                        fs.renameSync(injTmp, injFile);
+
+                        log("INFO", `Injected response ready thread=${threadId} (${injText.length} chars)`);
+                    } catch (injErr) {
+                        log("WARN", `Injected response error for thread ${threadId}: ${toErrorMessage(injErr)}`);
+                        sessionPool.close(threadId);
+                        break;
+                    }
+                }
+            }
         }
     } catch (error) {
         const errorMsg = toErrorMessage(error);
@@ -2498,8 +2585,42 @@ async function processQueue(): Promise<void> {
                 continue; // File may have been picked up by a concurrent scan
             }
 
-            // Only one message per thread at a time (SDK sessions aren't concurrent)
-            if (activeThreads.has(msg.threadId)) continue;
+            // If thread is busy, inject the message into the running session.
+            // The SDK queues it and processes it after the current turn completes.
+            // The slurp loop in processMessage consumes the response.
+            if (activeThreads.has(msg.threadId)) {
+                if (!msg.message.startsWith("/") &&
+                    msg.source !== "heartbeat" &&
+                    msg.source !== "scheduled-task" &&
+                    msg.source !== "one-shot") {
+                    const now = formatCurrentTime();
+                    const prefix = buildSourcePrefix(msg);
+                    const injectPrompt = `[${now}] ${prefix} ${msg.message}`;
+                    if (sessionPool.injectMessage(msg.threadId, injectPrompt)) {
+                        // Log incoming to history
+                        appendHistory({
+                            ts: Date.now(),
+                            threadId: msg.threadId,
+                            channel: msg.channel,
+                            sender: msg.sender,
+                            direction: "in",
+                            message: msg.message,
+                            source: msg.source ?? "user",
+                            sourceThreadId: msg.sourceThreadId,
+                            messageId: msg.messageId,
+                        });
+                        // Track that a response is pending for the slurp loop
+                        injectedMessageCount.set(
+                            msg.threadId,
+                            (injectedMessageCount.get(msg.threadId) ?? 0) + 1,
+                        );
+                        // Delete queue file — message is in the channel now
+                        try { fs.unlinkSync(file.path); } catch {}
+                        log("INFO", `Injected message into running session for thread ${msg.threadId} from ${msg.sender}: ${msg.message.substring(0, 60)}`);
+                    }
+                }
+                continue;
+            }
 
             // Only 1 heartbeat can process concurrently — reserve other slots for user messages
             if (msg.source === 'heartbeat' && activeHeartbeatCount >= 1) continue;

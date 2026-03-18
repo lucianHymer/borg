@@ -151,6 +151,25 @@ export class SessionPool {
     }
 
     /**
+     * Push a message into a session that's currently processing.
+     * The SDK will queue it and process it after the current turn completes.
+     * Returns true if the message was pushed, false if no session or no channel.
+     */
+    injectMessage(threadId: number, prompt: string): boolean {
+        const session = this.sessions.get(threadId);
+        if (!session) return false;
+        // Allow injection into processing or idle sessions
+        if (session.state !== "processing" && session.state !== "idle") return false;
+
+        const channel = this.channels.get(threadId);
+        if (!channel) return false;
+
+        channel.push(prompt, session.sessionId);
+        this.log("INFO", `Session pool: injected message into ${session.state} session for thread ${threadId}`);
+        return true;
+    }
+
+    /**
      * Create a new persistent session for a thread.
      * Uses AsyncIterable prompt (streaming mode) so the subprocess stays alive
      * across turns. Returns the Query object — caller consumes the first response.
