@@ -9,6 +9,12 @@ import path from "node:path";
 const SCRIPT_DIR = path.resolve(__dirname, "..");
 const VOICE_CACHE_FILE = path.join(SCRIPT_DIR, ".borg/voice-transcripts.json");
 
+// Zone-specific cache files for cross-zone reads (infra reads transcripts written by core/perimeter)
+const ZONE_CACHE_FILES = [
+    path.join(SCRIPT_DIR, ".borg-core/voice-transcripts.json"),
+    path.join(SCRIPT_DIR, ".borg-perimeter/voice-transcripts.json"),
+];
+
 export interface VoiceTranscriptEntry {
     transcript: string;
     ts: number;  // Unix epoch timestamp
@@ -75,10 +81,26 @@ export function storeVoiceTranscript(telegramMessageId: string, transcript: stri
 
 /**
  * Retrieve a voice transcript from the cache.
+ * Checks local cache first, then zone-specific caches (for infra reading core/perimeter data).
  * @param telegramMessageId - Telegram message ID as string
  * @returns Transcript text or undefined if not found/pruned
  */
 export function getVoiceTranscript(telegramMessageId: string): string | undefined {
     const cache = loadVoiceCache();
-    return cache[telegramMessageId]?.transcript;
+    const local = cache[telegramMessageId]?.transcript;
+    if (local) return local;
+
+    // Check zone-specific caches (infra has read-only mounts of .borg-core/.borg-perimeter)
+    for (const zoneFile of ZONE_CACHE_FILES) {
+        try {
+            const data = fs.readFileSync(zoneFile, "utf8");
+            const zoneCache = JSON.parse(data) as Record<string, VoiceTranscriptEntry>;
+            const transcript = zoneCache[telegramMessageId]?.transcript;
+            if (transcript) return transcript;
+        } catch {
+            // Zone file doesn't exist or isn't mounted — skip
+        }
+    }
+
+    return undefined;
 }
