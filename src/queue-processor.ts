@@ -582,12 +582,13 @@ function buildSourcePrefix(msg: IncomingMessage): string {
 
 // ─── Status File Helpers ───
 
-function writeStatus(messageId: string, label: string, startTs: number, preview?: string): void {
+function writeStatus(messageId: string, label: string, startTs: number, preview?: string, fullText?: string): void {
     try {
         const statusFile = path.join(QUEUE_STATUS, `${messageId}.json`);
         const tmpFile = statusFile + ".tmp";
         const data: Record<string, unknown> = { label, ts: Date.now(), startTs };
         if (preview) data.preview = preview;
+        if (fullText) data.fullText = fullText;
         fs.writeFileSync(tmpFile, JSON.stringify(data));
         fs.renameSync(tmpFile, statusFile);
     } catch {
@@ -1912,7 +1913,7 @@ async function processMessage(messageFile: string): Promise<void> {
                 if (!cancelled && fs.existsSync(cancelFile)) {
                     cancelled = true;
                     currentStatusLabel = "Cancelled";
-                    writeStatus(messageId, currentStatusLabel, statusStartTime, currentPreview);
+                    writeStatus(messageId, currentStatusLabel, statusStartTime, currentPreview, fullAccumulatedText);
                     try { fs.unlinkSync(cancelFile); } catch { /* best effort */ }
                     // Race interrupt() against a 10s timeout — if the SDK subprocess
                     // hangs (e.g. waiting on a background task), we can't block this
@@ -1930,7 +1931,7 @@ async function processMessage(messageFile: string): Promise<void> {
                 }
                 // Check for settings file changes (e.g., /budget_on from telegram-client)
                 invalidateSettingsCacheIfChanged();
-                writeStatus(messageId, currentStatusLabel, statusStartTime, currentPreview);
+                writeStatus(messageId, currentStatusLabel, statusStartTime, currentPreview, fullAccumulatedText);
             }, 2000);
 
             // Observer callbacks set intent; the interval handles all file writes

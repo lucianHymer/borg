@@ -1476,13 +1476,11 @@ app.get("/api/response/:messageId/feed", (req, res) => {
     let lastTasksJson = "";
     let completeSent = false;
 
-    // Initialize session log offset to current EOF
+    // Initialize session log — start from beginning so existing entries are sent
     const sessionInfo = findSessionLogForMessage();
     if (sessionInfo) {
         sessionLogFile = sessionInfo.logFile;
-        if (fs.existsSync(sessionLogFile)) {
-            sessionLogTail.offset = fs.statSync(sessionLogFile).size;
-        }
+        // offset stays at 0 — first tick will send all existing entries
     }
 
     const interval = setInterval(() => {

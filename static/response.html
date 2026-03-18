@@ -818,9 +818,11 @@ function startLiveFeed() {
         : '';
       setBadge('live', `${status.label || 'Processing'} ${elapsed}`);
 
-      if (status.preview) {
+      // Use full text if available, fall back to truncated preview
+      const streamText = status.fullText || status.preview;
+      if (streamText) {
         const body = document.getElementById('outgoing-body');
-        body.textContent = status.preview;
+        body.textContent = streamText;
         body.style.color = '';
         body.style.fontStyle = '';
       }
