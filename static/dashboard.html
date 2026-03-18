@@ -2692,6 +2692,22 @@ tr.clickable { cursor: pointer; }
 
   var allTasksCache = [];
 
+  // Event delegation for task interactions (scheduled task rows + bg task stop buttons)
+  document.addEventListener('click', function(e) {
+    // Scheduled task row click → open modal
+    var row = e.target.closest('tr[data-task-id]');
+    if (row) {
+      openTaskModal(row.getAttribute('data-task-id'));
+      return;
+    }
+    // Background task stop button
+    var stopBtn = e.target.closest('[data-stop-bg-task]');
+    if (stopBtn) {
+      stopBgTask(stopBtn.getAttribute('data-stop-bg-task'), stopBtn);
+      return;
+    }
+  });
+
   function initTasks() {
     document.getElementById('task-modal-close').onclick = closeTaskModal;
     document.getElementById('task-modal').addEventListener('click', function(e) {
@@ -2774,7 +2790,7 @@ tr.clickable { cursor: pointer; }
                         task.status === 'completed' ? 'var(--accent-blue)' :
                         task.status === 'failed' ? 'var(--accent-red, #ff6b6b)' : 'var(--text-secondary)';
       var stopBtn = task.status === 'running'
-        ? '<button style="background:rgba(248,81,73,0.15);color:var(--accent-red, #ff6b6b);border:1px solid rgba(248,81,73,0.3);border-radius:4px;padding:2px 8px;font-size:10px;cursor:pointer;font-family:inherit;" onclick="stopBgTask(\'' + escapeHtml(task.taskId) + '\', this)">Stop</button>'
+        ? '<button style="background:rgba(248,81,73,0.15);color:var(--accent-red, #ff6b6b);border:1px solid rgba(248,81,73,0.3);border-radius:4px;padding:2px 8px;font-size:10px;cursor:pointer;font-family:inherit;" data-stop-bg-task="' + escapeHtml(task.taskId) + '">Stop</button>'
         : '';
       html += '<tr>' +
         '<td style="color:' + statusColor + '">' + escapeHtml(task.status) + '</td>' +
@@ -2823,7 +2839,7 @@ tr.clickable { cursor: pointer; }
       var statusColor = !t.enabled ? 'var(--text-secondary)' : t.lastResult === 'error' ? 'var(--accent-red, #ff6b6b)' : 'var(--accent-green)';
       var statusText = !t.enabled ? 'disabled' : t.lastResult || 'pending';
       var modelClass = modelColorClass(t.model.replace('[1m]', ''));
-      html += '<tr style="cursor:pointer;" onclick="openTaskModal(\'' + escapeHtml(t.id) + '\')">' +
+      html += '<tr style="cursor:pointer;" data-task-id="' + escapeHtml(t.id) + '">' +
         '<td>' + escapeHtml(t.name) + '</td>' +
         '<td class="' + modelClass + '">' + escapeHtml(t.model.replace('[1m]', '')) + '</td>' +
         '<td style="font-family:monospace;font-size:11px;">' + escapeHtml(t.cron) + '</td>' +
