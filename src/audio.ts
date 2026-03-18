@@ -182,8 +182,8 @@ export async function synthesize(text: string, voice?: string, speed?: number): 
 // ─── Speech Distillation via Sonnet ───
 
 export async function distillForSpeech(text: string): Promise<string> {
-    // Cap input length before sending to distillation
-    const truncatedInput = text.length > 4096 ? text.slice(0, 4096) : text;
+    // Cap input length before sending to distillation (100k chars — well within sonnet's context)
+    const truncatedInput = text.length > 100_000 ? text.slice(0, 100_000) : text;
 
     try {
         const conversation = query({
