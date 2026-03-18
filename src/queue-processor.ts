@@ -1263,6 +1263,83 @@ async function monitorBackgroundTasks(
     } finally {
         // Clean up task state file when all monitoring is done
         clearTaskState(messageId);
+
+        // Mark session idle so we can claim it for the summary response.
+        // (The .finally() callback in processMessage also marks idle, but
+        // this runs first — inside the monitor's own finally block.)
+        sessionPool.markIdle(threadId);
+
+        // Push a summary of completed tasks into the session so the model
+        // can report results without waiting for the user to ask.
+        const completedTasks = [...activeTasks.values()].filter(t => t.status === "completed" || t.status === "failed");
+        if (completedTasks.length > 0) {
+            const summaryLines = completedTasks.map(t => {
+                const status = t.status === "completed" ? "completed" : "FAILED";
+                return `- ${t.description}: ${status}${t.summary ? ` — ${t.summary}` : ""}`;
+            });
+            const summaryPrompt = `[System] Background tasks finished:\n${summaryLines.join("\n")}\n\nPlease review the results and report back to the user.`;
+
+            if (sessionPool.injectMessage(threadId, summaryPrompt)) {
+                log("INFO", `Injected background task completion summary into session for thread ${threadId}`);
+
+                // Consume the model's response to the summary
+                const claimed = sessionPool.tryClaimSession(threadId,
+                    loadThreads()[String(threadId)]?.model ?? "sonnet",
+                    loadThreads()[String(threadId)]?.cwd ?? process.cwd());
+                if (claimed) {
+                    try {
+                        const summaryResponse = collectPrimaryResponse(claimed.query);
+                        claimed.pushMessage(summaryPrompt);
+                        const result = await summaryResponse;
+                        const responseText = result.text.trim();
+
+                        if (result.sessionId) {
+                            updateThread(threadId, { sessionId: result.sessionId, lastActive: Date.now() });
+                        }
+                        sessionPool.markIdle(threadId, result.sessionId);
+
+                        if (responseText) {
+                            // Log and send the response
+                            const bgMessageId = `bg_summary_${threadId}_${Date.now()}`;
+                            appendHistory({
+                                ts: Date.now(), threadId, channel: "system",
+                                sender: "assistant", direction: "out", message: responseText,
+                                model: loadThreads()[String(threadId)]?.model ?? "sonnet",
+                                source: "system", messageId: bgMessageId,
+                                ...(result.usage ? {
+                                    costUSD: result.usage.totalCostUSD,
+                                    inputTokens: result.usage.inputTokens,
+                                    outputTokens: result.usage.outputTokens,
+                                    cacheReadInputTokens: result.usage.cacheReadInputTokens,
+                                    cacheCreationInputTokens: result.usage.cacheCreationInputTokens,
+                                    durationMs: result.usage.durationMs,
+                                    durationApiMs: result.usage.durationApiMs,
+                                    numTurns: result.usage.numTurns,
+                                    modelUsage: result.usage.modelUsage,
+                                } : {}),
+                            });
+
+                            const outgoing: OutgoingMessage = {
+                                channel: "system", threadId, sender: "assistant",
+                                message: responseText, originalMessage: "(background task results)",
+                                timestamp: Date.now(), messageId: bgMessageId,
+                                model: loadThreads()[String(threadId)]?.model ?? "sonnet",
+                            };
+                            const outFile = path.join(QUEUE_OUTGOING, `bg_summary_${threadId}_${Date.now()}.json`);
+                            const tmpFile = outFile + ".tmp";
+                            fs.writeFileSync(tmpFile, JSON.stringify(outgoing, null, 2));
+                            fs.renameSync(tmpFile, outFile);
+
+                            log("INFO", `Background task summary response ready for thread ${threadId} (${responseText.length} chars)`);
+                        }
+                    } catch (summaryErr) {
+                        log("WARN", `Background task summary response error for thread ${threadId}: ${toErrorMessage(summaryErr)}`);
+                        sessionPool.close(threadId);
+                    }
+                }
+            }
+        }
+
         log("INFO", `Background task monitoring ended for ${messageId}`);
     }
 }
