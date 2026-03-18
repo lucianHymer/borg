@@ -969,9 +969,15 @@ tr.clickable { cursor: pointer; }
     <div id="heartbeats-list"></div>
   </div>
 
-  <!-- View: Scheduled Tasks -->
+  <!-- View: Tasks (Background + Scheduled) -->
   <div id="view-tasks" class="view">
-    <h2 style="margin-bottom:12px;">Scheduled Tasks</h2>
+    <h2 style="margin-bottom:12px;">Background Tasks</h2>
+    <div id="bg-tasks-container">
+      <div id="bg-tasks-empty" class="empty-state" style="display:none;">No active background tasks.</div>
+      <div id="bg-tasks-list"></div>
+    </div>
+
+    <h2 style="margin-top:24px;margin-bottom:12px;">Scheduled Tasks</h2>
     <div style="display:flex;gap:8px;margin-bottom:16px;align-items:center;">
       <span id="tasks-meta" style="color:var(--text-secondary);font-size:11px;"></span>
     </div>
@@ -2695,6 +2701,14 @@ tr.clickable { cursor: pointer; }
       if (e.key === 'Escape') closeTaskModal();
     });
     fetchTasks();
+    fetchBackgroundTasks();
+    // Auto-refresh background tasks every 5s while Tasks view is visible
+    if (window._bgTasksInterval) clearInterval(window._bgTasksInterval);
+    window._bgTasksInterval = setInterval(function() {
+      if (document.getElementById('view-tasks').style.display !== 'none') {
+        fetchBackgroundTasks();
+      }
+    }, 5000);
   }
 
   function openTaskModal(taskId) {
@@ -2721,6 +2735,66 @@ tr.clickable { cursor: pointer; }
 
   function closeTaskModal() {
     document.getElementById('task-modal').style.display = 'none';
+  }
+
+  async function fetchBackgroundTasks() {
+    var data = await api('/api/background-tasks');
+    var list = document.getElementById('bg-tasks-list');
+    var empty = document.getElementById('bg-tasks-empty');
+    if (!data || !data.taskStates || data.taskStates.length === 0) {
+      list.innerHTML = '';
+      empty.style.display = '';
+      return;
+    }
+    empty.style.display = 'none';
+    var allTasks = [];
+    for (var i = 0; i < data.taskStates.length; i++) {
+      var state = data.taskStates[i];
+      var taskEntries = Object.values(state.tasks || {});
+      for (var j = 0; j < taskEntries.length; j++) {
+        var t = taskEntries[j];
+        t._threadId = state.threadId;
+        t._messageId = state.messageId;
+        allTasks.push(t);
+      }
+    }
+    // Sort: running first, then by startedAt desc
+    allTasks.sort(function(a, b) {
+      if (a.status === 'running' && b.status !== 'running') return -1;
+      if (a.status !== 'running' && b.status === 'running') return 1;
+      return (b.startedAt || 0) - (a.startedAt || 0);
+    });
+    var html = '<table><thead><tr><th>Status</th><th>Description</th><th>Thread</th><th>Elapsed</th><th>Tokens</th><th>Tools</th><th></th></tr></thead><tbody>';
+    for (var k = 0; k < allTasks.length; k++) {
+      var task = allTasks[k];
+      var elapsed = task.startedAt ? fmtDuration(Date.now() - task.startedAt) : '';
+      var tokens = task.usage ? fmtTokens(task.usage.totalTokens) : '-';
+      var tools = task.usage ? task.usage.toolUses : '-';
+      var statusColor = task.status === 'running' ? 'var(--accent-green)' :
+                        task.status === 'completed' ? 'var(--accent-blue)' :
+                        task.status === 'failed' ? 'var(--accent-red, #ff6b6b)' : 'var(--text-secondary)';
+      var stopBtn = task.status === 'running'
+        ? '<button style="background:rgba(248,81,73,0.15);color:var(--accent-red, #ff6b6b);border:1px solid rgba(248,81,73,0.3);border-radius:4px;padding:2px 8px;font-size:10px;cursor:pointer;font-family:inherit;" onclick="stopBgTask(\'' + escapeHtml(task.taskId) + '\', this)">Stop</button>'
+        : '';
+      html += '<tr>' +
+        '<td style="color:' + statusColor + '">' + escapeHtml(task.status) + '</td>' +
+        '<td>' + escapeHtml(task.description) + (task.summary ? '<br><span style="color:var(--text-secondary);font-size:11px;">' + escapeHtml(task.summary) + '</span>' : '') + '</td>' +
+        '<td>' + task._threadId + '</td>' +
+        '<td>' + elapsed + '</td>' +
+        '<td>' + tokens + '</td>' +
+        '<td>' + tools + '</td>' +
+        '<td>' + stopBtn + '</td>' +
+        '</tr>';
+    }
+    html += '</tbody></table>';
+    list.innerHTML = html;
+  }
+
+  async function stopBgTask(taskId, btn) {
+    btn.disabled = true;
+    btn.textContent = '...';
+    try { await fetch('/api/background-tasks/' + encodeURIComponent(taskId) + '/stop', { method: 'POST' }); } catch {}
+    setTimeout(fetchBackgroundTasks, 1000);
   }
 
   async function fetchTasks() {
