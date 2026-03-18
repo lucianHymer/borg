@@ -1008,7 +1008,24 @@ async function collectPrimaryResponse(
         // In streaming mode (AsyncIterable prompt), the iterator stays open
         // after result. We must return here — NOT wait for done — otherwise
         // we'll block forever waiting for the next message from the generator.
-        if (state.sawResult) break;
+        // But first: check if background tasks are active — if so, return
+        // early so the caller can fire off the background monitor.
+        if (state.sawResult) {
+            const runningTasks = [...state.activeTasks.values()].filter(t => t.status === "running");
+            if (runningTasks.length > 0) {
+                log("INFO", `result with ${runningTasks.length} active background task(s) — returning for monitoring`);
+                return {
+                    text: state.parts.join("\n\n"),
+                    sessionId: state.capturedSessionId,
+                    stallRecovered: false,
+                    usage: state.usageData,
+                    activeTasks: state.activeTasks,
+                    query: q,
+                    hasBackgroundTasks: true,
+                };
+            }
+            break;
+        }
     }
 
     // Clean up hung process on stall
