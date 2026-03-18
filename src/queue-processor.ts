@@ -1028,6 +1028,41 @@ async function collectPrimaryResponse(
         }
     }
 
+    // Drain any buffered events from the iterator after result.
+    // In streaming mode, the subprocess stays alive and may have emitted
+    // system messages, compacting events, or additional results after the
+    // one we consumed. If we don't drain these, they'll be served as
+    // responses to the NEXT message, causing stale/out-of-order replies.
+    if (state.sawResult && !stallDetected) {
+        let drained = 0;
+        // Use a short timeout — buffered events resolve near-instantly,
+        // while waiting for new events from the subprocess takes longer.
+        // 100ms is enough to drain buffered events without adding latency.
+        const DRAIN_TIMEOUT_MS = 100;
+        while (true) {
+            let drainHandle: ReturnType<typeof setTimeout>;
+            const drainTimeout = new Promise<"timeout">(resolve => {
+                drainHandle = setTimeout(() => resolve("timeout"), DRAIN_TIMEOUT_MS);
+            });
+            const winner = await Promise.race([
+                iterator.next().then(r => ({ kind: "event" as const, result: r })),
+                drainTimeout.then(() => ({ kind: "timeout" as const })),
+            ]);
+            if (winner.kind === "timeout") break;
+            clearTimeout(drainHandle!);
+            const r = (winner as { kind: "event"; result: IteratorResult<SDKMessage, void> }).result;
+            if (r.done) break;
+            drained++;
+            // Process to capture any late session_id updates
+            if ("session_id" in r.value && r.value.session_id) {
+                state.capturedSessionId = r.value.session_id;
+            }
+        }
+        if (drained > 0) {
+            log("DEBUG", `Drained ${drained} buffered event(s) after result for session reuse`);
+        }
+    }
+
     // Clean up hung process on stall
     if (stallDetected) {
         try {
