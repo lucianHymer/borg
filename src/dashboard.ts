@@ -1407,8 +1407,27 @@ app.get("/api/response/:messageId", (req, res) => {
     // Get session logs if we have a sessionId
     let sessionLogs: string[] = [];
     const resolvedThreadId = (outgoing?.threadId ?? incoming?.threadId) as number | undefined;
-    const resolvedSessionId = sessionId
+    let resolvedSessionId = sessionId
         || (resolvedThreadId ? threads[String(resolvedThreadId)]?.sessionId : undefined);
+
+    // During processing, sessionId may only be in the status file (before threads.json is updated)
+    if (!resolvedSessionId) {
+        const zoneDirs = [
+            BORG_DIR,
+            path.join(SCRIPT_DIR, ".borg-core"),
+            path.join(SCRIPT_DIR, ".borg-perimeter"),
+        ];
+        for (const dir of zoneDirs) {
+            const sf = path.join(dir, "status", `${messageId}.json`);
+            if (fs.existsSync(sf)) {
+                try {
+                    const status = JSON.parse(fs.readFileSync(sf, "utf8"));
+                    if (status.sessionId) { resolvedSessionId = status.sessionId; break; }
+                } catch { /* best effort */ }
+            }
+        }
+    }
+
     if (resolvedSessionId) {
         const logFile = findSessionLogFile(resolvedSessionId);
         if (logFile) {
@@ -1503,10 +1522,28 @@ app.get("/api/response/:messageId/feed", (req, res) => {
 
         // Check for new session log entries
         if (!sessionLogFile) {
-            const info = findSessionLogForMessage();
-            if (info) {
-                sessionLogFile = info.logFile;
-                sessionLogTail.offset = 0; // Read all existing entries on first find
+            // Try sessionId from status file first (available early during processing)
+            let found = false;
+            if (statusFile) {
+                try {
+                    const status = JSON.parse(lastStatusJson || fs.readFileSync(statusFile, "utf8"));
+                    if (status.sessionId) {
+                        const logFile = findSessionLogFile(status.sessionId);
+                        if (logFile) {
+                            sessionLogFile = logFile;
+                            sessionLogTail.offset = 0;
+                            found = true;
+                        }
+                    }
+                } catch { /* best effort */ }
+            }
+            // Fall back to message history + threads.json lookup
+            if (!found) {
+                const info = findSessionLogForMessage();
+                if (info) {
+                    sessionLogFile = info.logFile;
+                    sessionLogTail.offset = 0;
+                }
             }
         }
 

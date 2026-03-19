@@ -34,8 +34,6 @@ import {
 } from "./message-history.js";
 import { createBorgMcpServer } from "./mcp-tools.js";
 import { loadZoneConfig, getThreadsInZone } from "./zone-config.js";
-import { transcribe, cleanupAudioFile, ensureModels, AUDIO_INCOMING_DIR } from "./audio.js";
-import { IMAGES_INCOMING_DIR } from "./images.js";
 import type { MessageSource, MessageHistoryEntry } from "./message-history.js";
 import {
     loadThreads,
@@ -320,6 +318,13 @@ function syncSessionLog(sessionId: string, cwd: string): void {
     }
 }
 
+/** Persist sessionId to threads.json and sync the session log immediately. */
+function persistSessionId(threadId: number, sessionId: string): void {
+    updateThread(threadId, { sessionId, lastActive: Date.now() });
+    const cwd = loadThreads()[String(threadId)]?.cwd;
+    if (cwd) syncSessionLog(sessionId, cwd);
+}
+
 function syncAllActiveSessionLogs(): void {
     try {
         const threads = loadThreads();
@@ -502,8 +507,8 @@ let activeScheduledTaskCount = 0;
 // Background task monitors that run independently after end_turn
 const activeBackgroundMonitors = new Map<number, Promise<void>>();
 
-// Messages injected mid-turn into running sessions (threadId → count of pending responses)
-const injectedMessageCount = new Map<number, number>();
+// Messages injected mid-turn into running sessions (threadId → queued messageIds)
+const injectedMessageIds = new Map<number, string[]>();
 
 // Persistent session pool for reusing SDK sessions across messages
 const sessionPool = new SessionPool({
@@ -582,13 +587,14 @@ function buildSourcePrefix(msg: IncomingMessage): string {
 
 // ─── Status File Helpers ───
 
-function writeStatus(messageId: string, label: string, startTs: number, preview?: string, fullText?: string): void {
+function writeStatus(messageId: string, label: string, startTs: number, preview?: string, fullText?: string, sessionId?: string): void {
     try {
         const statusFile = path.join(QUEUE_STATUS, `${messageId}.json`);
         const tmpFile = statusFile + ".tmp";
         const data: Record<string, unknown> = { label, ts: Date.now(), startTs };
         if (preview) data.preview = preview;
         if (fullText) data.fullText = fullText;
+        if (sessionId) data.sessionId = sessionId;
         fs.writeFileSync(tmpFile, JSON.stringify(data));
         fs.renameSync(tmpFile, statusFile);
     } catch {
@@ -746,6 +752,7 @@ interface QueryUsageData {
 // ─── Collect full response text from query stream ───
 
 interface QueryEventObserver {
+    onSessionId?(sessionId: string): void;
     onToolUse?(toolName: string): void;
     onToolProgress?(toolName: string, elapsedSeconds: number): void;
     onCompacting?(): void;
@@ -869,7 +876,11 @@ function applyTaskEvent(
 function processSDKMessage(msg: SDKMessage, state: MessageProcessingState): void {
     // Always capture the latest session_id (it may change after compaction)
     if ("session_id" in msg && msg.session_id) {
+        const isNew = state.capturedSessionId !== msg.session_id;
         state.capturedSessionId = msg.session_id;
+        if (isNew) {
+            state.observer?.onSessionId?.(msg.session_id);
+        }
     }
 
     if (msg.type === "assistant") {
@@ -1599,8 +1610,8 @@ function slurpNextMessage(threadId: number): { file: string; msg: IncomingMessag
 
             if (!primary) {
                 primary = { ...file, msg };
-            } else if (!msg.audioPath) {
-                // Coalesce additional text messages
+            } else {
+                // Coalesce additional messages
                 primary.msg.message += "\n\n" + msg.message;
                 coalesced.push(file);
             }
@@ -1662,102 +1673,7 @@ async function processMessage(messageFile: string): Promise<void> {
         `Processing [${channel}] thread=${threadId} from ${sender}: ${msg.message.substring(0, 80)}...`,
     );
 
-    // ─── Validate audioPath is within the allowed directory ───
-    if (msg.audioPath) {
-        const resolved = path.resolve(msg.audioPath);
-        if (!resolved.startsWith(AUDIO_INCOMING_DIR + "/") && resolved !== AUDIO_INCOMING_DIR) {
-            throw new Error(`audioPath outside allowed directory: ${resolved}`);
-        }
-    }
-
-    // ─── Validate imagePath(s) are within the allowed directory ───
-    const allImagePaths = [
-        ...(msg.imagePath ? [msg.imagePath] : []),
-        ...(msg.imagePaths ?? []),
-    ];
-    for (const ip of allImagePaths) {
-        const resolved = path.resolve(ip);
-        if (!resolved.startsWith(IMAGES_INCOMING_DIR + "/") && resolved !== IMAGES_INCOMING_DIR) {
-            throw new Error(`imagePath outside allowed directory: ${resolved}`);
-        }
-    }
-
-    // ─── Voice Message: STT transcription ───
-    function writeSttErrorAndBail(userMessage: string, originalLabel: string): void {
-        const errorData: OutgoingMessage = {
-            channel,
-            threadId,
-            sender,
-            message: userMessage,
-            originalMessage: originalLabel,
-            timestamp: Date.now(),
-            messageId,
-            model: "haiku",
-        };
-        const errorFile = path.join(QUEUE_OUTGOING, `${channel}_${messageId}_${Date.now()}.json`);
-        const tmpFile = errorFile + ".tmp";
-        fs.writeFileSync(tmpFile, JSON.stringify(errorData, null, 2));
-        fs.renameSync(tmpFile, errorFile);
-        clearStatus(messageId);
-        if (msg.audioPath) cleanupAudioFile(msg.audioPath);
-        if (fs.existsSync(processingFile)) fs.unlinkSync(processingFile);
-    }
-
-    if (msg.audioPath && !msg.message) {
-        try {
-            writeStatus(messageId, "Listening", Date.now());
-            await ensureModels();
-            const transcript = await transcribe(msg.audioPath);
-            if (!transcript) {
-                writeSttErrorAndBail(
-                    "Couldn't transcribe your voice message — no speech detected. Please try again or send as text.",
-                    "(voice message — empty transcript)",
-                );
-                return;
-            }
-            msg.message = transcript;
-            log("INFO", `STT transcript (${msg.voiceDuration}s): ${transcript.substring(0, 120)}...`);
-
-            // Store transcript in voice cache for "Your Text"/"Your Summary" buttons
-            if (msg.telegramMessageId) {
-                const { storeVoiceTranscript } = await import("./voice-cache.js");
-                storeVoiceTranscript(String(msg.telegramMessageId), transcript);
-                log("INFO", `Stored voice transcript for message ${msg.telegramMessageId}`);
-            }
-
-            cleanupAudioFile(msg.audioPath);
-            // Update the processing file so retries don't re-attempt STT on a deleted audio file
-            delete msg.audioPath;
-            fs.writeFileSync(processingFile, JSON.stringify(msg, null, 2));
-        } catch (err) {
-            log("ERROR", `STT failed for thread ${threadId}: ${toErrorMessage(err)}`);
-            writeSttErrorAndBail(
-                "Couldn't transcribe your voice message — the transcription service may be unavailable. Please try again or send as text.",
-                "(voice message — STT error)",
-            );
-            return;
-        }
-    }
-
-    // ─── Photo Message: Add Read tool instruction ───
-    // Collect all image paths (single imagePath or multiple imagePaths from media group)
-    const imagesToProcess = msg.imagePaths?.length ? msg.imagePaths : (msg.imagePath ? [msg.imagePath] : []);
-    if (imagesToProcess.length > 0) {
-        const instructions = imagesToProcess.map(
-            (p, i) => imagesToProcess.length > 1
-                ? `[Image ${i + 1} received: ${p}]\n\nPlease view this image using the Read tool.`
-                : `[Image received: ${p}]\n\nPlease analyze this image using the Read tool.`
-        );
-        const imageInstruction = instructions.join("\n\n");
-        if (msg.message) {
-            msg.message = `${imageInstruction}\n\nCaption: ${msg.message}`;
-        } else {
-            msg.message = imageInstruction;
-        }
-        log("INFO", `Image message: ${imagesToProcess.length} image(s) — ${imagesToProcess.join(", ")}`);
-    }
-
-    // Log incoming message to history (after STT and image instruction so they're captured)
+    // Log incoming message to history
     appendHistory({
         ts: Date.now(),
         threadId,
@@ -2008,12 +1924,17 @@ async function processMessage(messageFile: string): Promise<void> {
                 }
                 // Check for settings file changes (e.g., /budget_on from telegram-client)
                 invalidateSettingsCacheIfChanged();
-                writeStatus(messageId, currentStatusLabel, statusStartTime, currentPreview, fullAccumulatedText);
+                writeStatus(messageId, currentStatusLabel, statusStartTime, currentPreview, fullAccumulatedText, currentSessionId);
             }, 2000);
 
             // Observer callbacks set intent; the interval handles all file writes
             let toolUseCount = 0;
+            let currentSessionId: string | undefined;
             const observer: QueryEventObserver = {
+                onSessionId(sessionId: string) {
+                    currentSessionId = sessionId;
+                    persistSessionId(threadId, sessionId);
+                },
                 onToolUse(toolName: string) {
                     toolUseCount++;
                     currentStatusLabel = `Using ${toolName} [${toolUseCount}]`;
@@ -2302,13 +2223,36 @@ async function processMessage(messageFile: string): Promise<void> {
                 const claimed = sessionPool.tryClaimSession(threadId, effectiveModel, slurpCwd);
                 if (!claimed) break; // Session gone (model changed, etc.)
 
-                writeStatus(slurpMessageId, "Thinking", Date.now());
+                const slurpStartTime = Date.now();
+                let slurpStatusLabel = "Thinking";
+                let slurpPreview: string | undefined;
+                let slurpFullText = "";
+                let slurpSessionId: string | undefined;
+                let slurpToolCount = 0;
+                writeStatus(slurpMessageId, slurpStatusLabel, slurpStartTime);
+
+                // Periodic status refresh so telegram-client's pollStatusFiles (2s)
+                // can pick up the status message — without this, fast responses
+                // could complete before the first poll tick ever sees the file.
+                const slurpStatusInterval = setInterval(() => {
+                    writeStatus(slurpMessageId, slurpStatusLabel, slurpStartTime, slurpPreview, slurpFullText, slurpSessionId);
+                }, 2000);
 
                 const slurpObserver: QueryEventObserver = {
-                    onToolUse(toolName: string) {
-                        writeStatus(slurpMessageId, `Using ${toolName}`, Date.now());
+                    onSessionId(sid: string) {
+                        slurpSessionId = sid;
+                        persistSessionId(threadId, sid);
                     },
-                    onTextContent() {},
+                    onToolUse(toolName: string) {
+                        slurpToolCount++;
+                        slurpStatusLabel = `Using ${toolName} [${slurpToolCount}]`;
+                    },
+                    onTextContent(text: string) {
+                        slurpFullText += (slurpFullText ? "\n\n" : "") + text;
+                        slurpPreview = slurpFullText.length > 500
+                            ? "…" + slurpFullText.slice(-500)
+                            : slurpFullText;
+                    },
                 };
 
                 const slurpPromise = collectPrimaryResponse(claimed.query, slurpObserver);
@@ -2316,6 +2260,7 @@ async function processMessage(messageFile: string): Promise<void> {
 
                 try {
                     const slurpResult = await slurpPromise;
+                    clearInterval(slurpStatusInterval);
                     const slurpText = slurpResult.text.trim() || "(No response generated)";
 
                     if (slurpResult.sessionId) {
@@ -2369,6 +2314,7 @@ async function processMessage(messageFile: string): Promise<void> {
                     clearStatus(slurpMessageId);
                     log("INFO", `Slurp response ready thread=${threadId} model=${effectiveModel} (${slurpText.length} chars)`);
                 } catch (slurpErr) {
+                    clearInterval(slurpStatusInterval);
                     log("WARN", `Slurp error for thread ${threadId}: ${toErrorMessage(slurpErr)}`);
                     clearStatus(slurpMessageId);
                     // Put the message back for normal processing
@@ -2385,19 +2331,30 @@ async function processMessage(messageFile: string): Promise<void> {
             // ─── Consume responses from messages injected mid-turn ───
             // These were pushed into the channel by processQueue while we were
             // processing. The SDK queued them and their responses are in the iterator.
-            const pendingInjected = injectedMessageCount.get(threadId) ?? 0;
-            if (pendingInjected > 0 && sessionPool.getState(threadId) === "idle") {
-                injectedMessageCount.delete(threadId);
-                log("INFO", `Consuming ${pendingInjected} injected message response(s) for thread ${threadId}`);
+            const pendingInjectedIds = injectedMessageIds.get(threadId) ?? [];
+            if (pendingInjectedIds.length > 0 && sessionPool.getState(threadId) === "idle") {
+                injectedMessageIds.delete(threadId);
+                log("INFO", `Consuming ${pendingInjectedIds.length} injected message response(s) for thread ${threadId}`);
 
-                for (let i = 0; i < pendingInjected; i++) {
+                for (let i = 0; i < pendingInjectedIds.length; i++) {
+                    const injMessageId = pendingInjectedIds[i];
                     const claimed = sessionPool.tryClaimSession(threadId, effectiveModel,
                         loadThreads()[String(threadId)]?.cwd ?? process.cwd());
                     if (!claimed) break;
 
+                    const injStartTime = Date.now();
+                    let injStatusLabel = "Thinking";
+                    let injToolCount = 0;
+                    writeStatus(injMessageId, injStatusLabel, injStartTime);
+
+                    const injStatusInterval = setInterval(() => {
+                        writeStatus(injMessageId, injStatusLabel, injStartTime);
+                    }, 2000);
+
                     const injObserver: QueryEventObserver = {
                         onToolUse(toolName: string) {
-                            log("DEBUG", `Injected response using ${toolName}`);
+                            injToolCount++;
+                            injStatusLabel = `Using ${toolName} [${injToolCount}]`;
                         },
                         onTextContent() {},
                     };
@@ -2406,6 +2363,7 @@ async function processMessage(messageFile: string): Promise<void> {
                     // Don't push — message was already injected into the channel
                     try {
                         const injResult = await injPromise;
+                        clearInterval(injStatusInterval);
                         const injText = injResult.text.trim() || "(No response generated)";
 
                         if (injResult.sessionId) {
@@ -2415,7 +2373,7 @@ async function processMessage(messageFile: string): Promise<void> {
                         if (injResult.hasBackgroundTasks) {
                             sessionPool.markMonitoring(threadId);
                             const monitor = monitorBackgroundTasks(
-                                injResult.query, injResult.activeTasks, threadId, messageId,
+                                injResult.query, injResult.activeTasks, threadId, injMessageId,
                             );
                             activeBackgroundMonitors.set(threadId, monitor);
                             monitor.finally(() => {
@@ -2426,12 +2384,13 @@ async function processMessage(messageFile: string): Promise<void> {
                             sessionPool.markIdle(threadId, injResult.sessionId);
                         }
 
-                        // Write response to outgoing
+                        // Write response to outgoing — use original messageId so
+                        // telegram-client can match it to the pendingMessages entry
                         appendHistory({
                             ts: Date.now(), threadId, channel,
                             sender: "assistant", direction: "out", message: injText,
                             model: effectiveModel, source: source ?? "user",
-                            messageId: `injected_${threadId}_${Date.now()}`,
+                            messageId: injMessageId,
                             ...(injResult.usage ? {
                                 costUSD: injResult.usage.totalCostUSD,
                                 inputTokens: injResult.usage.inputTokens,
@@ -2449,16 +2408,19 @@ async function processMessage(messageFile: string): Promise<void> {
                             channel, threadId, sender,
                             message: injText, originalMessage: "(injected mid-turn)",
                             timestamp: Date.now(),
-                            messageId: `injected_${threadId}_${Date.now()}`,
+                            messageId: injMessageId,
                             model: effectiveModel,
                         };
-                        const injFile = path.join(QUEUE_OUTGOING, `injected_${threadId}_${Date.now()}.json`);
+                        const injFile = path.join(QUEUE_OUTGOING, `${channel}_${injMessageId}_${Date.now()}.json`);
                         const injTmp = injFile + ".tmp";
                         fs.writeFileSync(injTmp, JSON.stringify(injOutgoing, null, 2));
                         fs.renameSync(injTmp, injFile);
 
+                        clearStatus(injMessageId);
                         log("INFO", `Injected response ready thread=${threadId} (${injText.length} chars)`);
                     } catch (injErr) {
+                        clearInterval(injStatusInterval);
+                        clearStatus(injMessageId);
                         log("WARN", `Injected response error for thread ${threadId}: ${toErrorMessage(injErr)}`);
                         sessionPool.close(threadId);
                         break;
@@ -2687,11 +2649,10 @@ async function processQueue(): Promise<void> {
                             sourceThreadId: msg.sourceThreadId,
                             messageId: msg.messageId,
                         });
-                        // Track that a response is pending for the slurp loop
-                        injectedMessageCount.set(
-                            msg.threadId,
-                            (injectedMessageCount.get(msg.threadId) ?? 0) + 1,
-                        );
+                        // Track messageId so the consume loop can write proper status files
+                        const ids = injectedMessageIds.get(msg.threadId) ?? [];
+                        ids.push(msg.messageId);
+                        injectedMessageIds.set(msg.threadId, ids);
                         // Delete queue file — message is in the channel now
                         try { fs.unlinkSync(file.path); } catch {}
                         log("INFO", `Injected message into running session for thread ${msg.threadId} from ${msg.sender}: ${msg.message.substring(0, 60)}`);
@@ -2833,8 +2794,6 @@ log(
 );
 log("INFO", `Watching: ${QUEUE_INCOMING}`);
 
-// Ensure Speaches models are installed (fire-and-forget, cached across restarts)
-ensureModels().catch(() => {});
 
 // fs.watch for near-instant pickup
 try {

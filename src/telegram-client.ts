@@ -21,7 +21,8 @@ import type { OutgoingMessage, TaskListMapping, MessageModelEntry, PendingApprov
 import { toErrorMessage, TASK_LISTS_FILENAME } from "./types.js";
 import { RoutingMetadataSchema } from "./types.js";
 import { logDecision, logCorrection, ROUTING_LOG } from "./routing-logger.js";
-import { cleanupAudioFile, startPeriodicCleanup, ensureModels, distillForSpeech, synthesize, isAvailable } from "./audio.js";
+import { cleanupAudioFile, startPeriodicCleanup, ensureModels, distillForSpeech, synthesize, isAvailable, transcribe } from "./audio.js";
+import { storeVoiceTranscript } from "./voice-cache.js";
 import { startPeriodicCleanup as startImageCleanup } from "./images.js";
 import { toTelegramMarkdownV2, escapeMarkdownV2 } from "./markdown-v2.js";
 import { loadZoneConfig, getThreadZone, isSameZone } from "./zone-config.js";
@@ -696,18 +697,170 @@ bot.command("status", async (ctx) => {
     });
 });
 
+// ─── Shared Helpers ───
+
+function generateMessageId(): string {
+    return `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/** Download a file from Telegram's servers to a local path (atomic: tmp + rename). */
+async function downloadTelegramFile(fileUrl: string, destPath: string): Promise<void> {
+    const res = await fetch(fileUrl);
+    if (!res.ok) throw new Error(`Download failed: ${res.status}`);
+    const buffer = Buffer.from(await res.arrayBuffer());
+    const tmpPath = destPath + ".tmp";
+    fs.writeFileSync(tmpPath, buffer);
+    fs.renameSync(tmpPath, destPath);
+}
+
+/** Get the canonical path that queue-processor sees for a file in images/incoming. */
+function canonicalIncomingPath(filename: string): string {
+    return path.join(SCRIPT_DIR, ".borg/images/incoming", filename);
+}
+
+/** Build the Telegram file download URL from a file_path. */
+function telegramFileUrl(filePath: string): string {
+    return `https://api.telegram.org/file/bot${settings.telegram_bot_token}/${filePath}`;
+}
+
+/** Extract reply-to-bot context from a message. */
+function extractReplyContext(ctx: any): { isReplyToBot: boolean; replyToModel?: string; replyToText?: string } {
+    const isReplyToBot = ctx.msg?.reply_to_message?.from?.id === bot.botInfo.id;
+    const stored = isReplyToBot && ctx.msg.reply_to_message
+        ? lookupMessageModel(ctx.msg.reply_to_message.message_id)
+        : undefined;
+    return {
+        isReplyToBot,
+        replyToModel: stored?.model,
+        replyToText: isReplyToBot ? ctx.msg.reply_to_message?.text : undefined,
+    };
+}
+
+/** Queue an incoming message and register it for status tracking. */
+function queueIncomingMessage(
+    queueData: Record<string, unknown>,
+    threadId: number,
+    messageId: string,
+    ctx: any,
+    telegramMessageId: number,
+): void {
+    const incomingDir = resolveIncomingForThread(threadId);
+    fs.mkdirSync(incomingDir, { recursive: true });
+    const queueFile = path.join(incomingDir, `telegram_${messageId}.json`);
+    const tmpFile = queueFile + ".tmp";
+    fs.writeFileSync(tmpFile, JSON.stringify(queueData, null, 2));
+    fs.renameSync(tmpFile, queueFile);
+
+    pendingMessages.set(messageId, {
+        ctx,
+        chatId: ctx.chat.id,
+        threadId,
+        telegramMessageId,
+    });
+    telegramToQueueId.set(telegramMessageId, messageId);
+}
+
+// ─── Retry Command ───
+// Reply to any message with /retry to reprocess it (voice: re-download + STT, photo: re-download, text: re-queue)
+
+bot.command("retry", async (ctx) => {
+    if (String(ctx.chat?.id) !== settings.telegram_chat_id) return;
+    const threadId = ctx.msg.message_thread_id ?? 1;
+
+    const reply = ctx.msg.reply_to_message;
+    if (!reply) {
+        await ctx.reply("Reply to a message with /retry to reprocess it.", {
+            message_thread_id: ctx.msg.message_thread_id,
+        });
+        return;
+    }
+
+    const messageId = generateMessageId();
+    let message = "";
+
+    try {
+        if (reply.voice) {
+            const file = await bot.api.getFile(reply.voice.file_id);
+            if (!file.file_path) throw new Error("No file_path from Telegram");
+            const zoneAudioDir = resolveZoneAudioIncoming(threadId);
+            if (!fs.existsSync(zoneAudioDir)) fs.mkdirSync(zoneAudioDir, { recursive: true });
+            const oggPath = path.join(zoneAudioDir, `${messageId}.ogg`);
+            await downloadTelegramFile(telegramFileUrl(file.file_path), oggPath);
+            await ensureModels();
+            const transcript = await transcribe(oggPath);
+            cleanupAudioFile(oggPath);
+            if (!transcript) throw new Error("No speech detected in voice message");
+            message = transcript;
+            storeVoiceTranscript(String(reply.message_id), transcript);
+
+        } else if (reply.photo?.length) {
+            const photo = reply.photo[reply.photo.length - 1];
+            const file = await bot.api.getFile(photo.file_id);
+            if (!file.file_path) throw new Error("No file_path from Telegram");
+            const ext = path.extname(file.file_path || ".jpg") || ".jpg";
+            const zoneImagesDir = resolveZoneImagesIncoming(threadId);
+            if (!fs.existsSync(zoneImagesDir)) fs.mkdirSync(zoneImagesDir, { recursive: true });
+            await downloadTelegramFile(telegramFileUrl(file.file_path), path.join(zoneImagesDir, `${messageId}${ext}`));
+            message = `[Image received: ${canonicalIncomingPath(`${messageId}${ext}`)}]\n\nPlease analyze this image using the Read tool.`;
+            if (reply.caption) message += `\n\nCaption: ${reply.caption}`;
+
+        } else if (reply.document) {
+            const file = await bot.api.getFile(reply.document.file_id);
+            if (!file.file_path) throw new Error("No file_path from Telegram");
+            const ext = path.extname(reply.document.file_name || file.file_path || "");
+            const zoneImagesDir = resolveZoneImagesIncoming(threadId);
+            if (!fs.existsSync(zoneImagesDir)) fs.mkdirSync(zoneImagesDir, { recursive: true });
+            await downloadTelegramFile(telegramFileUrl(file.file_path), path.join(zoneImagesDir, `${messageId}${ext}`));
+            message = `[File received: ${canonicalIncomingPath(`${messageId}${ext}`)}] (${reply.document.file_name || "unnamed"})\n\nPlease read this file using the Read tool.`;
+            if (reply.caption) message += `\n\nCaption: ${reply.caption}`;
+
+        } else if (reply.text) {
+            message = reply.text;
+
+        } else {
+            await ctx.reply("Unsupported message type for /retry.", { message_thread_id: ctx.msg.message_thread_id });
+            return;
+        }
+
+        queueIncomingMessage({
+            channel: "telegram", source: "user", threadId,
+            sender: ctx.from?.first_name ?? "Unknown",
+            senderId: String(ctx.from?.id ?? 0),
+            message, topicName: topicNames.get(threadId),
+            timestamp: Date.now(), messageId,
+        }, threadId, messageId, ctx, ctx.msg.message_id);
+
+        await reactAcknowledge(ctx.chat.id, ctx.msg.message_id, threadId, messageId);
+        log("INFO", `Retry: reprocessed message for thread ${threadId}`);
+    } catch (err) {
+        log("ERROR", `Retry failed: ${toErrorMessage(err)}`);
+        await ctx.reply(`Retry failed: ${toErrorMessage(err)}`, { message_thread_id: ctx.msg.message_thread_id });
+    }
+});
+
+// ─── Shared acknowledgement reaction ───
+// 👍 if thread already has a pending message (queued behind another), 👀 otherwise
+async function reactAcknowledge(chatId: number, telegramMsgId: number, threadId: number, currentMessageId: string): Promise<void> {
+    let threadBusy = false;
+    for (const [id, p] of pendingMessages) {
+        if (p.threadId === threadId && id !== currentMessageId) { threadBusy = true; break; }
+    }
+    try {
+        const emoji = threadBusy ? "👍" : "👀";
+        await bot.api.setMessageReaction(chatId, telegramMsgId,
+            [{ type: "emoji", emoji: emoji as any }]);
+    } catch {
+        // Reactions may not be available
+    }
+}
+
 // ─── Message Handler ───
 
 bot.on("message:text").filter(
     (ctx) => ctx.from.id !== bot.botInfo.id,
     async (ctx) => {
         const threadId = ctx.msg.message_thread_id ?? 1;
-        const isReplyToBot = ctx.msg.reply_to_message?.from?.id === bot.botInfo.id;
-        const replyToText = isReplyToBot ? ctx.msg.reply_to_message?.text : undefined;
-        const stored = isReplyToBot && ctx.msg.reply_to_message
-            ? lookupMessageModel(ctx.msg.reply_to_message.message_id)
-            : undefined;
-        const replyToModel = stored?.model;
+        const { isReplyToBot, replyToModel, replyToText } = extractReplyContext(ctx);
 
         // Restrict to configured chat ID
         if (String(ctx.chat.id) !== settings.telegram_chat_id) return;
@@ -718,56 +871,18 @@ bot.on("message:text").filter(
             return;
         }
 
-        const messageId = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-        const topicName = topicNames.get(threadId);
-        const queueData = {
-            channel: "telegram",
-            source: "user" as const,
-            threadId,
-            sender: ctx.from.first_name,
-            senderId: String(ctx.from.id),
-            message: ctx.message.text,
-            isReply: isReplyToBot,
-            replyToText,
-            replyToModel,
-            topicName,
-            timestamp: Date.now(),
-            messageId,
-        };
+        const messageId = generateMessageId();
 
-        const incomingDir = resolveIncomingForThread(threadId);
-        fs.mkdirSync(incomingDir, { recursive: true });
-        const queueFile = path.join(incomingDir, `telegram_${messageId}.json`);
-        const tmpFile = queueFile + ".tmp";
-        fs.writeFileSync(tmpFile, JSON.stringify(queueData, null, 2));
-        fs.renameSync(tmpFile, queueFile);
+        queueIncomingMessage({
+            channel: "telegram", source: "user", threadId,
+            sender: ctx.from.first_name, senderId: String(ctx.from.id),
+            message: ctx.message.text, isReply: isReplyToBot,
+            replyToText, replyToModel, topicName: topicNames.get(threadId),
+            timestamp: Date.now(), messageId,
+        }, threadId, messageId, ctx, ctx.msg.message_id);
 
-        pendingMessages.set(messageId, {
-            ctx,
-            chatId: ctx.chat.id,
-            threadId,
-            telegramMessageId: ctx.msg.message_id,
-        });
-        telegramToQueueId.set(ctx.msg.message_id, messageId);
-
-        // React with emoji: 👍 if thread is already busy (message queued behind another),
-        // 👀 if this is the first/only message for the thread
-        let threadBusy = false;
-        for (const [id, p] of pendingMessages) {
-            if (p.threadId === threadId && id !== messageId) { threadBusy = true; break; }
-        }
-        try {
-            const emoji = threadBusy ? "👍" : "👀";
-            await bot.api.setMessageReaction(ctx.chat.id, ctx.msg.message_id,
-                [{ type: "emoji", emoji: emoji as any }]);
-        } catch {
-            // Reactions may not be available — silently ignore
-        }
-
-        log(
-            "INFO",
-            `Queued message from ${ctx.from.first_name} in thread ${threadId}: ${ctx.message.text.substring(0, 80)}`,
-        );
+        await reactAcknowledge(ctx.chat.id, ctx.msg.message_id, threadId, messageId);
+        log("INFO", `Queued message from ${ctx.from.first_name} in thread ${threadId}: ${ctx.message.text.substring(0, 80)}`);
     },
 );
 
@@ -830,6 +945,8 @@ bot.on("message:text").filter(
 );
 
 // ─── Voice Message Handler ───
+// Downloads voice file, transcribes via Speaches (STT), then queues as plain text.
+// By the time the message hits the queue, it's indistinguishable from a typed message.
 
 bot.on("message:voice").filter(
     (ctx) => ctx.from.id !== bot.botInfo.id,
@@ -864,81 +981,72 @@ bot.on("message:voice").filter(
             return;
         }
 
-        // Download the voice file — write to the target zone's audio dir so queue-processor can read it
-        const fileUrl = `https://api.telegram.org/file/bot${settings.telegram_bot_token}/${file.file_path}`;
-        const messageId = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-        const zoneAudioDir = resolveZoneAudioIncoming(threadId);
-        if (!fs.existsSync(zoneAudioDir)) fs.mkdirSync(zoneAudioDir, { recursive: true });
-        const oggPath = path.join(zoneAudioDir, `${messageId}.ogg`);
-        // Queue-processor sees /app/.borg/audio/incoming/ (its own zone mount), not /app/.borg-{zone}/
-        const canonicalAudioPath = path.join(SCRIPT_DIR, ".borg/audio/incoming", `${messageId}.ogg`);
-
-        try {
-            const res = await fetch(fileUrl);
-            if (!res.ok) throw new Error(`Download failed: ${res.status}`);
-            const buffer = Buffer.from(await res.arrayBuffer());
-            const tmpPath = oggPath + ".tmp";
-            fs.writeFileSync(tmpPath, buffer);
-            fs.renameSync(tmpPath, oggPath);
-        } catch (err) {
-            log("ERROR", `Failed to download voice file: ${toErrorMessage(err)}`);
-            await ctx.reply("Couldn't download your voice message. Please try again.", {
-                message_thread_id: ctx.msg.message_thread_id,
-            });
-            return;
-        }
-
-        // Check reply-to-bot context (same as text handler)
-        const isReplyToBot = ctx.msg.reply_to_message?.from?.id === bot.botInfo.id;
-        const stored = isReplyToBot && ctx.msg.reply_to_message
-            ? lookupMessageModel(ctx.msg.reply_to_message.message_id)
-            : undefined;
-        const replyToModel = stored?.model;
-        const replyToText = isReplyToBot ? ctx.msg.reply_to_message?.text : undefined;
-
-        const topicName = topicNames.get(threadId);
-        const queueData = {
-            channel: "telegram",
-            source: "user" as const,
-            threadId,
-            sender: ctx.from.first_name,
-            senderId: String(ctx.from.id),
-            message: "",  // empty — queue-processor fills after STT
-            audioPath: canonicalAudioPath,
-            voiceDuration: duration,
-            isReply: isReplyToBot,
-            replyToText,
-            replyToModel,
-            topicName,
-            timestamp: Date.now(),
-            messageId,
-            telegramMessageId: ctx.msg.message_id,
-        };
-
-        const incomingDir = resolveIncomingForThread(threadId);
-        fs.mkdirSync(incomingDir, { recursive: true });
-        const queueFile = path.join(incomingDir, `telegram_${messageId}.json`);
-        const tmpFile = queueFile + ".tmp";
-        fs.writeFileSync(tmpFile, JSON.stringify(queueData, null, 2));
-        fs.renameSync(tmpFile, queueFile);
-
-        pendingMessages.set(messageId, {
-            ctx,
-            chatId: ctx.chat.id,
-            threadId,
-            telegramMessageId: ctx.msg.message_id,
-        });
-        telegramToQueueId.set(ctx.msg.message_id, messageId);
-
-        // React with 👀 to acknowledge
+        // React with 🎧 immediately, then run STT in background.
+        // This avoids blocking grammY's update loop during transcription (10-30s).
         try {
             await bot.api.setMessageReaction(ctx.chat.id, ctx.msg.message_id,
-                [{ type: "emoji", emoji: "👀" as any }]);
-        } catch {
-            // Reactions may not be available
-        }
+                [{ type: "emoji", emoji: "🎧" as any }]);
+        } catch { /* reactions may not be available */ }
 
-        log("INFO", `Queued voice message (${duration}s) from ${ctx.from.first_name} in thread ${threadId}`);
+        const messageId = generateMessageId();
+        const sender = ctx.from.first_name;
+        const senderId = String(ctx.from.id);
+        const chatId = ctx.chat.id;
+        const telegramMessageId = ctx.msg.message_id;
+        const threadMsgId = ctx.msg.message_thread_id;
+        const filePath = file.file_path!;
+        const { isReplyToBot, replyToModel, replyToText } = extractReplyContext(ctx);
+
+        // Fire-and-forget: download + STT + queue runs outside the handler
+        // so other messages are not blocked while waiting for transcription.
+        void (async () => {
+            const zoneAudioDir = resolveZoneAudioIncoming(threadId);
+            if (!fs.existsSync(zoneAudioDir)) fs.mkdirSync(zoneAudioDir, { recursive: true });
+            const oggPath = path.join(zoneAudioDir, `${messageId}.ogg`);
+
+            try {
+                await downloadTelegramFile(telegramFileUrl(filePath), oggPath);
+            } catch (err) {
+                log("ERROR", `Failed to download voice file: ${toErrorMessage(err)}`);
+                await bot.api.sendMessage(chatId, "Couldn't download your voice message. Please try again or use /retry.", {
+                    message_thread_id: threadMsgId,
+                });
+                return;
+            }
+
+            try {
+                await ensureModels();
+                const transcript = await transcribe(oggPath);
+                if (!transcript) {
+                    await bot.api.sendMessage(chatId, "Couldn't transcribe your voice message — no speech detected. Please try again or send as text.", {
+                        message_thread_id: threadMsgId,
+                    });
+                    cleanupAudioFile(oggPath);
+                    return;
+                }
+
+                log("INFO", `STT transcript (${duration}s): ${transcript.substring(0, 120)}...`);
+                storeVoiceTranscript(String(telegramMessageId), transcript);
+                cleanupAudioFile(oggPath);
+
+                queueIncomingMessage({
+                    channel: "telegram", source: "user", threadId,
+                    sender, senderId, message: transcript,
+                    isReply: isReplyToBot, replyToText, replyToModel,
+                    topicName: topicNames.get(threadId),
+                    timestamp: Date.now(), messageId,
+                    telegramMessageId,
+                }, threadId, messageId, ctx, telegramMessageId);
+
+                await reactAcknowledge(chatId, telegramMessageId, threadId, messageId);
+                log("INFO", `Queued voice message (${duration}s, transcribed) from ${sender} in thread ${threadId}`);
+            } catch (err) {
+                log("ERROR", `STT failed for thread ${threadId}: ${toErrorMessage(err)}`);
+                await bot.api.sendMessage(chatId, "Couldn't transcribe your voice message — transcription service may be unavailable. Reply with /retry to try again.", {
+                    message_thread_id: threadMsgId,
+                });
+            }
+        })();
     },
 );
 
@@ -969,38 +1077,26 @@ function flushMediaGroup(groupId: string): void {
     mediaGroupBuffer.delete(groupId);
     clearTimeout(group.timer);
 
-    const messageId = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const messageId = generateMessageId();
 
-    const queueData = {
-        channel: "telegram",
-        source: "user" as const,
-        threadId: group.threadId,
-        sender: group.sender,
-        senderId: group.senderId,
-        message: group.caption,
-        imagePaths: group.canonicalPaths,
-        isReply: group.isReplyToBot,
-        replyToText: group.replyToText,
-        replyToModel: group.replyToModel,
-        topicName: group.topicName,
-        timestamp: Date.now(),
-        messageId,
-    };
+    // Build Read tool instructions for all images — queued as plain text
+    const instructions = group.canonicalPaths.map(
+        (p, i) => group.canonicalPaths.length > 1
+            ? `[Image ${i + 1} received: ${p}]\n\nPlease view this image using the Read tool.`
+            : `[Image received: ${p}]\n\nPlease analyze this image using the Read tool.`
+    );
+    let message = instructions.join("\n\n");
+    if (group.caption) message += `\n\nCaption: ${group.caption}`;
 
-    const incomingDir = resolveIncomingForThread(group.threadId);
-    fs.mkdirSync(incomingDir, { recursive: true });
-    const queueFile = path.join(incomingDir, `telegram_${messageId}.json`);
-    const tmpFile = queueFile + ".tmp";
-    fs.writeFileSync(tmpFile, JSON.stringify(queueData, null, 2));
-    fs.renameSync(tmpFile, queueFile);
+    queueIncomingMessage({
+        channel: "telegram", source: "user", threadId: group.threadId,
+        sender: group.sender, senderId: group.senderId, message,
+        isReply: group.isReplyToBot, replyToText: group.replyToText,
+        replyToModel: group.replyToModel, topicName: group.topicName,
+        timestamp: Date.now(), messageId,
+    }, group.threadId, messageId, group.ctx, group.telegramMessageIds[0]);
 
-    // Register pending message using the first photo's context
-    pendingMessages.set(messageId, {
-        ctx: group.ctx,
-        chatId: group.ctx.chat.id,
-        threadId: group.threadId,
-        telegramMessageId: group.telegramMessageIds[0],
-    });
+    // Map all photo message IDs to this queue entry
     for (const tmId of group.telegramMessageIds) {
         telegramToQueueId.set(tmId, messageId);
     }
@@ -1034,25 +1130,16 @@ bot.on("message:photo").filter(
             return;
         }
 
-        // Download the image file — write to the target zone's images dir so queue-processor can read it
-        const fileUrl = `https://api.telegram.org/file/bot${settings.telegram_bot_token}/${file.file_path}`;
-        const photoId = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-
-        // Determine file extension from path (e.g., "photos/file_123.jpg")
+        // Download the image file
+        const photoId = generateMessageId();
         const ext = path.extname(file.file_path || ".jpg") || ".jpg";
         const zoneImagesDir = resolveZoneImagesIncoming(threadId);
         if (!fs.existsSync(zoneImagesDir)) fs.mkdirSync(zoneImagesDir, { recursive: true });
         const imagePath = path.join(zoneImagesDir, `${photoId}${ext}`);
-        // Queue-processor sees /app/.borg/images/incoming/ (its own zone mount)
-        const canonicalImagePath = path.join(SCRIPT_DIR, ".borg/images/incoming", `${photoId}${ext}`);
+        const canonicalImagePath = canonicalIncomingPath(`${photoId}${ext}`);
 
         try {
-            const res = await fetch(fileUrl);
-            if (!res.ok) throw new Error(`Download failed: ${res.status}`);
-            const buffer = Buffer.from(await res.arrayBuffer());
-            const tmpPath = imagePath + ".tmp";
-            fs.writeFileSync(tmpPath, buffer);
-            fs.renameSync(tmpPath, imagePath);
+            await downloadTelegramFile(telegramFileUrl(file.file_path!), imagePath);
         } catch (err) {
             log("ERROR", `Failed to download image file: ${toErrorMessage(err)}`);
             await ctx.reply("Couldn't download your image. Please try again.", {
@@ -1061,18 +1148,16 @@ bot.on("message:photo").filter(
             return;
         }
 
-        // React with 👀 to acknowledge
-        try {
-            await bot.api.setMessageReaction(ctx.chat.id, ctx.msg.message_id,
-                [{ type: "emoji", emoji: "👀" as any }]);
-        } catch {
-            // Reactions may not be available
-        }
-
         const mediaGroupId = ctx.msg.media_group_id;
 
         // ─── Media group: buffer and flush after 800ms ───
         if (mediaGroupId) {
+            // Acknowledge each photo in a media group with 👀
+            try {
+                await bot.api.setMessageReaction(ctx.chat.id, ctx.msg.message_id,
+                    [{ type: "emoji", emoji: "👀" as any }]);
+            } catch { /* reactions may not be available */ }
+
             const existing = mediaGroupBuffer.get(mediaGroupId);
             if (existing) {
                 // Add to existing group
@@ -1115,52 +1200,87 @@ bot.on("message:photo").filter(
         }
 
         // ─── Single photo (no media group) — queue immediately ───
-        const messageId = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+        const messageId = generateMessageId();
+        const { isReplyToBot, replyToModel, replyToText } = extractReplyContext(ctx);
 
-        // Check reply-to-bot context (same as text/voice handler)
-        const isReplyToBot = ctx.msg.reply_to_message?.from?.id === bot.botInfo.id;
-        const stored = isReplyToBot && ctx.msg.reply_to_message
-            ? lookupMessageModel(ctx.msg.reply_to_message.message_id)
-            : undefined;
-        const replyToModel = stored?.model;
-        const replyToText = isReplyToBot ? ctx.msg.reply_to_message?.text : undefined;
+        let message = `[Image received: ${canonicalImagePath}]\n\nPlease analyze this image using the Read tool.`;
+        if (ctx.msg.caption) message += `\n\nCaption: ${ctx.msg.caption}`;
 
-        // Use caption if provided, otherwise empty (queue-processor will add instruction)
-        const caption = ctx.msg.caption || "";
+        queueIncomingMessage({
+            channel: "telegram", source: "user", threadId,
+            sender: ctx.from.first_name, senderId: String(ctx.from.id),
+            message, isReply: isReplyToBot, replyToText, replyToModel,
+            topicName: topicNames.get(threadId), timestamp: Date.now(), messageId,
+        }, threadId, messageId, ctx, ctx.msg.message_id);
 
-        const topicName = topicNames.get(threadId);
-        const queueData = {
-            channel: "telegram",
-            source: "user" as const,
-            threadId,
-            sender: ctx.from.first_name,
-            senderId: String(ctx.from.id),
-            message: caption,
-            imagePath: canonicalImagePath,
-            isReply: isReplyToBot,
-            replyToText,
-            replyToModel,
-            topicName,
-            timestamp: Date.now(),
-            messageId,
-        };
-
-        const incomingDir = resolveIncomingForThread(threadId);
-        fs.mkdirSync(incomingDir, { recursive: true });
-        const queueFile = path.join(incomingDir, `telegram_${messageId}.json`);
-        const tmpFile = queueFile + ".tmp";
-        fs.writeFileSync(tmpFile, JSON.stringify(queueData, null, 2));
-        fs.renameSync(tmpFile, queueFile);
-
-        pendingMessages.set(messageId, {
-            ctx,
-            chatId: ctx.chat.id,
-            threadId,
-            telegramMessageId: ctx.msg.message_id,
-        });
-        telegramToQueueId.set(ctx.msg.message_id, messageId);
-
+        await reactAcknowledge(ctx.chat.id, ctx.msg.message_id, threadId, messageId);
         log("INFO", `Queued photo message from ${ctx.from.first_name} in thread ${threadId} (${file.file_size} bytes)`);
+    },
+);
+
+// ─── Document/File Message Handler ───
+// Downloads files and builds a Read tool instruction, queued as plain text.
+
+bot.on("message:document").filter(
+    (ctx) => ctx.from.id !== bot.botInfo.id,
+    async (ctx) => {
+        const threadId = ctx.msg.message_thread_id ?? 1;
+        if (String(ctx.chat.id) !== settings.telegram_chat_id) return;
+
+        const doc = ctx.msg.document;
+
+        // Reject oversized files (Claude Read tool limit for images; text files can be larger)
+        if (doc.file_size && doc.file_size > 10 * 1024 * 1024) {
+            await ctx.reply("File too large (max 10MB). Please send a smaller file.", {
+                message_thread_id: ctx.msg.message_thread_id,
+            });
+            return;
+        }
+
+        // Deduplicate using file_unique_id
+        if (isDuplicate(threadId, String(ctx.from.id), `doc_${doc.file_unique_id}`)) {
+            log("INFO", `Dedup: skipping duplicate document from ${ctx.from.first_name} in thread ${threadId}`);
+            return;
+        }
+
+        // Fetch and download the file
+        const file = await ctx.getFile();
+        if (!file.file_path) {
+            await ctx.reply("Couldn't get the file from Telegram. Please try again.", {
+                message_thread_id: ctx.msg.message_thread_id,
+            });
+            return;
+        }
+
+        const messageId = generateMessageId();
+        const ext = path.extname(doc.file_name || file.file_path || "");
+        const zoneFilesDir = resolveZoneImagesIncoming(threadId);
+        if (!fs.existsSync(zoneFilesDir)) fs.mkdirSync(zoneFilesDir, { recursive: true });
+        const localPath = path.join(zoneFilesDir, `${messageId}${ext}`);
+
+        try {
+            await downloadTelegramFile(telegramFileUrl(file.file_path), localPath);
+        } catch (err) {
+            log("ERROR", `Failed to download document: ${toErrorMessage(err)}`);
+            await ctx.reply("Couldn't download your file. Please try again.", { message_thread_id: ctx.msg.message_thread_id });
+            return;
+        }
+
+        const fileName = doc.file_name || `file${ext}`;
+        let message = `[File received: ${canonicalIncomingPath(`${messageId}${ext}`)}] (${fileName})\n\nPlease read this file using the Read tool.`;
+        if (ctx.msg.caption) message += `\n\nCaption: ${ctx.msg.caption}`;
+
+        const { isReplyToBot, replyToModel, replyToText } = extractReplyContext(ctx);
+
+        queueIncomingMessage({
+            channel: "telegram", source: "user", threadId,
+            sender: ctx.from.first_name, senderId: String(ctx.from.id),
+            message, isReply: isReplyToBot, replyToText, replyToModel,
+            topicName: topicNames.get(threadId), timestamp: Date.now(), messageId,
+        }, threadId, messageId, ctx, ctx.msg.message_id);
+
+        await reactAcknowledge(ctx.chat.id, ctx.msg.message_id, threadId, messageId);
+        log("INFO", `Queued document (${fileName}, ${doc.file_size} bytes) from ${ctx.from.first_name} in thread ${threadId}`);
     },
 );
 
@@ -2435,6 +2555,7 @@ bot.start({
             { command: "compact_team", description: "Reset all team member sessions" },
             { command: "do", description: "One-shot query: /do [haiku|sonnet|opus] <message>" },
             { command: "clear_all", description: "Reset all thread sessions" },
+            { command: "retry", description: "Reply to a voice message to reprocess it" },
         ]);
         // Start task watcher
         setInterval(() => { pollTaskUpdates().catch(() => {}); }, TASK_POLL_INTERVAL);
