@@ -761,6 +761,8 @@ interface QueryEventObserver {
     onTaskStarted?(taskId: string, description: string): void;
     onTaskProgress?(taskId: string, summary: string | undefined): void;
     onTaskCompleted?(taskId: string, status: string, summary: string): void;
+    /** If true, skip stall detection and drain — next events belong to injected messages. */
+    hasPendingInjections?(): boolean;
 }
 
 // Stall detection: if no active background tasks and end_turn seen, wait this long
@@ -987,6 +989,14 @@ async function collectPrimaryResponse(
                 };
             }
 
+            // If there are injected messages pending, return immediately —
+            // the next events in the iterator belong to the injected message's response,
+            // not stale leftovers. Consuming them here would steal from the inject consumer.
+            if (observer?.hasPendingInjections?.()) {
+                log("DEBUG", `end_turn with pending injections — returning immediately`);
+                break;
+            }
+
             // No background tasks — use stall detection to avoid hanging indefinitely
             const elapsed = Date.now() - state.endTurnSeenAt;
             if (elapsed >= END_TURN_STALL_TIMEOUT_MS) {
@@ -1048,7 +1058,8 @@ async function collectPrimaryResponse(
     // system messages, compacting events, or additional results after the
     // one we consumed. If we don't drain these, they'll be served as
     // responses to the NEXT message, causing stale/out-of-order replies.
-    if (state.sawResult && !stallDetected) {
+    // SKIP drain when injected messages are pending — those events belong to them.
+    if (state.sawResult && !stallDetected && !observer?.hasPendingInjections?.()) {
         let drained = 0;
         // Use a short timeout — buffered events resolve near-instantly,
         // while waiting for new events from the subprocess takes longer.
@@ -1931,6 +1942,9 @@ async function processMessage(messageFile: string): Promise<void> {
             let toolUseCount = 0;
             let currentSessionId: string | undefined;
             const observer: QueryEventObserver = {
+                hasPendingInjections() {
+                    return (injectedMessageIds.get(threadId)?.length ?? 0) > 0;
+                },
                 onSessionId(sessionId: string) {
                     currentSessionId = sessionId;
                     persistSessionId(threadId, sessionId);
