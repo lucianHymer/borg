@@ -226,6 +226,35 @@ export class SessionPool {
     }
 
     /**
+     * Check if a session exists for a thread (any state).
+     */
+    hasSession(threadId: number): boolean {
+        return this.sessions.has(threadId);
+    }
+
+    /**
+     * Push a message into any existing session (processing or idle).
+     * Used by the streaming channel architecture — messages flow into the
+     * channel and the event consumer handles them. Returns true if pushed.
+     */
+    pushMessage(threadId: number, prompt: string): boolean {
+        const session = this.sessions.get(threadId);
+        if (!session) return false;
+
+        const channel = this.channels.get(threadId);
+        if (!channel) return false;
+
+        channel.push(prompt, session.sessionId);
+        session.lastActivity = Date.now();
+        // If idle, mark as processing since new events will flow
+        if (session.state === "idle") {
+            session.state = "processing";
+        }
+        this.log("INFO", `Session pool: pushed message into session for thread ${threadId} (was ${session.state})`);
+        return true;
+    }
+
+    /**
      * Mark a session as idle (ready for next message).
      * Called after primary response is collected and no background tasks.
      */

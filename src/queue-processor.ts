@@ -499,16 +499,12 @@ function logPrompt(entry: {
 // ─── Concurrency Control ───
 
 let activeCount = 0;
-const activeThreads = new Set<number>();
 let scanning = false;
 let activeHeartbeatCount = 0;
 let activeScheduledTaskCount = 0;
 
 // Background task monitors that run independently after end_turn
 const activeBackgroundMonitors = new Map<number, Promise<void>>();
-
-// Messages injected mid-turn into running sessions (threadId → queued messageIds)
-const injectedMessageIds = new Map<number, string[]>();
 
 // Persistent session pool for reusing SDK sessions across messages
 const sessionPool = new SessionPool({
@@ -585,32 +581,25 @@ function buildSourcePrefix(msg: IncomingMessage): string {
     return prefixMap[msg.source ?? "user"];
 }
 
-// ─── Status File Helpers ───
+// ─── Status File Helpers (per-thread) ───
+// Status is keyed by threadId, not messageId. The anchorMessageId tracks which
+// user message the status indicator should appear below in Telegram.
 
-function writeStatus(messageId: string, label: string, startTs: number, preview?: string, fullText?: string, sessionId?: string): void {
-    try {
-        const statusFile = path.join(QUEUE_STATUS, `${messageId}.json`);
-        const tmpFile = statusFile + ".tmp";
-        const data: Record<string, unknown> = { label, ts: Date.now(), startTs };
-        if (preview) data.preview = preview;
-        if (fullText) data.fullText = fullText;
-        if (sessionId) data.sessionId = sessionId;
-        fs.writeFileSync(tmpFile, JSON.stringify(data));
-        fs.renameSync(tmpFile, statusFile);
-    } catch {
-        // Status updates are best-effort — never crash the process
-    }
+import {
+    writeThreadStatus,
+    clearThreadStatus,
+    updateThreadStatusAnchor,
+} from "./thread-status.js";
+
+function writeStatus(threadId: number, anchorMessageId: string, label: string, startTs: number, preview?: string, fullText?: string, sessionId?: string): void {
+    writeThreadStatus(QUEUE_STATUS, {
+        threadId, label, startTs, ts: Date.now(),
+        anchorMessageId, preview, fullText, sessionId,
+    });
 }
 
-function clearStatus(messageId: string): void {
-    try {
-        const statusFile = path.join(QUEUE_STATUS, `${messageId}.json`);
-        if (fs.existsSync(statusFile)) {
-            fs.unlinkSync(statusFile);
-        }
-    } catch {
-        // Best-effort cleanup
-    }
+function clearStatus(threadId: number): void {
+    clearThreadStatus(QUEUE_STATUS, threadId);
 }
 
 // ─── Build v1 query options ───
@@ -769,6 +758,12 @@ interface QueryEventObserver {
 // before giving up. With active background tasks, we wait indefinitely.
 const END_TURN_STALL_TIMEOUT_MS = 90_000; // 90 seconds
 const POST_END_TURN_POLL_MS = 5_000; // 5 seconds per event poll
+
+// Subprocess liveness: if zero events arrive for this long, the subprocess is likely dead.
+// Active sessions always emit events (tool_progress, assistant messages, etc.) so silence
+// means the child process crashed. Intentionally long — legit sessions can run for hours.
+const SUBPROCESS_LIVENESS_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+const LIVENESS_POLL_MS = 30_000; // 30 seconds per poll iteration
 
 // Alert threshold for long-running background tasks (2 hours)
 const BACKGROUND_TASK_ALERT_MS = 2 * 60 * 60 * 1000;
@@ -970,7 +965,7 @@ async function collectPrimaryResponse(
     const iterator = q[Symbol.asyncIterator]();
 
     while (true) {
-        let iterResult: IteratorResult<SDKMessage, void>;
+        let iterResult!: IteratorResult<SDKMessage, void>;
 
         if (state.sawEndTurn && state.parts.length > 0) {
             // If there are active background tasks, return immediately —
@@ -989,13 +984,14 @@ async function collectPrimaryResponse(
                 };
             }
 
-            // If there are injected messages pending, return immediately —
-            // the next events in the iterator belong to the injected message's response,
-            // not stale leftovers. Consuming them here would steal from the inject consumer.
-            if (observer?.hasPendingInjections?.()) {
-                log("DEBUG", `end_turn with pending injections — returning immediately`);
-                break;
-            }
+            // If there are injected messages pending, DON'T return yet — we need to
+            // consume the trailing `result` event first. In streaming mode, result comes
+            // right after end_turn. If we break before consuming it, the result event
+            // leaks into the next collectPrimaryResponse call and causes it to exit
+            // immediately via sawResult, yielding "(No response generated)".
+            // The sawResult check (after processSDKMessage) will break us out once
+            // the result event is consumed. The drain section already guards against
+            // consuming events meant for injected messages.
 
             // No background tasks — use stall detection to avoid hanging indefinitely
             const elapsed = Date.now() - state.endTurnSeenAt;
@@ -1024,7 +1020,43 @@ async function collectPrimaryResponse(
             clearTimeout(timeoutHandle!);
             iterResult = winner.result;
         } else {
-            iterResult = await iterator.next();
+            // Liveness detection: the SDK subprocess should always emit events
+            // while working (tool_progress, assistant messages, etc.). If nothing
+            // arrives for SUBPROCESS_LIVENESS_TIMEOUT_MS, it's likely dead.
+            // We call iterator.next() once and race the same promise against
+            // repeated short timeouts to avoid creating dangling next() calls.
+            const eventPromise = iterator.next().then(
+                (r) => ({ kind: "event" as const, result: r }),
+            );
+            let livenessElapsed = 0;
+            while (livenessElapsed < SUBPROCESS_LIVENESS_TIMEOUT_MS) {
+                const remaining = SUBPROCESS_LIVENESS_TIMEOUT_MS - livenessElapsed;
+                const pollMs = Math.min(LIVENESS_POLL_MS, remaining);
+                let livenessHandle: ReturnType<typeof setTimeout>;
+                const livenessPromise = new Promise<"timeout">((resolve) => {
+                    livenessHandle = setTimeout(() => resolve("timeout"), pollMs);
+                });
+                const winner = await Promise.race([
+                    eventPromise,
+                    livenessPromise.then(() => ({ kind: "timeout" as const })),
+                ]);
+                if (winner.kind === "timeout") {
+                    livenessElapsed += pollMs;
+                    continue;
+                }
+                clearTimeout(livenessHandle!);
+                iterResult = winner.result;
+                break;
+            }
+            if (livenessElapsed >= SUBPROCESS_LIVENESS_TIMEOUT_MS) {
+                stallDetected = true;
+                observer?.onStallDetected?.();
+                log(
+                    "WARN",
+                    `No SDK events for ${Math.round(livenessElapsed / 1000)}s — subprocess likely dead, returning collected response (${state.parts.join("").length} chars)`,
+                );
+                break;
+            }
         }
 
         if (iterResult.done) break;
@@ -1366,6 +1398,283 @@ async function monitorBackgroundTasks(
     }
 }
 
+// ─── Streaming Channel: Event Consumer ───
+// Long-running async function per thread. Consumes SDK events from the query
+// iterator, posts text blocks via outgoing queue, handles tool use status,
+// background tasks, cancel signals, and usage logging. Loops across turns —
+// when a new message is pushed into the channel, the SDK processes it and
+// emits more events which this consumer handles.
+
+// Active consumers keyed by threadId
+const activeConsumers = new Map<number, Promise<void>>();
+
+async function consumeThreadEvents(
+    threadId: number,
+    q: Query,
+    channel: string,
+    sender: string,
+    model: string,
+    messageId: string,
+    cwd: string,
+): Promise<void> {
+    const iterator = q[Symbol.asyncIterator]();
+    let streamSeq = 0;
+    let accumulated = "";
+    let currentAnchorMessageId = messageId;
+    let toolCount = 0;
+    let currentSessionId: string | undefined;
+    let activeTasks = new Map<string, BackgroundTaskInfo>();
+
+    const statusStartTime = Date.now();
+    writeStatus(threadId, currentAnchorMessageId, "Thinking", statusStartTime);
+
+    // Status refresh interval — keep ts fresh for staleness detection,
+    // update label/preview, and check for cancel signals
+    let currentStatusLabel = "Thinking";
+    let currentPreview: string | undefined;
+    let fullAccumulatedText = "";
+    let cancelled = false;
+    const cancelFile = path.join(QUEUE_CANCEL, `${currentAnchorMessageId}.json`);
+
+    const statusInterval = setInterval(() => {
+        // Check for cancel signal
+        const checkFile = path.join(QUEUE_CANCEL, `${currentAnchorMessageId}.json`);
+        if (!cancelled && fs.existsSync(checkFile)) {
+            cancelled = true;
+            currentStatusLabel = "Cancelled";
+            try { fs.unlinkSync(checkFile); } catch { /* best effort */ }
+            Promise.race([q.interrupt(), new Promise<void>(r => setTimeout(r, 10_000))]).catch(() => {});
+            log("INFO", `Cancelled processing for thread ${threadId} (anchor: ${currentAnchorMessageId})`);
+        }
+        // Check for settings file changes
+        invalidateSettingsCacheIfChanged();
+        writeStatus(threadId, currentAnchorMessageId, currentStatusLabel, statusStartTime, currentPreview, fullAccumulatedText, currentSessionId);
+    }, 2000);
+
+    try {
+        while (true) {
+            // Liveness: if no events for 5 min, subprocess is likely dead
+            let iterResult: IteratorResult<SDKMessage, void> | undefined;
+            {
+                const eventPromise = iterator.next().then(
+                    (r) => ({ kind: "event" as const, result: r }),
+                );
+                let livenessElapsed = 0;
+                while (livenessElapsed < SUBPROCESS_LIVENESS_TIMEOUT_MS) {
+                    const remaining = SUBPROCESS_LIVENESS_TIMEOUT_MS - livenessElapsed;
+                    const pollMs = Math.min(LIVENESS_POLL_MS, remaining);
+                    let livenessHandle: ReturnType<typeof setTimeout>;
+                    const livenessPromise = new Promise<"timeout">((resolve) => {
+                        livenessHandle = setTimeout(() => resolve("timeout"), pollMs);
+                    });
+                    const winner = await Promise.race([
+                        eventPromise,
+                        livenessPromise.then(() => ({ kind: "timeout" as const })),
+                    ]);
+                    if (winner.kind === "timeout") {
+                        livenessElapsed += pollMs;
+                        continue;
+                    }
+                    clearTimeout(livenessHandle!);
+                    iterResult = winner.result;
+                    break;
+                }
+                if (livenessElapsed >= SUBPROCESS_LIVENESS_TIMEOUT_MS) {
+                    log("WARN", `No events for ${Math.round(livenessElapsed / 1000)}s on thread ${threadId} — exiting consumer`);
+                    break;
+                }
+            }
+
+            if (!iterResult || iterResult.done) break;
+            const msg = iterResult.value;
+
+            // Capture session ID
+            if ("session_id" in msg && msg.session_id) {
+                const isNew = currentSessionId !== msg.session_id;
+                currentSessionId = msg.session_id;
+                if (isNew) {
+                    persistSessionId(threadId, currentSessionId);
+                }
+            }
+
+            if (msg.type === "assistant") {
+                const assistantMsg = msg as SDKAssistantMessage;
+                const content = assistantMsg.message?.content;
+                if (Array.isArray(content)) {
+                    for (const block of content) {
+                        if (block.type === "text" && typeof block.text === "string") {
+                            accumulated += (accumulated ? "\n\n" : "") + block.text;
+                            fullAccumulatedText += (fullAccumulatedText ? "\n\n" : "") + block.text;
+                            currentPreview = fullAccumulatedText.length > 500
+                                ? "…" + fullAccumulatedText.slice(-500)
+                                : fullAccumulatedText;
+                            // Write streaming text block to outgoing queue
+                            writeStreamingOutgoing(threadId, channel, sender, model, block.text, streamSeq++, currentAnchorMessageId);
+                        }
+                        if (block.type === "tool_use" && "name" in block) {
+                            toolCount++;
+                            currentStatusLabel = `Using ${block.name} [${toolCount}]`;
+                        }
+                    }
+                }
+            }
+
+            if (msg.type === "tool_progress") {
+                const toolMsg = msg as SDKToolProgressMessage;
+                currentStatusLabel = `Using ${toolMsg.tool_name} [${toolCount}]`;
+            }
+
+            if (msg.type === "system" && "subtype" in msg && msg.subtype === "status" && "status" in msg && msg.status === "compacting") {
+                currentStatusLabel = "Compacting context";
+            }
+
+            // Track background tasks
+            applyTaskEvent(msg, activeTasks, {
+                onTaskStarted(taskId: string, description: string) {
+                    currentStatusLabel = `Background: ${description}`;
+                    log("INFO", `Background task started: ${taskId} — ${description}`);
+                },
+                onTaskProgress(_taskId: string, summary: string | undefined) {
+                    if (summary) currentStatusLabel = `Background: ${summary.substring(0, 60)}`;
+                },
+                onTaskCompleted(taskId: string, status: string, summary: string) {
+                    log("INFO", `Background task ${taskId} ${status}: ${summary}`);
+                },
+            });
+
+            if (msg.type === "result") {
+                const result = msg as SDKResultMessage;
+                const usage = extractUsageData(result);
+
+                // Log and write stream-complete marker
+                if (accumulated || streamSeq > 0) {
+                    appendHistory({
+                        ts: Date.now(), threadId, channel,
+                        sender: "assistant", direction: "out",
+                        message: accumulated, model,
+                        source: "user", messageId: currentAnchorMessageId,
+                        ...(currentSessionId ? { sessionId: currentSessionId } : {}),
+                        costUSD: usage.totalCostUSD,
+                        inputTokens: usage.inputTokens,
+                        outputTokens: usage.outputTokens,
+                        cacheReadInputTokens: usage.cacheReadInputTokens,
+                        cacheCreationInputTokens: usage.cacheCreationInputTokens,
+                        durationMs: usage.durationMs,
+                        durationApiMs: usage.durationApiMs,
+                        numTurns: usage.numTurns,
+                        modelUsage: usage.modelUsage,
+                    });
+                    writeStreamCompleteOutgoing(threadId, channel, sender, model, accumulated, currentAnchorMessageId);
+                } else {
+                    // Empty response — still write a marker so telegram-client knows the turn ended
+                    writeStreamCompleteOutgoing(threadId, channel, sender, model, "", currentAnchorMessageId);
+                }
+
+                // Handle background tasks
+                const runningTasks = [...activeTasks.values()].filter(t => t.status === "running");
+                if (runningTasks.length > 0) {
+                    // Fire off background monitoring — the consumer keeps running
+                    // to handle task events and eventual completion summary injection
+                    sessionPool.markMonitoring(threadId);
+                    writeTaskState(currentAnchorMessageId, threadId, activeTasks);
+                    const monitor = monitorBackgroundTasks(q, activeTasks, threadId, currentAnchorMessageId);
+                    activeBackgroundMonitors.set(threadId, monitor);
+                    monitor.finally(() => {
+                        activeBackgroundMonitors.delete(threadId);
+                        sessionPool.markIdle(threadId, currentSessionId);
+                    });
+                    log("INFO", `Started background task monitor for thread ${threadId} (${runningTasks.length} task(s))`);
+                    // Consumer returns — background monitor takes over the iterator.
+                    // Next message will create a new consumer.
+                    break;
+                }
+
+                // Reset for next turn
+                accumulated = "";
+                fullAccumulatedText = "";
+                currentPreview = undefined;
+                streamSeq = 0;
+                toolCount = 0;
+                clearStatus(threadId);
+
+                // Session is idle between turns — wait for next message push
+                sessionPool.markIdle(threadId, currentSessionId);
+                if (currentSessionId) {
+                    const threadCwd = loadThreads()[String(threadId)]?.cwd;
+                    if (threadCwd) syncSessionLog(currentSessionId, threadCwd);
+                }
+
+                // Check for cancel
+                if (cancelled) {
+                    break;
+                }
+            }
+        }
+    } catch (err) {
+        log("ERROR", `Consumer error for thread ${threadId}: ${toErrorMessage(err)}`);
+        // Close the persistent session on error
+        sessionPool.close(threadId);
+        deleteThreadField(threadId, "sessionId");
+    } finally {
+        clearInterval(statusInterval);
+        clearStatus(threadId);
+
+        if (cancelled) {
+            // Write cancellation message
+            const cancelText = fullAccumulatedText
+                ? `${fullAccumulatedText}\n\n---\n🚫 Processing was cancelled.`
+                : "🚫 Processing was cancelled.";
+            writeStreamCompleteOutgoing(threadId, channel, sender, model, cancelText, currentAnchorMessageId);
+            sessionPool.close(threadId);
+        }
+
+        activeConsumers.delete(threadId);
+        log("INFO", `Event consumer exited for thread ${threadId}`);
+    }
+}
+
+// Write a streaming text block to the outgoing queue
+function writeStreamingOutgoing(
+    threadId: number, channel: string, sender: string, model: string,
+    text: string, sequence: number, anchorMessageId: string,
+): void {
+    const data: OutgoingMessage = {
+        channel, threadId, sender, model,
+        message: text,
+        originalMessage: "(streaming text block)",
+        timestamp: Date.now(),
+        messageId: anchorMessageId,
+        streaming: true,
+        streamSequence: sequence,
+    };
+    const filename = `stream_${threadId}_${anchorMessageId}_${sequence}_${Date.now()}.json`;
+    const outFile = path.join(QUEUE_OUTGOING, filename);
+    const tmpFile = outFile + ".tmp";
+    fs.writeFileSync(tmpFile, JSON.stringify(data, null, 2));
+    fs.renameSync(tmpFile, outFile);
+}
+
+// Write a stream-complete marker to the outgoing queue
+function writeStreamCompleteOutgoing(
+    threadId: number, channel: string, sender: string, model: string,
+    accumulatedText: string, anchorMessageId: string,
+): void {
+    const data: OutgoingMessage = {
+        channel, threadId, sender, model,
+        message: accumulatedText || "(No response generated)",
+        originalMessage: "(stream complete)",
+        timestamp: Date.now(),
+        messageId: anchorMessageId,
+        streamComplete: true,
+        accumulatedText,
+    };
+    const filename = `stream_complete_${threadId}_${anchorMessageId}_${Date.now()}.json`;
+    const outFile = path.join(QUEUE_OUTGOING, filename);
+    const tmpFile = outFile + ".tmp";
+    fs.writeFileSync(tmpFile, JSON.stringify(data, null, 2));
+    fs.renameSync(tmpFile, outFile);
+}
+
 // ─── Heartbeat Processing (one-shot, no persistent session) ───
 
 async function processHeartbeat(msg: IncomingMessage): Promise<{ text: string; usage?: QueryUsageData; heartbeatUsageId?: string; heartbeatModel?: string }> {
@@ -1525,8 +1834,6 @@ async function processScheduledTask(task: ScheduledTask): Promise<{ text: string
     }
 }
 
-// ─── Process a Single Message ───
-
 // ─── One-Shot Query (/do command) ───
 
 async function processOneShot(msg: IncomingMessage): Promise<{ text: string; model: string; usage?: QueryUsageData; budgetUsageId?: string }> {
@@ -1588,64 +1895,7 @@ async function processOneShot(msg: IncomingMessage): Promise<{ text: string; mod
     }
 }
 
-// ─── Process Message ───
-
-// ─── Slurp: scan queue for next message on a given thread ───
-
-function slurpNextMessage(threadId: number): { file: string; msg: IncomingMessage } | null {
-    if (!fs.existsSync(QUEUE_INCOMING)) return null;
-
-    const files = fs.readdirSync(QUEUE_INCOMING)
-        .filter(f => f.endsWith(".json"))
-        .map(f => ({ name: f, path: path.join(QUEUE_INCOMING, f) }));
-
-    // Find messages for this thread, apply coalescing
-    let primary: { name: string; path: string; msg: IncomingMessage } | null = null;
-    const coalesced: { name: string; path: string }[] = [];
-
-    for (const file of files) {
-        try {
-            const raw: unknown = JSON.parse(fs.readFileSync(file.path, "utf8"));
-            // Skip if retry backoff not ready
-            if (raw && typeof raw === "object" && "retryAfter" in raw) {
-                const retryAfter = (raw as any).retryAfter;
-                if (typeof retryAfter === "number" && Date.now() < retryAfter) continue;
-            }
-            const parsed = IncomingMessageSchema.safeParse(raw);
-            if (!parsed.success) continue;
-            const msg = parsed.data;
-            if (msg.threadId !== threadId) continue;
-            // Skip commands, heartbeats, scheduled tasks — only slurp user messages
-            if (msg.message.startsWith("/")) continue;
-            if (msg.source === "heartbeat" || msg.source === "scheduled-task" || msg.source === "one-shot") continue;
-
-            if (!primary) {
-                primary = { ...file, msg };
-            } else {
-                // Coalesce additional messages
-                primary.msg.message += "\n\n" + msg.message;
-                coalesced.push(file);
-            }
-        } catch { continue; }
-    }
-
-    if (!primary) return null;
-
-    // Rewrite primary file with coalesced text if needed
-    if (coalesced.length > 0) {
-        try {
-            const tmpFile = primary.path + ".tmp";
-            fs.writeFileSync(tmpFile, JSON.stringify(primary.msg, null, 2));
-            fs.renameSync(tmpFile, primary.path);
-        } catch { /* proceed with original */ }
-        for (const cf of coalesced) {
-            try { fs.unlinkSync(cf.path); } catch {}
-        }
-        log("INFO", `Slurp: coalesced ${coalesced.length + 1} messages for thread ${threadId}`);
-    }
-
-    return { file: primary.path, msg: primary.msg };
-}
+// ─── Process Message (one-shot/heartbeat/scheduled-task/command paths only) ───
 
 async function processMessage(messageFile: string): Promise<void> {
     const filename = path.basename(messageFile);
@@ -1712,14 +1962,14 @@ async function processMessage(messageFile: string): Promise<void> {
             responseText = oneshotResult.text;
             usageData = oneshotResult.usage;
             budgetUsageId = oneshotResult.budgetUsageId;
-            clearStatus(messageId);
+            clearStatus(threadId);
         // ─── Scheduled Task: one-shot, no persistent session ───
         } else if (source === "scheduled-task") {
             const taskId = msg.messageId.match(/^sched_([^_]+)_/)?.[1];
             const task = taskId ? loadTasks().find(t => t.id === taskId) : undefined;
             if (!task) {
                 log("WARN", `Scheduled task not found for messageId ${msg.messageId}`);
-                clearStatus(messageId);
+                clearStatus(threadId);
                 if (fs.existsSync(processingFile)) fs.unlinkSync(processingFile);
                 return;
             }
@@ -1738,7 +1988,7 @@ async function processMessage(messageFile: string): Promise<void> {
                 markTaskComplete(task.id, "error", 0);
             }
 
-            clearStatus(messageId);
+            clearStatus(threadId);
         // ─── Heartbeat: one-shot, skip router and session ───
         } else if (source === "heartbeat") {
             // Defense-in-depth: skip heartbeat for team threads
@@ -1746,7 +1996,7 @@ async function processMessage(messageFile: string): Promise<void> {
             const teamCheckConfig = teamCheckThreads[String(threadId)];
             if (teamCheckConfig?.team) {
                 log("INFO", `Skipping heartbeat for team thread ${threadId} (team: ${teamCheckConfig.team})`);
-                clearStatus(messageId);
+                clearStatus(threadId);
                 if (fs.existsSync(processingFile)) {
                     fs.unlinkSync(processingFile);
                 }
@@ -1790,657 +2040,19 @@ async function processMessage(messageFile: string): Promise<void> {
                         modelUsage: usageData.modelUsage,
                     });
                 }
-                clearStatus(messageId);
+                clearStatus(threadId);
                 if (fs.existsSync(processingFile)) {
                     fs.unlinkSync(processingFile);
                 }
                 return;
             }
         } else {
-            // ─── Load thread config ───
-            const threads = loadThreads();
-            const key = String(threadId);
-            let threadConfig = threads[key];
-
-            if (!threadConfig) {
-                const defaultCwd =
-                    process.env.DEFAULT_CWD || process.cwd();
-                threadConfig = {
-                    name: msg.topicName ?? `Thread ${threadId}`,
-                    cwd: defaultCwd,
-                    model: "sonnet",
-                    isMaster: false,
-                    lastActive: Date.now(),
-                };
-                threads[key] = threadConfig;
-                saveThreads(threads);
-            } else if (msg.topicName && threadConfig.name === `Thread ${threadId}`) {
-                // Backfill topic name for threads created before name tracking
-                threadConfig.name = msg.topicName;
-                saveThreads(threads);
-            }
-
-            // Update lastActive
-            threads[key].lastActive = Date.now();
-
-            // ─── Sticky model: use thread's configured model (set via /model command) ───
-            // Budget mode overrides thread model; otherwise use thread config or default
-            if (isBudgetMode()) {
-                effectiveModel = BUDGET_MODEL;
-            } else {
-                effectiveModel = threadConfig.model || DEFAULT_THREAD_MODEL;
-            }
-
-            log("INFO", `Thread ${threadId}: model=${effectiveModel}`);
-
-            // ─── Build the full prompt ───
-            const now = formatCurrentTime();
-            const prefix = buildSourcePrefix(msg);
-            const isNewSession = !threadConfig.sessionId;
-            const threadPrompt = buildThreadPrompt(threadConfig, { threadId, model: effectiveModel });
-            const historyContext = isNewSession
-                ? buildHistoryContext(threadId, threadConfig.isMaster)
-                : "";
-            let fullPrompt: string;
-            if (isNewSession) {
-                const contextBlock = historyContext
-                    ? `\n\n${historyContext}\n\n`
-                    : "\n\n";
-                fullPrompt = `[${now}]${contextBlock}${prefix} ${msg.message}`;
-            } else {
-                fullPrompt = `[${now}] ${prefix} ${msg.message}`;
-            }
-
-            // ─── Log assembled prompt ───
-            logPrompt({
-                threadId,
-                messageId,
-                model: effectiveModel,
-                systemPromptAppend: threadPrompt,
-                userMessage: `${prefix} ${msg.message}`,
-                historyInjected: isNewSession,
-                historyLines: isNewSession ? historyContext.split("\n").length - 1 : 0,
-                promptLength: fullPrompt.length,
-            });
-
-            // ─── Send query (persistent session or new) ───
-            const stderrLines: string[] = [];
-            const options = await buildQueryOptions(threadId, threadConfig, effectiveModel, stderrLines, msg.message);
-
-            // Create pending usage file for budget mode or thread-level Fireworks model correlation
-            if (isBudgetMode() || effectiveModel.includes("fireworks")) {
-                budgetUsageId = crypto.randomUUID();
-                const pendingFile = path.join(BORG_DIR, `minimax-usage-${budgetUsageId}.pending`);
-                fs.writeFileSync(pendingFile, "");
-                // Embed UUID in base URL path — proxy extracts it from the request URL
-                process.env.ANTHROPIC_BASE_URL = `${BUDGET_PROXY_URL}/${budgetUsageId}`;
-            }
-
-            // Try to reuse an existing persistent session, or create a new one.
-            // The session pool uses AsyncIterable prompt mode — the generator
-            // stays open between turns, keeping the SDK subprocess alive.
-            let q: Query;
-            let pushReusedMessage: (() => void) | null = null;
-            const claimed = sessionPool.tryClaimSession(threadId, effectiveModel, threadConfig.cwd);
-            if (claimed) {
-                q = claimed.query;
-                // DON'T push the message yet — the consumer (collectPrimaryResponse)
-                // must be set up first, otherwise the SDK processes the message and
-                // emits events before anyone is consuming them.
-                pushReusedMessage = () => claimed.pushMessage(fullPrompt);
-            } else {
-                q = sessionPool.createSession(threadId, fullPrompt, options, effectiveModel, threadConfig.cwd);
-            }
-
-            // Write initial status; the telegram-client computes elapsed time from startTs
-            const statusStartTime = Date.now();
-            let currentStatusLabel = "Thinking";
-            writeStatus(messageId, currentStatusLabel, statusStartTime);
-
-            // Refresh the status file every 2 seconds to keep ts fresh (for staleness detection)
-            // and to pick up label changes and preview text from the observer callbacks.
-            // Also checks for cancel signal files written by telegram-client.
-            let currentPreview: string | undefined;
-            let fullAccumulatedText = "";
-            let cancelled = false;
-            const cancelFile = path.join(QUEUE_CANCEL, `${messageId}.json`);
-
-            // Cancel-aware: race collectPrimaryResponse against a cancel timeout
-            // so we're guaranteed to resolve even if the SDK hangs after interrupt()
-            let cancelTimeoutResolve: (() => void) | undefined;
-            const cancelTimeoutPromise = new Promise<"cancel-timeout">((resolve) => {
-                cancelTimeoutResolve = () => resolve("cancel-timeout");
-            });
-
-            const statusInterval = setInterval(async () => {
-                // Check for cancel signal
-                if (!cancelled && fs.existsSync(cancelFile)) {
-                    cancelled = true;
-                    currentStatusLabel = "Cancelled";
-                    writeStatus(messageId, currentStatusLabel, statusStartTime, currentPreview, fullAccumulatedText);
-                    try { fs.unlinkSync(cancelFile); } catch { /* best effort */ }
-                    // Race interrupt() against a 10s timeout — if the SDK subprocess
-                    // hangs (e.g. waiting on a background task), we can't block this
-                    // callback forever or the cancel timeout never gets scheduled and
-                    // the processing slot is permanently stuck.
-                    const interruptTimeout = new Promise<void>((r) => setTimeout(r, 10_000));
-                    Promise.race([q.interrupt(), interruptTimeout]).catch(() => { /* process may be gone */ });
-                    log("INFO", `Cancelled processing for ${messageId}`);
-                    // Safety net: if collectPrimaryResponse doesn't return within 30s
-                    // after interrupt, resolve the cancel timeout to unblock the race
-                    setTimeout(() => {
-                        cancelTimeoutResolve?.();
-                    }, 30_000);
-                    return;
-                }
-                // Check for settings file changes (e.g., /budget_on from telegram-client)
-                invalidateSettingsCacheIfChanged();
-                writeStatus(messageId, currentStatusLabel, statusStartTime, currentPreview, fullAccumulatedText, currentSessionId);
-            }, 2000);
-
-            // Observer callbacks set intent; the interval handles all file writes
-            let toolUseCount = 0;
-            let currentSessionId: string | undefined;
-            const observer: QueryEventObserver = {
-                hasPendingInjections() {
-                    return (injectedMessageIds.get(threadId)?.length ?? 0) > 0;
-                },
-                onSessionId(sessionId: string) {
-                    currentSessionId = sessionId;
-                    persistSessionId(threadId, sessionId);
-                },
-                onToolUse(toolName: string) {
-                    toolUseCount++;
-                    currentStatusLabel = `Using ${toolName} [${toolUseCount}]`;
-                },
-                onToolProgress(toolName: string) {
-                    currentStatusLabel = `Using ${toolName} [${toolUseCount}]`;
-                },
-                onCompacting() {
-                    currentStatusLabel = "Compacting context";
-                },
-                onStallDetected() {
-                    currentStatusLabel = "Stall recovered";
-                },
-                onTextContent(text: string) {
-                    // Full text for cancel responses; truncated preview for status display
-                    fullAccumulatedText += (fullAccumulatedText ? "\n\n" : "") + text;
-                    currentPreview = fullAccumulatedText.length > 500
-                        ? "…" + fullAccumulatedText.slice(-500)
-                        : fullAccumulatedText;
-                },
-                onTaskStarted(taskId: string, description: string) {
-                    currentStatusLabel = `Background: ${description}`;
-                    log("INFO", `Background task started: ${taskId} — ${description}`);
-                },
-                onTaskProgress(taskId: string, summary: string | undefined) {
-                    if (summary) {
-                        currentStatusLabel = `Background: ${summary.substring(0, 60)}`;
-                    }
-                },
-                onTaskCompleted(taskId: string, status: string, summary: string) {
-                    log("INFO", `Background task ${taskId} ${status}: ${summary}`);
-                },
-            };
-
-            try {
-                // Start consumer FIRST — it calls iterator.next() and blocks waiting for events.
-                const queryPromise = collectPrimaryResponse(q, observer);
-
-                // NOW push the message for reused sessions. The consumer is already
-                // waiting on iterator.next(), so when the generator yields the message
-                // and the SDK processes it, events flow directly to the consumer.
-                if (pushReusedMessage) {
-                    pushReusedMessage();
-                    pushReusedMessage = null;
-                }
-
-                const result = await Promise.race([
-                    queryPromise.then((r) => ({ kind: "response" as const, ...r })),
-                    cancelTimeoutPromise.then(() => ({ kind: "cancel-timeout" as const })),
-                ]);
-
-                clearInterval(statusInterval);
-
-                if (result.kind === "cancel-timeout") {
-                    log("WARN", `Cancel timeout: collectPrimaryResponse did not return within 30s after interrupt for ${messageId}`);
-                    responseText = fullAccumulatedText
-                        ? `${fullAccumulatedText}\n\n---\n🚫 Processing was cancelled.`
-                        : "🚫 Processing was cancelled.";
-                    clearStatus(messageId);
-                    // Interrupt kills the subprocess — session is no longer reusable
-                    sessionPool.close(threadId);
-                } else if (cancelled) {
-                    // Cancelled but collectPrimaryResponse returned normally
-                    responseText = fullAccumulatedText
-                        ? `${fullAccumulatedText}\n\n---\n🚫 Processing was cancelled.`
-                        : "🚫 Processing was cancelled.";
-                    clearStatus(messageId);
-                    // Interrupt kills the subprocess — session is no longer reusable
-                    sessionPool.close(threadId);
-                    usageData = result.usage;
-                    if (result.sessionId) {
-                        resolvedSessionId = result.sessionId;
-                        updateThread(threadId, {
-                            sessionId: result.sessionId,
-                            lastActive: Date.now(),
-                        });
-                    }
-                } else {
-                    usageData = result.usage;
-                    responseText = result.text.trim();
-
-                    if (result.stallRecovered) {
-                        responseText += `\n\n---\n⚠️ _Stall recovered: session hung after end\\_turn (${END_TURN_STALL_TIMEOUT_MS / 1000}s timeout). Response above may be incomplete._`;
-                        // Stall recovery calls interrupt() which kills the subprocess
-                        sessionPool.close(threadId);
-                    }
-
-                    // Persist session ID for future resume (atomic to avoid clobbering team/role)
-                    if (result.sessionId) {
-                        resolvedSessionId = result.sessionId;
-                        updateThread(threadId, {
-                            sessionId: result.sessionId,
-                            lastActive: Date.now(),
-                        });
-                        const cwd = loadThreads()[String(threadId)]?.cwd;
-                        if (cwd) syncSessionLog(result.sessionId, cwd);
-                    }
-
-                    // Fire off background task monitoring if there are active tasks
-                    if (result.hasBackgroundTasks) {
-                        sessionPool.markMonitoring(threadId);
-                        const monitor = monitorBackgroundTasks(
-                            result.query,
-                            result.activeTasks,
-                            threadId,
-                            messageId,
-                        );
-                        activeBackgroundMonitors.set(threadId, monitor);
-                        monitor.finally(() => {
-                            activeBackgroundMonitors.delete(threadId);
-                            // Session returns to idle after background tasks complete
-                            sessionPool.markIdle(threadId, result.sessionId);
-                        });
-                        log("INFO", `Started background task monitor for thread ${threadId} (${result.activeTasks.size} task(s))`);
-                    } else {
-                        // No background tasks — session is ready for next message
-                        sessionPool.markIdle(threadId, result.sessionId);
-                    }
-                }
-            } catch (queryErr) {
-                clearInterval(statusInterval);
-
-                if (cancelled) {
-                    // Cancelled — include partial response so user can see what was generated
-                    responseText = fullAccumulatedText
-                        ? `${fullAccumulatedText}\n\n---\n🚫 Processing was cancelled.`
-                        : "🚫 Processing was cancelled.";
-                    clearStatus(messageId);
-                } else {
-                    const stderrOutput = stderrLines.join("").trim();
-                    log(
-                        "ERROR",
-                        `Query error for thread ${threadId}: ${toErrorMessage(queryErr)}` +
-                            (stderrOutput ? `\n  stderr: ${stderrOutput.slice(0, 2000)}` : ""),
-                    );
-
-                    // Close the persistent session on error
-                    sessionPool.close(threadId);
-
-                    // Clear stale sessionId on error so retries start a fresh session (atomic)
-                    deleteThreadField(threadId, "sessionId");
-
-                    throw queryErr;
-                }
-            } finally {
-                // Clean up pending usage file regardless of success or error
-                // This prevents orphaned .pending files when queries fail
-                if (budgetUsageId) {
-                    const pendingFile = path.join(BORG_DIR, `minimax-usage-${budgetUsageId}.pending`);
-                    try {
-                        if (fs.existsSync(pendingFile)) {
-                            fs.unlinkSync(pendingFile);
-                            log("DEBUG", `Cleaned up pending file: ${pendingFile}`);
-                        }
-                    } catch {
-                        // Best effort cleanup — don't throw, query may already be failing
-                    }
-                    // Clean up correlation env var to prevent stale correlation on next query
-                }
-            }
-        }
-
-        // Fallback for empty responses
-        if (!responseText) {
-            responseText = "(No response generated)";
-        }
-
-        // Read budget mode usage from correlation file if applicable
-        if (budgetUsageId) {
-            const budgetUsage = readBudgetUsage(budgetUsageId);
-            if (budgetUsage) {
-                usageData = budgetUsage;
-            }
-        }
-
-        // ─── Log outgoing message to history ───
-        appendHistory({
-            ts: Date.now(),
-            threadId,
-            channel,
-            sender: "assistant",
-            direction: "out",
-            message: responseText,
-            model: effectiveModel,
-            source: source ?? "user",
-            messageId,
-            ...(resolvedSessionId ? { sessionId: resolvedSessionId } : {}),
-            ...(usageData ? {
-                costUSD: usageData.totalCostUSD,
-                inputTokens: usageData.inputTokens,
-                outputTokens: usageData.outputTokens,
-                cacheReadInputTokens: usageData.cacheReadInputTokens,
-                cacheCreationInputTokens: usageData.cacheCreationInputTokens,
-                durationMs: usageData.durationMs,
-                durationApiMs: usageData.durationApiMs,
-                numTurns: usageData.numTurns,
-                modelUsage: usageData.modelUsage,
-            } : {}),
-        });
-
-        // ─── Write response to outgoing queue ───
-        const responseData: OutgoingMessage = {
-            channel,
-            threadId,
-            sender,
-            message: responseText,
-            originalMessage: msg.message,
-            timestamp: Date.now(),
-            messageId,
-            model: effectiveModel,
-            ...(msg.telegramMessageId && msg.voiceDuration ? {
-                replyToMessageId: msg.telegramMessageId,
-                replyToVoice: true,
-            } : {}),
-            ...(scheduledTaskName ? { scheduledTaskName } : {}),
-        };
-
-        const responseFile =
-            channel === "heartbeat"
-                ? path.join(QUEUE_OUTGOING, `${messageId}.json`)
-                : path.join(
-                        QUEUE_OUTGOING,
-                        `${channel}_${messageId}_${Date.now()}.json`,
-                    );
-
-        const tmpFile = responseFile + ".tmp";
-        fs.writeFileSync(tmpFile, JSON.stringify(responseData, null, 2));
-        fs.renameSync(tmpFile, responseFile);
-
-        clearStatus(messageId);
-
-        log(
-            "INFO",
-            `Response ready [${channel}] thread=${threadId} model=${effectiveModel} (${responseText.length} chars)`,
-        );
-
-        // Clean up processing file
-        if (fs.existsSync(processingFile)) {
-            fs.unlinkSync(processingFile);
-        }
-
-        // ─── Slurp: check for queued messages that arrived while we were processing ───
-        // If the session is idle and there are more messages for this thread,
-        // consume them immediately instead of releasing the thread slot.
-        // Messages stay in the file queue until we're ready, preserving
-        // edit/delete and coalescing behavior.
-        if (source !== "heartbeat" && source !== "scheduled-task" && source !== "one-shot") {
-            while (sessionPool.getState(threadId) === "idle") {
-                const nextMsg = slurpNextMessage(threadId);
-                if (!nextMsg) break;
-
-                const { file: nextFile, msg: nextMsgData } = nextMsg;
-                const nextFilename = path.basename(nextFile);
-                const nextProcessingFile = path.join(QUEUE_PROCESSING, nextFilename);
-
-                try {
-                    fs.renameSync(nextFile, nextProcessingFile);
-                } catch {
-                    break; // File may have been picked up by someone else
-                }
-
-                log("INFO", `Slurp: consuming queued message for thread ${threadId} from ${nextMsgData.sender}`);
-
-                // Build prompt for the slurped message
-                const slurpNow = formatCurrentTime();
-                const slurpPrefix = buildSourcePrefix(nextMsgData);
-                const slurpPrompt = `[${slurpNow}] ${slurpPrefix} ${nextMsgData.message}`;
-                const slurpMessageId = nextMsgData.messageId;
-
-                // Log incoming
-                appendHistory({
-                    ts: Date.now(),
-                    threadId,
-                    channel: nextMsgData.channel,
-                    sender: nextMsgData.sender,
-                    direction: "in",
-                    message: nextMsgData.message,
-                    source: nextMsgData.source ?? "user",
-                    sourceThreadId: nextMsgData.sourceThreadId,
-                    messageId: slurpMessageId,
-                });
-
-                // Push into session and collect response
-                const slurpThreads = loadThreads();
-                const slurpCwd = slurpThreads[String(threadId)]?.cwd ?? process.cwd();
-                const claimed = sessionPool.tryClaimSession(threadId, effectiveModel, slurpCwd);
-                if (!claimed) break; // Session gone (model changed, etc.)
-
-                const slurpStartTime = Date.now();
-                let slurpStatusLabel = "Thinking";
-                let slurpPreview: string | undefined;
-                let slurpFullText = "";
-                let slurpSessionId: string | undefined;
-                let slurpToolCount = 0;
-                writeStatus(slurpMessageId, slurpStatusLabel, slurpStartTime);
-
-                // Periodic status refresh so telegram-client's pollStatusFiles (2s)
-                // can pick up the status message — without this, fast responses
-                // could complete before the first poll tick ever sees the file.
-                const slurpStatusInterval = setInterval(() => {
-                    writeStatus(slurpMessageId, slurpStatusLabel, slurpStartTime, slurpPreview, slurpFullText, slurpSessionId);
-                }, 2000);
-
-                const slurpObserver: QueryEventObserver = {
-                    onSessionId(sid: string) {
-                        slurpSessionId = sid;
-                        persistSessionId(threadId, sid);
-                    },
-                    onToolUse(toolName: string) {
-                        slurpToolCount++;
-                        slurpStatusLabel = `Using ${toolName} [${slurpToolCount}]`;
-                    },
-                    onTextContent(text: string) {
-                        slurpFullText += (slurpFullText ? "\n\n" : "") + text;
-                        slurpPreview = slurpFullText.length > 500
-                            ? "…" + slurpFullText.slice(-500)
-                            : slurpFullText;
-                    },
-                };
-
-                const slurpPromise = collectPrimaryResponse(claimed.query, slurpObserver);
-                claimed.pushMessage(slurpPrompt);
-
-                try {
-                    const slurpResult = await slurpPromise;
-                    clearInterval(slurpStatusInterval);
-                    const slurpText = slurpResult.text.trim() || "(No response generated)";
-
-                    if (slurpResult.sessionId) {
-                        updateThread(threadId, { sessionId: slurpResult.sessionId, lastActive: Date.now() });
-                    }
-
-                    // Handle background tasks from slurped message
-                    if (slurpResult.hasBackgroundTasks) {
-                        sessionPool.markMonitoring(threadId);
-                        const monitor = monitorBackgroundTasks(
-                            slurpResult.query, slurpResult.activeTasks, threadId, slurpMessageId,
-                        );
-                        activeBackgroundMonitors.set(threadId, monitor);
-                        monitor.finally(() => {
-                            activeBackgroundMonitors.delete(threadId);
-                            sessionPool.markIdle(threadId, slurpResult.sessionId);
-                        });
-                    } else {
-                        sessionPool.markIdle(threadId, slurpResult.sessionId);
-                    }
-
-                    // Log and write outgoing
-                    appendHistory({
-                        ts: Date.now(), threadId, channel: nextMsgData.channel,
-                        sender: "assistant", direction: "out", message: slurpText,
-                        model: effectiveModel, source: nextMsgData.source ?? "user",
-                        messageId: slurpMessageId,
-                        ...(slurpResult.usage ? {
-                            costUSD: slurpResult.usage.totalCostUSD,
-                            inputTokens: slurpResult.usage.inputTokens,
-                            outputTokens: slurpResult.usage.outputTokens,
-                            cacheReadInputTokens: slurpResult.usage.cacheReadInputTokens,
-                            cacheCreationInputTokens: slurpResult.usage.cacheCreationInputTokens,
-                            durationMs: slurpResult.usage.durationMs,
-                            durationApiMs: slurpResult.usage.durationApiMs,
-                            numTurns: slurpResult.usage.numTurns,
-                            modelUsage: slurpResult.usage.modelUsage,
-                        } : {}),
-                    });
-
-                    const slurpOutgoing: OutgoingMessage = {
-                        channel: nextMsgData.channel, threadId, sender: nextMsgData.sender,
-                        message: slurpText, originalMessage: nextMsgData.message,
-                        timestamp: Date.now(), messageId: slurpMessageId, model: effectiveModel,
-                    };
-                    const slurpOutFile = path.join(QUEUE_OUTGOING, `${nextMsgData.channel}_${slurpMessageId}_${Date.now()}.json`);
-                    const slurpTmp = slurpOutFile + ".tmp";
-                    fs.writeFileSync(slurpTmp, JSON.stringify(slurpOutgoing, null, 2));
-                    fs.renameSync(slurpTmp, slurpOutFile);
-
-                    clearStatus(slurpMessageId);
-                    log("INFO", `Slurp response ready thread=${threadId} model=${effectiveModel} (${slurpText.length} chars)`);
-                } catch (slurpErr) {
-                    clearInterval(slurpStatusInterval);
-                    log("WARN", `Slurp error for thread ${threadId}: ${toErrorMessage(slurpErr)}`);
-                    clearStatus(slurpMessageId);
-                    // Put the message back for normal processing
-                    try { fs.renameSync(nextProcessingFile, nextFile); } catch {}
-                    sessionPool.close(threadId);
-                    break;
-                } finally {
-                    if (fs.existsSync(nextProcessingFile)) {
-                        try { fs.unlinkSync(nextProcessingFile); } catch {}
-                    }
-                }
-            }
-
-            // ─── Consume responses from messages injected mid-turn ───
-            // These were pushed into the channel by processQueue while we were
-            // processing. The SDK queued them and their responses are in the iterator.
-            const pendingInjectedIds = injectedMessageIds.get(threadId) ?? [];
-            if (pendingInjectedIds.length > 0 && sessionPool.getState(threadId) === "idle") {
-                injectedMessageIds.delete(threadId);
-                log("INFO", `Consuming ${pendingInjectedIds.length} injected message response(s) for thread ${threadId}`);
-
-                for (let i = 0; i < pendingInjectedIds.length; i++) {
-                    const injMessageId = pendingInjectedIds[i];
-                    const claimed = sessionPool.tryClaimSession(threadId, effectiveModel,
-                        loadThreads()[String(threadId)]?.cwd ?? process.cwd());
-                    if (!claimed) break;
-
-                    const injStartTime = Date.now();
-                    let injStatusLabel = "Thinking";
-                    let injToolCount = 0;
-                    writeStatus(injMessageId, injStatusLabel, injStartTime);
-
-                    const injStatusInterval = setInterval(() => {
-                        writeStatus(injMessageId, injStatusLabel, injStartTime);
-                    }, 2000);
-
-                    const injObserver: QueryEventObserver = {
-                        onToolUse(toolName: string) {
-                            injToolCount++;
-                            injStatusLabel = `Using ${toolName} [${injToolCount}]`;
-                        },
-                        onTextContent() {},
-                    };
-
-                    const injPromise = collectPrimaryResponse(claimed.query, injObserver);
-                    // Don't push — message was already injected into the channel
-                    try {
-                        const injResult = await injPromise;
-                        clearInterval(injStatusInterval);
-                        const injText = injResult.text.trim() || "(No response generated)";
-
-                        if (injResult.sessionId) {
-                            updateThread(threadId, { sessionId: injResult.sessionId, lastActive: Date.now() });
-                        }
-
-                        if (injResult.hasBackgroundTasks) {
-                            sessionPool.markMonitoring(threadId);
-                            const monitor = monitorBackgroundTasks(
-                                injResult.query, injResult.activeTasks, threadId, injMessageId,
-                            );
-                            activeBackgroundMonitors.set(threadId, monitor);
-                            monitor.finally(() => {
-                                activeBackgroundMonitors.delete(threadId);
-                                sessionPool.markIdle(threadId, injResult.sessionId);
-                            });
-                        } else {
-                            sessionPool.markIdle(threadId, injResult.sessionId);
-                        }
-
-                        // Write response to outgoing — use original messageId so
-                        // telegram-client can match it to the pendingMessages entry
-                        appendHistory({
-                            ts: Date.now(), threadId, channel,
-                            sender: "assistant", direction: "out", message: injText,
-                            model: effectiveModel, source: source ?? "user",
-                            messageId: injMessageId,
-                            ...(injResult.usage ? {
-                                costUSD: injResult.usage.totalCostUSD,
-                                inputTokens: injResult.usage.inputTokens,
-                                outputTokens: injResult.usage.outputTokens,
-                                cacheReadInputTokens: injResult.usage.cacheReadInputTokens,
-                                cacheCreationInputTokens: injResult.usage.cacheCreationInputTokens,
-                                durationMs: injResult.usage.durationMs,
-                                durationApiMs: injResult.usage.durationApiMs,
-                                numTurns: injResult.usage.numTurns,
-                                modelUsage: injResult.usage.modelUsage,
-                            } : {}),
-                        });
-
-                        const injOutgoing: OutgoingMessage = {
-                            channel, threadId, sender,
-                            message: injText, originalMessage: "(injected mid-turn)",
-                            timestamp: Date.now(),
-                            messageId: injMessageId,
-                            model: effectiveModel,
-                        };
-                        const injFile = path.join(QUEUE_OUTGOING, `${channel}_${injMessageId}_${Date.now()}.json`);
-                        const injTmp = injFile + ".tmp";
-                        fs.writeFileSync(injTmp, JSON.stringify(injOutgoing, null, 2));
-                        fs.renameSync(injTmp, injFile);
-
-                        clearStatus(injMessageId);
-                        log("INFO", `Injected response ready thread=${threadId} (${injText.length} chars)`);
-                    } catch (injErr) {
-                        clearInterval(injStatusInterval);
-                        clearStatus(injMessageId);
-                        log("WARN", `Injected response error for thread ${threadId}: ${toErrorMessage(injErr)}`);
-                        sessionPool.close(threadId);
-                        break;
-                    }
-                }
-            }
+            // Regular messages are handled by the streaming channel in processQueue.
+            // If we get here, it's a regular message that somehow ended up in processMessage
+            // (shouldn't happen with the new architecture). Log and skip.
+            log("WARN", `Regular message in processMessage — should be handled by streaming channel: thread=${threadId} messageId=${messageId}`);
+            effectiveModel = "sonnet";
+            responseText = "(Message routed incorrectly — please retry)";
         }
     } catch (error) {
         const errorMsg = toErrorMessage(error);
@@ -2463,7 +2075,7 @@ async function processMessage(messageFile: string): Promise<void> {
             }
         }
 
-        clearStatus(messageId);
+        clearStatus(threadId);
         handleRetry(processingFile, filename, retryCount);
     }
 }
@@ -2633,24 +2245,24 @@ async function processQueue(): Promise<void> {
                     if (typeof retryAfter === "number" && Date.now() < retryAfter) continue;
                 }
                 const parsed = IncomingMessageSchema.safeParse(raw);
-                if (!parsed.success) continue; // Skip malformed messages — processMessage will handle them
+                if (!parsed.success) continue;
                 msg = parsed.data;
             } catch {
                 continue; // File may have been picked up by a concurrent scan
             }
 
-            // If thread is busy, inject the message into the running session.
-            // The SDK queues it and processes it after the current turn completes.
-            // The slurp loop in processMessage consumes the response.
-            if (activeThreads.has(msg.threadId)) {
+            // ─── Streaming channel: push into existing session ───
+            // If a consumer is running for this thread, push the message into the
+            // session channel. The consumer handles it — no separate tracking needed.
+            if (activeConsumers.has(msg.threadId)) {
                 if (!msg.message.startsWith("/") &&
                     msg.source !== "heartbeat" &&
                     msg.source !== "scheduled-task" &&
                     msg.source !== "one-shot") {
                     const now = formatCurrentTime();
                     const prefix = buildSourcePrefix(msg);
-                    const injectPrompt = `[${now}] ${prefix} ${msg.message}`;
-                    if (sessionPool.injectMessage(msg.threadId, injectPrompt)) {
+                    const pushPrompt = `[${now}] ${prefix} ${msg.message}`;
+                    if (sessionPool.pushMessage(msg.threadId, pushPrompt)) {
                         // Log incoming to history
                         appendHistory({
                             ts: Date.now(),
@@ -2663,13 +2275,11 @@ async function processQueue(): Promise<void> {
                             sourceThreadId: msg.sourceThreadId,
                             messageId: msg.messageId,
                         });
-                        // Track messageId so the consume loop can write proper status files
-                        const ids = injectedMessageIds.get(msg.threadId) ?? [];
-                        ids.push(msg.messageId);
-                        injectedMessageIds.set(msg.threadId, ids);
+                        // Update the status anchor to the latest user message
+                        updateThreadStatusAnchor(QUEUE_STATUS, msg.threadId, msg.messageId);
                         // Delete queue file — message is in the channel now
                         try { fs.unlinkSync(file.path); } catch {}
-                        log("INFO", `Injected message into running session for thread ${msg.threadId} from ${msg.sender}: ${msg.message.substring(0, 60)}`);
+                        log("INFO", `Pushed message into channel for thread ${msg.threadId} from ${msg.sender}: ${msg.message.substring(0, 60)}`);
                     }
                 }
                 continue;
@@ -2680,11 +2290,39 @@ async function processQueue(): Promise<void> {
             // Only 1 scheduled task at a time
             if (msg.source === 'scheduled-task' && activeScheduledTaskCount >= 1) continue;
 
-            // Coalesce: grab other queued messages for the same thread
-            // Skip command messages (starting with /), non-user sources, and voice messages
+            // ─── One-shot paths: dispatch to existing handlers (unchanged) ───
+            if (msg.source === "heartbeat" || msg.source === "scheduled-task" || msg.source === "one-shot") {
+                // These use their own one-shot query() calls, not the streaming channel
+                activeCount++;
+                if (msg.source === 'heartbeat') activeHeartbeatCount++;
+                if (msg.source === 'scheduled-task') activeScheduledTaskCount++;
+
+                log("INFO", `Dispatching ${msg.source} thread=${msg.threadId} (active: ${activeCount}/${maxConcurrent})`);
+
+                processMessage(file.path).finally(() => {
+                    activeCount--;
+                    if (msg.source === 'heartbeat') activeHeartbeatCount--;
+                    if (msg.source === 'scheduled-task') activeScheduledTaskCount--;
+                    void processQueue();
+                });
+                continue;
+            }
+
+            // ─── Commands: dispatch to processMessage for handling ───
+            if (msg.message.startsWith("/")) {
+                activeCount++;
+                log("INFO", `Dispatching command thread=${msg.threadId} (active: ${activeCount}/${maxConcurrent})`);
+                processMessage(file.path).finally(() => {
+                    activeCount--;
+                    void processQueue();
+                });
+                continue;
+            }
+
+            // ─── Coalesce queued messages for the same thread ───
             const coalesced: QueueFile[] = [];
             const hasImage = !!(msg.imagePath || msg.imagePaths?.length);
-            if (!msg.message.startsWith("/") && !msg.audioPath) {
+            if (!msg.audioPath) {
                 for (const other of files) {
                     if (other === file) continue;
                     try {
@@ -2695,66 +2333,156 @@ async function processQueue(): Promise<void> {
                         if (otherMsg.threadId !== msg.threadId) continue;
                         if (otherMsg.message.startsWith("/")) continue;
                         if (otherMsg.audioPath) continue;
+                        if (otherMsg.source === "heartbeat" || otherMsg.source === "scheduled-task" || otherMsg.source === "one-shot") continue;
                         const otherHasImage = !!(otherMsg.imagePath || otherMsg.imagePaths?.length);
-                        // Don't mix image and non-image messages in coalescing
                         if (hasImage !== otherHasImage) continue;
                         coalesced.push(other);
                         if (otherHasImage) {
-                            // Merge image paths into imagePaths array
                             if (!msg.imagePaths) msg.imagePaths = msg.imagePath ? [msg.imagePath] : [];
                             if (otherMsg.imagePaths?.length) {
                                 msg.imagePaths.push(...otherMsg.imagePaths);
                             } else if (otherMsg.imagePath) {
                                 msg.imagePaths.push(otherMsg.imagePath);
                             }
-                            // Merge captions
                             if (otherMsg.message) {
                                 msg.message = msg.message ? msg.message + "\n\n" + otherMsg.message : otherMsg.message;
                             }
                         } else {
-                            // Append text to primary message
                             msg.message = msg.message + "\n\n" + otherMsg.message;
                         }
                     } catch { continue; }
                 }
 
                 if (coalesced.length > 0) {
-                    // Rewrite primary queue file with coalesced text
                     try {
                         const tmpFile = file.path + ".tmp";
                         fs.writeFileSync(tmpFile, JSON.stringify(msg, null, 2));
                         fs.renameSync(tmpFile, file.path);
                     } catch { /* proceed with original if rewrite fails */ }
-
-                    // Delete coalesced files
                     for (const cf of coalesced) {
                         try { fs.unlinkSync(cf.path); } catch { /* best effort */ }
                     }
-
                     log("INFO", `Coalesced ${coalesced.length + 1} messages for thread ${msg.threadId}`);
                 }
             }
 
-            // Claim the slot
+            // ─── Streaming channel: create session + start consumer ───
+            const { channel, threadId, sender, messageId, source } = msg;
+
+            // Log incoming message to history
+            appendHistory({
+                ts: Date.now(), threadId, channel, sender,
+                direction: "in", message: msg.message,
+                source: source ?? "user",
+                sourceThreadId: msg.sourceThreadId, messageId,
+            });
+
+            // Load/create thread config
+            const threads = loadThreads();
+            const key = String(threadId);
+            let threadConfig = threads[key];
+            if (!threadConfig) {
+                const defaultCwd = process.env.DEFAULT_CWD || process.cwd();
+                threadConfig = {
+                    name: msg.topicName ?? `Thread ${threadId}`,
+                    cwd: defaultCwd, model: "sonnet",
+                    isMaster: false, lastActive: Date.now(),
+                };
+                threads[key] = threadConfig;
+                saveThreads(threads);
+            } else if (msg.topicName && threadConfig.name === `Thread ${threadId}`) {
+                threadConfig.name = msg.topicName;
+                saveThreads(threads);
+            }
+            threads[key].lastActive = Date.now();
+
+            // Determine model
+            let effectiveModel: string;
+            if (isBudgetMode()) {
+                effectiveModel = BUDGET_MODEL;
+            } else {
+                effectiveModel = threadConfig.model || DEFAULT_THREAD_MODEL;
+            }
+
+            // Build prompt
+            const now = formatCurrentTime();
+            const prefix = buildSourcePrefix(msg);
+            const isNewSession = !threadConfig.sessionId;
+            const historyContext = isNewSession ? buildHistoryContext(threadId, threadConfig.isMaster) : "";
+            let fullPrompt: string;
+            if (isNewSession) {
+                const contextBlock = historyContext ? `\n\n${historyContext}\n\n` : "\n\n";
+                fullPrompt = `[${now}]${contextBlock}${prefix} ${msg.message}`;
+            } else {
+                fullPrompt = `[${now}] ${prefix} ${msg.message}`;
+            }
+
+            const threadPrompt = buildThreadPrompt(threadConfig, { threadId, model: effectiveModel });
+            logPrompt({
+                threadId, messageId, model: effectiveModel,
+                systemPromptAppend: threadPrompt,
+                userMessage: `${prefix} ${msg.message}`,
+                historyInjected: isNewSession,
+                historyLines: isNewSession ? historyContext.split("\n").length - 1 : 0,
+                promptLength: fullPrompt.length,
+            });
+
+            // Budget proxy setup
+            let budgetUsageId: string | undefined;
+            if (isBudgetMode() || effectiveModel.includes("fireworks")) {
+                budgetUsageId = crypto.randomUUID();
+                const pendingFile = path.join(BORG_DIR, `minimax-usage-${budgetUsageId}.pending`);
+                fs.writeFileSync(pendingFile, "");
+                process.env.ANTHROPIC_BASE_URL = `${BUDGET_PROXY_URL}/${budgetUsageId}`;
+            }
+
+            // Build query options
+            const stderrLines: string[] = [];
+            const options = await buildQueryOptions(threadId, threadConfig, effectiveModel, stderrLines, msg.message);
+
+            // Try to reuse existing session or create new one.
+            // For reused sessions, we need to push the message AFTER the consumer
+            // is set up on the iterator — otherwise events get lost.
+            let q: Query;
+            let needsPush = false;
+            const claimed = sessionPool.tryClaimSession(threadId, effectiveModel, threadConfig.cwd);
+            if (claimed) {
+                q = claimed.query;
+                needsPush = true; // Push after consumer starts
+            } else {
+                // createSession queues firstPrompt in the channel automatically
+                q = sessionPool.createSession(threadId, fullPrompt, options, effectiveModel, threadConfig.cwd);
+            }
+
+            // Claim active slot
             activeCount++;
-            activeThreads.add(msg.threadId);
-            if (msg.source === 'heartbeat') activeHeartbeatCount++;
-            if (msg.source === 'scheduled-task') activeScheduledTaskCount++;
+            log("INFO", `Dispatching thread=${threadId} via streaming channel (active: ${activeCount}/${maxConcurrent})`);
 
-            log(
-                "INFO",
-                `Dispatching thread=${msg.threadId} (active: ${activeCount}/${maxConcurrent})`,
-            );
-
-            // Fire off processing — don't await, allow parallel execution
-            processMessage(file.path).finally(() => {
+            // Start the event consumer (fire-and-forget)
+            const consumerPromise = consumeThreadEvents(
+                threadId, q, channel, sender, effectiveModel, messageId, threadConfig.cwd,
+            ).catch(err => {
+                log("ERROR", `Consumer error thread ${threadId}: ${toErrorMessage(err)}`);
+            }).finally(() => {
                 activeCount--;
-                activeThreads.delete(msg.threadId);
-                if (msg.source === 'heartbeat') activeHeartbeatCount--;
-                if (msg.source === 'scheduled-task') activeScheduledTaskCount--;
-                // Re-scan queue for more work
+                activeConsumers.delete(threadId);
+                // Clean up budget usage files
+                if (budgetUsageId) {
+                    const pendingFile = path.join(BORG_DIR, `minimax-usage-${budgetUsageId}.pending`);
+                    try { if (fs.existsSync(pendingFile)) fs.unlinkSync(pendingFile); } catch {}
+                }
                 void processQueue();
             });
+            activeConsumers.set(threadId, consumerPromise);
+
+            // For reused sessions, push the message now. The consumer is already
+            // waiting on iterator.next(), so the message flows through immediately.
+            if (needsPush && claimed) {
+                claimed.pushMessage(fullPrompt);
+            }
+
+            // Delete queue file
+            try { fs.unlinkSync(file.path); } catch {}
         }
     } catch (error) {
         log("ERROR", `Queue scan error: ${toErrorMessage(error)}`);
@@ -2773,7 +2501,7 @@ async function shutdown(signal: string): Promise<void> {
 
     log(
         "INFO",
-        `Received ${signal}. Shutting down... (${activeCount} active session(s), ${activeBackgroundMonitors.size} background monitor(s), ${sessionPool.size} pooled session(s))`,
+        `Received ${signal}. Shutting down... (${activeCount} active session(s), ${activeConsumers.size} consumer(s), ${activeBackgroundMonitors.size} background monitor(s), ${sessionPool.size} pooled session(s))`,
     );
 
     clearInterval(queueInterval);

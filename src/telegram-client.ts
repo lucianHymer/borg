@@ -7,6 +7,7 @@
 import fs from "fs";
 import path from "path";
 import { Bot, Context, API_CONSTANTS, InlineKeyboard, InputFile } from "grammy";
+import { readThreadStatus, listActiveThreadStatuses, type ThreadStatusData } from "./thread-status.js";
 import { autoRetry } from "@grammyjs/auto-retry";
 import {
     loadThreads,
@@ -103,20 +104,6 @@ function resolveZoneCancelDir(threadId: number): string {
         return path.join(SCRIPT_DIR, `.borg-${zone}/queue/cancel`);
     } catch {
         return path.join(SCRIPT_DIR, ".borg-core/queue/cancel");
-    }
-}
-
-/**
- * Resolve the processing queue directory for a thread's zone.
- */
-function resolveZoneProcessingDir(threadId: number): string {
-    try {
-        const config = loadZoneConfig(ZONE_CONFIG_PATH);
-        if (!config) return path.join(SCRIPT_DIR, ".borg-core/queue/processing");
-        const zone = getThreadZone(config, threadId);
-        return path.join(SCRIPT_DIR, `.borg-${zone}/queue/processing`);
-    } catch {
-        return path.join(SCRIPT_DIR, ".borg-core/queue/processing");
     }
 }
 
@@ -296,8 +283,30 @@ interface PendingMessage {
 
 const pendingMessages = new Map<string, PendingMessage>();
 const telegramToQueueId = new Map<number, string>(); // Telegram message_id → queue messageId
+
+// ─── Stream Block Tracking ───
+// Maps anchorMessageId → array of Telegram message_ids for streamed text blocks.
+// Used by streamComplete to add Listen button to the last block.
+const streamBlocks = new Map<string, number[]>();
 const listenInFlight = new Set<number>(); // track message IDs being processed for TTS
 const voiceButtonsInFlight = new Set<string>(); // track voice button callbacks being processed
+
+// ─── Per-Thread Status Tracking ───
+// Tracks the Telegram status indicator message for each thread.
+// The status file (written by queue-processor) is the source of truth;
+// this map tracks the Telegram message we created to display it.
+interface ThreadStatusState {
+    chatId: number;
+    threadId: number;
+    statusMessageId?: number;          // Telegram message_id of the status indicator
+    anchoredToMessageId?: string;      // queue messageId the status is anchored to
+    anchoredTelegramId?: number;       // Telegram message_id for reply_parameters
+    lastStatusText?: string;
+    lastStatusLabel?: string;
+    lastPreview?: string;
+    lastEditTs?: number;
+}
+const threadStatusMap = new Map<number, ThreadStatusState>();
 
 // ─── Message Splitting ───
 
@@ -1286,82 +1295,8 @@ bot.on("message:document").filter(
 
 // ─── Edited Message Handler ───
 
-bot.on("edited_message:text", async (ctx) => {
-    const editedMsg = ctx.editedMessage;
-    if (!editedMsg || ctx.from.id === bot.botInfo.id) return;
-
-    const telegramMsgId = editedMsg.message_id;
-    const queueMessageId = telegramToQueueId.get(telegramMsgId);
-    if (!queueMessageId) return; // Not a tracked message — ignore silently
-
-    const newText = editedMsg.text?.trim() ?? "";
-    const threadId = editedMsg.message_thread_id ?? 1;
-
-    // Check if it's still queued (file in incoming/)
-    const incomingDir = resolveIncomingForThread(threadId);
-    const queueFile = path.join(incomingDir, `telegram_${queueMessageId}.json`);
-    if (fs.existsSync(queueFile)) {
-        if (newText === "") {
-            // Empty edit = delete the queued message
-            try {
-                fs.unlinkSync(queueFile);
-                pendingMessages.delete(queueMessageId);
-                telegramToQueueId.delete(telegramMsgId);
-                log("INFO", `Deleted queued message ${queueMessageId} (edited to empty)`);
-                await bot.api.setMessageReaction(ctx.chat!.id, telegramMsgId,
-                    [{ type: "emoji", emoji: "👌" as any }]).catch(() => {});
-            } catch {
-                log("WARN", `Failed to delete queued message file for ${queueMessageId}`);
-            }
-        } else {
-            // Rewrite the queue file with updated text
-            try {
-                const raw = JSON.parse(fs.readFileSync(queueFile, "utf8"));
-                raw.message = newText;
-                const tmpFile = queueFile + ".tmp";
-                fs.writeFileSync(tmpFile, JSON.stringify(raw, null, 2));
-                fs.renameSync(tmpFile, queueFile);
-                log("INFO", `Updated queued message ${queueMessageId}: ${newText.substring(0, 80)}`);
-                await bot.api.setMessageReaction(ctx.chat!.id, telegramMsgId,
-                    [{ type: "emoji", emoji: "✍" as any }]).catch(() => {});
-            } catch {
-                log("WARN", `Failed to rewrite queued message file for ${queueMessageId}`);
-            }
-        }
-        return;
-    }
-
-    // Check if it's currently processing
-    const processingDir = resolveZoneProcessingDir(threadId);
-    const processingFile = path.join(processingDir, `telegram_${queueMessageId}.json`);
-    if (fs.existsSync(processingFile)) {
-        const pending = pendingMessages.get(queueMessageId);
-        if (pending) {
-            let originalText = "";
-            try {
-                const raw = JSON.parse(fs.readFileSync(processingFile, "utf8"));
-                originalText = raw.message ?? "";
-            } catch { /* best effort */ }
-
-            const warning = originalText
-                ? `⚠️ Edit received but already processing. Original text was:\n\n${originalText}`
-                : `⚠️ Edit received but already processing.`;
-
-            const threadOpt = getThreadOpt(pending);
-            await bot.api.sendMessage(
-                pending.chatId,
-                warning,
-                {
-                    message_thread_id: threadOpt,
-                    reply_parameters: { message_id: telegramMsgId },
-                },
-            ).catch(() => {});
-        }
-        return;
-    }
-
-    // Already done — ignore silently
-});
+// Edit-pending-message support removed — streaming channel architecture pushes
+// messages immediately into the session, so there's no queue file to edit.
 
 // ─── Model Reaction Emoji (single source of truth) ───
 
@@ -1414,12 +1349,118 @@ async function pollOutgoingQueue(): Promise<void> {
             }
         }
 
+        // Sort by filename to ensure streaming blocks arrive in order
+        allFiles.sort((a, b) => a.file.localeCompare(b.file));
+
         for (const { file, filePath } of allFiles) {
 
             try {
                 const data: OutgoingMessage = JSON.parse(fs.readFileSync(filePath, "utf8"));
 
                 let firstSentId: number | undefined;
+
+                // ─── Streaming text block ───
+                if (data.streaming) {
+                    const chatId = settings.telegram_chat_id;
+                    const pending = pendingMessages.get(data.messageId);
+                    const threadId = data.threadId;
+                    const threadOpt = threadId && threadId !== 1
+                        ? { message_thread_id: threadId }
+                        : {};
+
+                    // On first block (sequence 0), delete the status message
+                    if (data.streamSequence === 0) {
+                        const threadState = threadStatusMap.get(threadId);
+                        if (threadState?.statusMessageId) {
+                            try {
+                                await bot.api.deleteMessage(threadState.chatId, threadState.statusMessageId);
+                            } catch { /* may already be deleted */ }
+                            threadState.statusMessageId = undefined;
+                        }
+                    }
+
+                    // Send text block as a new Telegram message
+                    const markdownV2Text = toTelegramMarkdownV2(data.message);
+                    const chunks = splitMessage(markdownV2Text);
+
+                    // Reply to user's original message on first block
+                    const replyParams = data.streamSequence === 0 && pending && pending.telegramMessageId > 0
+                        ? { reply_parameters: { message_id: pending.telegramMessageId } }
+                        : {};
+
+                    for (let i = 0; i < chunks.length; i++) {
+                        try {
+                            const sent = await bot.api.sendMessage(chatId, chunks[i], {
+                                ...threadOpt,
+                                parse_mode: "MarkdownV2" as const,
+                                ...(i === 0 ? replyParams : {}),
+                                disable_notification: data.streamSequence !== 0, // Only first block notifies
+                            });
+
+                            // Track the Telegram message_id for this stream
+                            const blocks = streamBlocks.get(data.messageId) ?? [];
+                            blocks.push(sent.message_id);
+                            streamBlocks.set(data.messageId, blocks);
+
+                            // Add model reaction on first block
+                            if (data.streamSequence === 0 && i === 0 && data.model) {
+                                storeMessageModel(sent.message_id, data.model, threadId, data.message);
+                                await reactWithModel(chatId, sent.message_id, data.model);
+                            }
+                        } catch (sendErr) {
+                            // Plain text fallback for markdown parse errors
+                            const errMsg = toErrorMessage(sendErr);
+                            if (errMsg.includes("can't parse entities")) {
+                                try {
+                                    const sent = await bot.api.sendMessage(chatId, data.message, {
+                                        ...threadOpt,
+                                        ...(i === 0 ? replyParams : {}),
+                                        disable_notification: data.streamSequence !== 0,
+                                    });
+                                    const blocks = streamBlocks.get(data.messageId) ?? [];
+                                    blocks.push(sent.message_id);
+                                    streamBlocks.set(data.messageId, blocks);
+                                } catch { /* give up on this chunk */ }
+                            } else {
+                                log("WARN", `Failed to send streaming block: ${errMsg}`);
+                            }
+                        }
+                    }
+
+                    fs.unlinkSync(filePath);
+                    continue;
+                }
+
+                // ─── Stream complete marker ───
+                if (data.streamComplete) {
+                    const blocks = streamBlocks.get(data.messageId);
+                    const lastBlockId = blocks?.[blocks.length - 1];
+                    const chatId = settings.telegram_chat_id;
+
+                    // Add Listen button to the last text block
+                    if (lastBlockId) {
+                        try {
+                            const keyboard = buildReplyKeyboard(lastBlockId, undefined, undefined, data.messageId);
+                            await bot.api.editMessageReplyMarkup(chatId, lastBlockId, {
+                                reply_markup: keyboard,
+                            });
+                        } catch { /* Buttons are best-effort */ }
+
+                        // Store accumulated text for TTS on the first block
+                        if (blocks && blocks.length > 0 && data.accumulatedText && data.model) {
+                            storeMessageModel(blocks[0], data.model, data.threadId, data.accumulatedText);
+                        }
+                    }
+
+                    // Clean up
+                    streamBlocks.delete(data.messageId);
+                    pendingMessages.delete(data.messageId);
+                    telegramToQueueId.delete(pendingMessages.get(data.messageId)?.telegramMessageId ?? -1);
+
+                    fs.unlinkSync(filePath);
+                    log("INFO", `Stream complete for thread ${data.threadId} (${blocks?.length ?? 0} block(s))`);
+                    continue;
+                }
 
                 if (data.crossThread && data.targetThreadId && data.sourceThreadId) {
                     // Cross-thread message: infra handles zone routing
@@ -1584,22 +1625,18 @@ async function pollOutgoingQueue(): Promise<void> {
                     const pending = pendingMessages.get(data.messageId);
 
                     if (pending) {
-                        // Delete status file FIRST to prevent pollStatusFiles from overwriting final response
-                        try {
-                            const statusFile = findStatusFile(data.messageId);
-                            if (statusFile) fs.unlinkSync(statusFile);
-                        } catch { /* may not exist */ }
-
                         // Convert Claude's GFM output to Telegram MarkdownV2
                         const markdownV2Response = toTelegramMarkdownV2(data.message);
                         const chunks = splitMessage(markdownV2Response);
 
-                        // Delete the silent status message so the final response
+                        // Delete the thread's status message so the final response
                         // arrives as a fresh message with a normal notification
-                        if (pending.statusMessageId) {
+                        const threadState = threadStatusMap.get(pending.threadId);
+                        if (threadState?.statusMessageId) {
                             try {
-                                await bot.api.deleteMessage(pending.chatId, pending.statusMessageId);
+                                await bot.api.deleteMessage(threadState.chatId, threadState.statusMessageId);
                             } catch { /* may already be deleted */ }
+                            threadState.statusMessageId = undefined;
                         }
 
                         // Send all chunks as new messages, replying to the user's original
@@ -1804,16 +1841,6 @@ function cleanupPendingMessages(): void {
         const timestamp = parseInt(tsStr, 10);
 
         if (!Number.isFinite(timestamp) || now - timestamp > timeout) {
-            // Delete Telegram status message if it exists
-            if (pending.statusMessageId) {
-                bot.api.deleteMessage(pending.chatId, pending.statusMessageId).catch(() => {});
-            }
-            // Delete status file if it exists
-            try {
-                const statusFile = findStatusFile(messageId);
-                if (statusFile) fs.unlinkSync(statusFile);
-            } catch { /* best effort */ }
-
             telegramToQueueId.delete(pending.telegramMessageId);
             pendingMessages.delete(messageId);
             log("DEBUG", `Cleaned up stale pending message: ${messageId}`);
@@ -1825,6 +1852,15 @@ function cleanupPendingMessages(): void {
  * Find a status file by messageId across all zone status directories.
  * Returns the full path if found, null otherwise.
  */
+function findThreadStatusData(threadId: number): ThreadStatusData | null {
+    for (const dir of ZONE_STATUS_DIRS) {
+        const data = readThreadStatus(dir, threadId);
+        if (data) return data;
+    }
+    return null;
+}
+
+// Legacy: find old per-messageId status files (for cleanup during migration)
 function findStatusFile(messageId: string): string | null {
     for (const dir of ZONE_STATUS_DIRS) {
         const filePath = path.join(dir, `${messageId}.json`);
@@ -1833,105 +1869,139 @@ function findStatusFile(messageId: string): string | null {
     return null;
 }
 
-// ─── Status File Polling ───
+// ─── Thread Status Polling ───
+// Scans zone status dirs for thread-keyed status files. For each active
+// thread, creates/updates a Telegram status message. When the anchor
+// changes (user sent a new message), the status message migrates to
+// appear below the latest user message.
 
-async function pollStatusFiles(): Promise<void> {
+async function pollThreadStatus(): Promise<void> {
     if (statusPollActive) return;
     statusPollActive = true;
     try {
-    for (const [messageId, pending] of pendingMessages) {
-        const statusFile = findStatusFile(messageId);
-
-        let statusData: { label: string; ts: number; startTs: number; preview?: string };
-        try {
-            if (!statusFile) continue;
-            statusData = JSON.parse(fs.readFileSync(statusFile, "utf8"));
-            if (!statusData.label || !statusData.startTs) continue; // invalid format
-        } catch {
-            continue; // File may be mid-write or already deleted
-        }
-
-        // Compute elapsed time from processing start
-        const elapsed = Math.round((Date.now() - statusData.startTs) / 1000);
-
-        // Detect stalled processing (queue processor refreshes every 2s during SDK work;
-        // STT/Listening has no refresh interval so use a longer threshold)
-        const stalledThreshold = statusData.label === "Listening" ? 180_000 : 15_000;
-        const isStale = Date.now() - statusData.ts > stalledThreshold;
-        let statusLine = isStale
-            ? `🕐 ${statusData.label}... — stalled`
-            : `🕐 ${statusData.label}... (${elapsed}s)`;
-
-        // Append preview text from latest assistant message (if available)
-        const previewText = statusData.preview;
-        let displayText: string;
-        if (previewText) {
-            // Truncate preview for Telegram message limits — show tail (latest text)
-            const maxPreview = 500;
-            const truncated = previewText.length > maxPreview
-                ? "…" + previewText.slice(-maxPreview)
-                : previewText;
-            displayText = `${statusLine}\n\n💬 ${truncated}\n\n[still processing...]`;
-        } else {
-            displayText = statusLine;
-        }
-
-        // Check if anything changed (status line, preview, or stale state)
-        const previewChanged = previewText !== pending.lastPreview;
-        const labelChanged = statusData.label !== pending.lastStatusLabel;
-        const timeSinceLastEdit = Date.now() - (pending.lastEditTs ?? 0);
-
-        // Skip if nothing has changed
-        if (displayText === pending.lastStatusText) continue;
-
-        // Throttle: label/preview changes edit immediately, timer-only throttle to 20s
-        if (!labelChanged && !previewChanged && !isStale && timeSinceLastEdit < 20_000) continue;
-
-        let cancelKeyboard: InlineKeyboard | undefined;
-        if (statusData.label !== "Cancelled") {
-            cancelKeyboard = new InlineKeyboard().text("✕ Cancel", `cancel:${messageId}`);
-            if (settings.dashboard_url) {
-                const dashUrl = `${settings.dashboard_url.replace(/\/$/, '')}/response/${messageId}`;
-                cancelKeyboard.url("📊 Live", dashUrl);
+        // Collect all active thread IDs from all zone dirs
+        const activeThreadIds = new Set<number>();
+        for (const dir of ZONE_STATUS_DIRS) {
+            for (const tid of listActiveThreadStatuses(dir)) {
+                activeThreadIds.add(tid);
             }
         }
 
-        try {
-            if (pending.statusMessageId) {
-                // Edit existing status message
-                await bot.api.editMessageText(
-                    pending.chatId,
-                    pending.statusMessageId,
-                    displayText,
-                    {
-                        reply_markup: cancelKeyboard,
-                    },
-                );
+        // Process each active thread's status
+        for (const threadId of activeThreadIds) {
+            const statusData = findThreadStatusData(threadId);
+            if (!statusData) continue;
+
+            let state = threadStatusMap.get(threadId);
+            if (!state) {
+                state = {
+                    chatId: Number(settings.telegram_chat_id),
+                    threadId,
+                };
+                threadStatusMap.set(threadId, state);
+            }
+
+            // Anchor migration: if the anchor changed, delete old status msg and reset
+            if (state.anchoredToMessageId !== statusData.anchorMessageId) {
+                if (state.statusMessageId) {
+                    try {
+                        await bot.api.deleteMessage(state.chatId, state.statusMessageId);
+                    } catch { /* may already be deleted */ }
+                    state.statusMessageId = undefined;
+                }
+                state.anchoredToMessageId = statusData.anchorMessageId;
+                // Look up Telegram message_id for the new anchor
+                const pending = pendingMessages.get(statusData.anchorMessageId);
+                state.anchoredTelegramId = pending?.telegramMessageId;
+                state.lastStatusText = undefined; // force re-render
+            }
+
+            // Compute elapsed time from processing start
+            const elapsed = Math.round((Date.now() - statusData.startTs) / 1000);
+
+            // Detect stalled processing
+            const stalledThreshold = statusData.label === "Listening" ? 180_000 : 15_000;
+            const isStale = Date.now() - statusData.ts > stalledThreshold;
+            const statusLine = isStale
+                ? `🕐 ${statusData.label}... — stalled`
+                : `🕐 ${statusData.label}... (${elapsed}s)`;
+
+            // Append preview text
+            const previewText = statusData.preview;
+            let displayText: string;
+            if (previewText) {
+                const maxPreview = 500;
+                const truncated = previewText.length > maxPreview
+                    ? "…" + previewText.slice(-maxPreview)
+                    : previewText;
+                displayText = `${statusLine}\n\n💬 ${truncated}\n\n[still processing...]`;
             } else {
-                // Send new status message as reply to original
-                const replyOpts = pending.telegramMessageId > 0
-                    ? { reply_parameters: { message_id: pending.telegramMessageId } }
-                    : {};
-                const sent = await bot.api.sendMessage(
-                    pending.chatId,
-                    displayText,
-                    {
-                        message_thread_id: getThreadOpt(pending),
-                        reply_markup: cancelKeyboard,
-                        disable_notification: true,
-                        ...replyOpts,
-                    },
-                );
-                pending.statusMessageId = sent.message_id;
+                displayText = statusLine;
             }
-            pending.lastStatusText = displayText;
-            pending.lastStatusLabel = statusData.label;
-            pending.lastPreview = previewText;
-            pending.lastEditTs = Date.now();
-        } catch {
-            // editMessageText may fail if message was deleted or content unchanged — ignore
+
+            // Change detection & throttling
+            const previewChanged = previewText !== state.lastPreview;
+            const labelChanged = statusData.label !== state.lastStatusLabel;
+            const timeSinceLastEdit = Date.now() - (state.lastEditTs ?? 0);
+            if (displayText === state.lastStatusText) continue;
+            if (!labelChanged && !previewChanged && !isStale && timeSinceLastEdit < 20_000) continue;
+
+            // Cancel button — references the current anchor messageId
+            let cancelKeyboard: InlineKeyboard | undefined;
+            if (statusData.label !== "Cancelled") {
+                cancelKeyboard = new InlineKeyboard().text("✕ Cancel", `cancel:${statusData.anchorMessageId}`);
+                if (settings.dashboard_url) {
+                    const dashUrl = `${settings.dashboard_url.replace(/\/$/, '')}/response/${statusData.anchorMessageId}`;
+                    cancelKeyboard.url("📊 Live", dashUrl);
+                }
+            }
+
+            try {
+                if (state.statusMessageId) {
+                    // Edit existing status message
+                    await bot.api.editMessageText(
+                        state.chatId,
+                        state.statusMessageId,
+                        displayText,
+                        { reply_markup: cancelKeyboard },
+                    );
+                } else {
+                    // Send new status message, replying to the anchor
+                    const replyOpts = state.anchoredTelegramId && state.anchoredTelegramId > 0
+                        ? { reply_parameters: { message_id: state.anchoredTelegramId } }
+                        : {};
+                    const sent = await bot.api.sendMessage(
+                        state.chatId,
+                        displayText,
+                        {
+                            message_thread_id: threadId === 1 ? undefined : threadId,
+                            reply_markup: cancelKeyboard,
+                            disable_notification: true,
+                            ...replyOpts,
+                        },
+                    );
+                    state.statusMessageId = sent.message_id;
+                }
+                state.lastStatusText = displayText;
+                state.lastStatusLabel = statusData.label;
+                state.lastPreview = previewText;
+                state.lastEditTs = Date.now();
+            } catch {
+                // editMessageText may fail if message was deleted or content unchanged — ignore
+            }
         }
-    }
+
+        // Clean up threadStatusMap entries where status file no longer exists
+        for (const [threadId, state] of threadStatusMap) {
+            if (!activeThreadIds.has(threadId)) {
+                if (state.statusMessageId) {
+                    try {
+                        await bot.api.deleteMessage(state.chatId, state.statusMessageId);
+                    } catch { /* may already be deleted */ }
+                }
+                threadStatusMap.delete(threadId);
+            }
+        }
     } finally {
         statusPollActive = false;
     }
@@ -2524,7 +2594,7 @@ setInterval(sendTypingForPending, 4000);
 setInterval(cleanupPendingMessages, 60_000);
 
 // Poll status files every 2 seconds for tool use visibility
-setInterval(pollStatusFiles, 2000);
+setInterval(pollThreadStatus, 2000);
 
 // Start periodic audio file cleanup
 startPeriodicCleanup();
