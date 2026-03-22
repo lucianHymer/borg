@@ -1418,6 +1418,17 @@ app.get("/api/response/:messageId", (req, res) => {
             path.join(SCRIPT_DIR, ".borg-perimeter"),
         ];
         for (const dir of zoneDirs) {
+            // Try thread-keyed status file
+            if (resolvedThreadId) {
+                const tf = path.join(dir, "status", `thread_${resolvedThreadId}.json`);
+                if (fs.existsSync(tf)) {
+                    try {
+                        const status = JSON.parse(fs.readFileSync(tf, "utf8"));
+                        if (status.sessionId) { resolvedSessionId = status.sessionId; break; }
+                    } catch { /* best effort */ }
+                }
+            }
+            // Legacy: per-messageId
             const sf = path.join(dir, "status", `${messageId}.json`);
             if (fs.existsSync(sf)) {
                 try {
@@ -1471,7 +1482,16 @@ app.get("/api/response/:messageId/feed", (req, res) => {
             path.join(SCRIPT_DIR, ".borg-core"),
             path.join(SCRIPT_DIR, ".borg-perimeter"),
         ];
+        // Resolve messageId → threadId for thread-keyed status lookup
+        const { incoming, outgoing } = findResponseByMessageId(messageId);
+        const resolvedThreadId = outgoing?.threadId ?? incoming?.threadId;
         for (const dir of zoneDirs) {
+            // Try thread-keyed status file first
+            if (resolvedThreadId) {
+                const threadFile = path.join(dir, "status", `thread_${resolvedThreadId}.json`);
+                if (fs.existsSync(threadFile)) return threadFile;
+            }
+            // Legacy: per-messageId status file
             const statusFile = path.join(dir, "status", `${messageId}.json`);
             if (fs.existsSync(statusFile)) return statusFile;
         }
