@@ -1434,21 +1434,21 @@ async function pollOutgoingQueue(): Promise<void> {
                 // ─── Stream complete marker ───
                 if (data.streamComplete) {
                     const blocks = streamBlocks.get(data.messageId);
-                    const lastBlockId = blocks?.[blocks.length - 1];
                     const chatId = settings.telegram_chat_id;
 
-                    // Add Listen button to the last text block
-                    if (lastBlockId) {
-                        try {
-                            const keyboard = buildReplyKeyboard(lastBlockId, undefined, undefined, data.messageId);
-                            await bot.api.editMessageReplyMarkup(chatId, lastBlockId, {
-                                reply_markup: keyboard,
-                            });
-                        } catch { /* Buttons are best-effort */ }
+                    // Add Listen button to each text block, store full text on each for TTS
+                    if (blocks && blocks.length > 0 && data.accumulatedText) {
+                        for (const blockId of blocks) {
+                            try {
+                                const keyboard = buildReplyKeyboard(blockId, undefined, undefined, data.messageId);
+                                await bot.api.editMessageReplyMarkup(chatId, blockId, {
+                                    reply_markup: keyboard,
+                                });
+                            } catch { /* Buttons are best-effort */ }
 
-                        // Store accumulated text for TTS on the first block
-                        if (blocks && blocks.length > 0 && data.accumulatedText && data.model) {
-                            storeMessageModel(blocks[0], data.model, data.threadId, data.accumulatedText);
+                            if (data.model) {
+                                storeMessageModel(blockId, data.model, data.threadId, data.accumulatedText);
+                            }
                         }
                     }
 
