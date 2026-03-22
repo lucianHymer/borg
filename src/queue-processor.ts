@@ -31,6 +31,7 @@ import type { IncomingMessage, OutgoingMessage, TaskListMapping, BackgroundTaskI
 import {
     appendHistory,
     buildHistoryContext,
+    getRecentHistory,
 } from "./message-history.js";
 import { createBorgMcpServer } from "./mcp-tools.js";
 import { loadZoneConfig, getThreadsInZone } from "./zone-config.js";
@@ -579,6 +580,34 @@ function buildSourcePrefix(msg: IncomingMessage): string {
         "one-shot": `[${msg.sender} via /do]:`,
     };
     return prefixMap[msg.source ?? "user"];
+}
+
+// ─── Recent One-Shot Context Hint ───
+// When a user message arrives shortly after a one-shot (scheduled task, heartbeat,
+// or /do) ran on the same thread, the persistent session has no awareness of that
+// output. This function checks recent history and returns a hint if needed.
+
+const ONE_SHOT_SOURCES = new Set(["scheduled-task", "heartbeat", "one-shot"]);
+
+function getRecentOneShotHint(threadId: number): string {
+    const recent = getRecentHistory({ threadId, limit: 10 });
+    if (recent.length === 0) return "";
+
+    // Find the last outgoing message on this thread
+    const lastOut = [...recent].reverse().find(e => e.direction === "out");
+    if (!lastOut) return "";
+
+    // If the most recent outgoing message was from a one-shot source,
+    // the session doesn't know about it. Once the session responds,
+    // its own message becomes the latest and this hint goes away naturally.
+    if (!lastOut.source || !ONE_SHOT_SOURCES.has(lastOut.source)) return "";
+    if (lastOut.message === "[heartbeat:suppressed]") return "";
+
+    const agoMin = Math.round((Date.now() - lastOut.ts) / 60_000);
+    const sourceLabel = lastOut.source === "scheduled-task"
+        ? "a scheduled task"
+        : lastOut.source === "one-shot" ? "a /do one-shot command" : "a heartbeat";
+    return `[Note: ${sourceLabel} ran on this thread ~${agoMin}m ago and posted a response, but it ran outside your session so you don't have direct context. If the user's message seems to reference something you didn't say, check .borg/message-history.jsonl for threadId ${threadId} to see what was posted.]`;
 }
 
 // ─── Status File Helpers (per-thread) ───
@@ -2077,6 +2106,54 @@ async function processMessage(messageFile: string): Promise<void> {
 
         clearStatus(threadId);
         handleRetry(processingFile, filename, retryCount);
+        return;
+    }
+
+    // ─── Write response to outgoing queue (one-shot paths: scheduled-task, heartbeat, one-shot) ───
+    appendHistory({
+        ts: Date.now(),
+        threadId,
+        channel,
+        sender: "assistant",
+        direction: "out",
+        message: responseText,
+        model: effectiveModel,
+        source: source ?? "user",
+        messageId,
+        ...(scheduledTaskName ? { scheduledTaskName } : {}),
+        ...(usageData ? {
+            costUSD: usageData.totalCostUSD,
+            inputTokens: usageData.inputTokens,
+            outputTokens: usageData.outputTokens,
+            cacheReadInputTokens: usageData.cacheReadInputTokens,
+            cacheCreationInputTokens: usageData.cacheCreationInputTokens,
+            durationMs: usageData.durationMs,
+            durationApiMs: usageData.durationApiMs,
+            numTurns: usageData.numTurns,
+            modelUsage: usageData.modelUsage,
+        } : {}),
+    });
+
+    const responseData: OutgoingMessage = {
+        channel,
+        threadId,
+        sender: "assistant",
+        message: responseText,
+        originalMessage: responseText,
+        timestamp: Date.now(),
+        messageId,
+        model: effectiveModel,
+        ...(scheduledTaskName ? { scheduledTaskName } : {}),
+    };
+
+    const outFile = path.join(QUEUE_OUTGOING, `${messageId}.json`);
+    const tmpFile = outFile + ".tmp";
+    fs.writeFileSync(tmpFile, JSON.stringify(responseData, null, 2));
+    fs.renameSync(tmpFile, outFile);
+
+    // Cleanup processing file
+    if (fs.existsSync(processingFile)) {
+        fs.unlinkSync(processingFile);
     }
 }
 
@@ -2261,7 +2338,10 @@ async function processQueue(): Promise<void> {
                     msg.source !== "one-shot") {
                     const now = formatCurrentTime();
                     const prefix = buildSourcePrefix(msg);
-                    const pushPrompt = `[${now}] ${prefix} ${msg.message}`;
+                    const oneShotHint = getRecentOneShotHint(msg.threadId);
+                    const pushPrompt = oneShotHint
+                        ? `${oneShotHint}\n\n[${now}] ${prefix} ${msg.message}`
+                        : `[${now}] ${prefix} ${msg.message}`;
                     if (sessionPool.pushMessage(msg.threadId, pushPrompt)) {
                         // Log incoming to history
                         appendHistory({
@@ -2409,10 +2489,13 @@ async function processQueue(): Promise<void> {
             const prefix = buildSourcePrefix(msg);
             const isNewSession = !threadConfig.sessionId;
             const historyContext = isNewSession ? buildHistoryContext(threadId, threadConfig.isMaster) : "";
+            const oneShotHint = isNewSession ? "" : getRecentOneShotHint(threadId);
             let fullPrompt: string;
             if (isNewSession) {
                 const contextBlock = historyContext ? `\n\n${historyContext}\n\n` : "\n\n";
                 fullPrompt = `[${now}]${contextBlock}${prefix} ${msg.message}`;
+            } else if (oneShotHint) {
+                fullPrompt = `${oneShotHint}\n\n[${now}] ${prefix} ${msg.message}`;
             } else {
                 fullPrompt = `[${now}] ${prefix} ${msg.message}`;
             }
