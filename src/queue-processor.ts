@@ -2003,6 +2003,17 @@ async function processMessage(messageFile: string): Promise<void> {
                 return;
             }
 
+            // Guard against stale retries: if the task already ran after this queue
+            // file was created, skip it (avoids duplicate execution after restarts)
+            const queuedAtMatch = msg.messageId.match(/^sched_[^_]+_(\d+)_/);
+            const queuedAt = queuedAtMatch ? Number(queuedAtMatch[1]) * 1000 : 0;
+            if (task.lastRunTs && queuedAt && task.lastRunTs > queuedAt) {
+                log("INFO", `Skipping stale scheduled task retry "${task.name}" (queued=${queuedAt}, lastRun=${task.lastRunTs})`);
+                clearStatus(threadId);
+                if (fs.existsSync(processingFile)) fs.unlinkSync(processingFile);
+                return;
+            }
+
             log("INFO", `Running scheduled task "${task.name}" (${task.model})`);
             effectiveModel = isBudgetMode() ? BUDGET_MODEL : task.model;
             scheduledTaskName = task.name;
