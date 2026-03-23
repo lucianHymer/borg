@@ -836,6 +836,46 @@ function extractUsageData(result: SDKResultMessage): QueryUsageData {
     };
 }
 
+// ─── Cost Alert ───
+
+const DEFAULT_COST_ALERT_THRESHOLD = 5; // $5 USD
+
+function writeCostAlert(
+    threadId: number, channel: string, model: string,
+    usage: QueryUsageData, anchorMessageId: string,
+): void {
+    const settings = loadSettings();
+    const threshold = settings.cost_alert_threshold ?? DEFAULT_COST_ALERT_THRESHOLD;
+    if (usage.totalCostUSD < threshold) return;
+
+    const cost = usage.totalCostUSD.toFixed(2);
+    const inputK = Math.round(usage.inputTokens / 1000);
+    const outputK = Math.round(usage.outputTokens / 1000);
+    const cacheReadM = (usage.cacheReadInputTokens / 1_000_000).toFixed(1);
+    const cacheCreateK = Math.round(usage.cacheCreationInputTokens / 1000);
+    const turns = usage.numTurns;
+
+    const alertText = `⚠️ Cost alert: last query cost $${cost} (threshold: $${threshold})\n` +
+        `Model: ${model} · ${turns} turn(s)\n` +
+        `Input: ${inputK}K · Output: ${outputK}K · Cache read: ${cacheReadM}M · Cache create: ${cacheCreateK}K`;
+
+    const alertMsg: OutgoingMessage = {
+        channel, threadId,
+        sender: "system",
+        message: alertText,
+        originalMessage: alertText,
+        timestamp: Date.now(),
+        messageId: `cost_alert_${anchorMessageId}`,
+        model: "system",
+    };
+    const filename = `cost_alert_${threadId}_${Date.now()}.json`;
+    const outFile = path.join(QUEUE_OUTGOING, filename);
+    const tmpFile = outFile + ".tmp";
+    fs.writeFileSync(tmpFile, JSON.stringify(alertMsg, null, 2));
+    fs.renameSync(tmpFile, outFile);
+    log("WARN", `Cost alert: thread=${threadId} cost=$${cost} threshold=$${threshold}`);
+}
+
 // ─── Process a single SDK message (shared between primary and background collection) ───
 
 interface MessageProcessingState {
@@ -1594,6 +1634,7 @@ async function consumeThreadEvents(
                         modelUsage: usage.modelUsage,
                     });
                     writeStreamCompleteOutgoing(threadId, channel, sender, model, accumulated, currentAnchorMessageId);
+                    writeCostAlert(threadId, channel, model, usage, currentAnchorMessageId);
                 } else {
                     // Empty response — still write a marker so telegram-client knows the turn ended
                     writeStreamCompleteOutgoing(threadId, channel, sender, model, "", currentAnchorMessageId);
@@ -2163,6 +2204,11 @@ async function processMessage(messageFile: string): Promise<void> {
     const tmpFile = outFile + ".tmp";
     fs.writeFileSync(tmpFile, JSON.stringify(responseData, null, 2));
     fs.renameSync(tmpFile, outFile);
+
+    // Cost alert for one-shot paths
+    if (usageData) {
+        writeCostAlert(threadId, channel, effectiveModel, usageData, messageId);
+    }
 
     // Cleanup processing file
     if (fs.existsSync(processingFile)) {
