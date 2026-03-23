@@ -192,6 +192,7 @@ services:
       - ./.borg-perimeter/queue/task-stop:/app/.borg-perimeter/queue/task-stop
       - ./threads.json:/app/threads.json:ro
       - ./zone-config.json:/app/zone-config.json:ro
+      - ./settings.json:/app/settings.json:ro
       - ${WORKSPACE_ROOT:-/home/lucian/workspace}:/home/lucian/workspace:ro
     ports:
       - "127.0.0.1:3100:3100"

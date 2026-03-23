@@ -656,6 +656,8 @@ export function createBorgMcpServer(sourceThreadId: number) {
 
             const nextRun = getNextRun(task);
             const settings = loadSettings();
+            const tz = settings.timezone || "UTC";
+            const fmtLocal = (d: Date) => d.toLocaleString("en-US", { timeZone: tz, dateStyle: "short", timeStyle: "short" });
             return {
                 content: [textContent(JSON.stringify({
                     id: task.id,
@@ -665,8 +667,8 @@ export function createBorgMcpServer(sourceThreadId: number) {
                     cwd: task.cwd,
                     reportThreadId: task.reportThreadId,
                     recurring: task.recurring,
-                    nextRun: nextRun?.toISOString() ?? "unknown",
-                    timezone: settings.timezone,
+                    nextRun: nextRun ? fmtLocal(nextRun) : "unknown",
+                    timezone: tz,
                 }, null, 2))],
             };
         },
@@ -683,19 +685,21 @@ export function createBorgMcpServer(sourceThreadId: number) {
             }
 
             const settings = loadSettings();
+            const tz = settings.timezone || "UTC";
+            const fmtLocal = (d: Date) => d.toLocaleString("en-US", { timeZone: tz, dateStyle: "short", timeStyle: "short" });
             const lines = tasks.map(t => {
                 const next = getNextRun(t);
                 return [
                     `ID: ${t.id}`,
                     `  Name: ${t.name}`,
                     `  Model: ${t.model}`,
-                    `  Cron: ${t.cron} (${settings.timezone})`,
+                    `  Cron: ${t.cron} (${tz})`,
                     `  CWD: ${t.cwd}`,
                     `  Report to: Thread ${t.reportThreadId}`,
                     `  Enabled: ${t.enabled}`,
                     `  Recurring: ${t.recurring}`,
-                    `  Next run: ${next?.toISOString() ?? "N/A"}`,
-                    `  Last run: ${t.lastRunTs ? new Date(t.lastRunTs).toISOString() : "never"}`,
+                    `  Next run: ${next ? fmtLocal(next) : "N/A"}`,
+                    `  Last run: ${t.lastRunTs ? fmtLocal(new Date(t.lastRunTs)) : "never"}`,
                     `  Last result: ${t.lastResult ?? "N/A"}`,
                     `  Last cost: ${t.lastCostUSD != null ? `$${t.lastCostUSD.toFixed(4)}` : "N/A"}`,
                 ].join("\n");
@@ -743,8 +747,10 @@ export function createBorgMcpServer(sourceThreadId: number) {
             }
 
             const next = getNextRun(updated);
+            const tz = loadSettings().timezone || "UTC";
+            const nextStr = next ? next.toLocaleString("en-US", { timeZone: tz, dateStyle: "short", timeStyle: "short" }) : "N/A";
             return {
-                content: [textContent(`Task "${updated.name}" updated. Next run: ${next?.toISOString() ?? "N/A"}`)],
+                content: [textContent(`Task "${updated.name}" updated. Next run: ${nextStr}`)],
             };
         },
     );
