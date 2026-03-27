@@ -839,24 +839,8 @@ bot.on("message:voice").filter(
 
         const duration = ctx.msg.voice.duration;
 
-        // Reject voice messages over 5 minutes
-        if (duration > 300) {
-            await ctx.reply("Voice messages over 5 minutes aren't supported. Please keep it under 5 minutes or send as text.", {
-                message_thread_id: ctx.msg.message_thread_id,
-            });
-            return;
-        }
-
-        // Fetch file metadata (needed for size check and dedup)
+        // Fetch file metadata (needed for dedup)
         const file = await ctx.getFile();
-
-        // Reject oversized voice files (Telegram allows up to 20MB)
-        if (file.file_size && file.file_size > 10 * 1024 * 1024) {
-            await ctx.reply("Voice file too large (max 10MB). Please send a shorter message or use text.", {
-                message_thread_id: ctx.msg.message_thread_id,
-            });
-            return;
-        }
 
         // Deduplicate using file_unique_id for reliable content identity
         if (isDuplicate(threadId, String(ctx.from.id), `voice_${file.file_unique_id}`)) {
