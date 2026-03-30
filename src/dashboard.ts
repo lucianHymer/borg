@@ -4,10 +4,12 @@
  */
 
 import express from "express";
+import crypto from "crypto";
 import fs from "fs";
 import path from "path";
 import http from "http";
 import { Cron } from "croner";
+import { z } from "zod/v4";
 import {
     type DockerContainerInspect,
     fetchDockerJson,
@@ -98,8 +100,12 @@ function readNewBytes(filePath: string, state: TailState): string | null {
 
 const app = express();
 
-// JSON body parser (needed for POST endpoints)
-app.use(express.json());
+// JSON body parser — verify callback captures raw body for HMAC verification on webhook routes
+app.use(express.json({
+    verify: (req: express.Request & { rawBody?: Buffer }, _res, buf) => {
+        req.rawBody = buf;
+    },
+}));
 
 // Serve static files
 app.use("/static", express.static(STATIC_DIR));
@@ -1603,6 +1609,196 @@ app.get("/api/response/:messageId/feed", (req, res) => {
     req.on("close", () => {
         clearInterval(interval);
     });
+});
+
+// ─── Webhook Infrastructure ───
+
+const SETTINGS_FILE = path.join(SCRIPT_DIR, "settings.json");
+
+function readSettings(): Record<string, unknown> {
+    try {
+        return JSON.parse(fs.readFileSync(SETTINGS_FILE, "utf8"));
+    } catch {
+        return {};
+    }
+}
+
+/** Write a webhook message to the correct zone's incoming queue. Returns messageId. */
+function enqueueWebhookMessage(opts: {
+    threadId: number;
+    sender: string;
+    message: string;
+    model?: string;
+    idempotencyKey?: string;
+}): { messageId: string; zone: string } {
+    const zoneConfig = loadZoneConfig(ZONE_CONFIG_PATH);
+    if (!zoneConfig) throw new Error("Zone config not available");
+
+    const zone = getThreadZone(zoneConfig, opts.threadId);
+    const queueDir = path.join(SCRIPT_DIR, `.borg-${zone}`, "queue", "incoming");
+    fs.mkdirSync(queueDir, { recursive: true });
+
+    const ts = Date.now();
+    const messageId = opts.idempotencyKey
+        ? `webhook_${opts.sender}_${opts.idempotencyKey}`
+        : `webhook_${opts.sender}_${ts}_${Math.random().toString(36).slice(2, 8)}`;
+
+    const incoming = {
+        channel: "webhook",
+        source: "webhook",
+        threadId: opts.threadId,
+        sender: opts.sender,
+        senderId: `webhook:${opts.sender}`,
+        message: opts.message,
+        isReply: false,
+        timestamp: ts,
+        messageId,
+        ...(opts.model ? { oneshotModel: opts.model } : {}),
+    };
+
+    const tmpFile = path.join(queueDir, `${messageId}.json.tmp`);
+    const finalFile = path.join(queueDir, `${messageId}.json`);
+    fs.writeFileSync(tmpFile, JSON.stringify(incoming));
+    fs.renameSync(tmpFile, finalFile);
+
+    return { messageId, zone };
+}
+
+// ─── Generic Webhook Endpoint (Bearer token auth) ───
+
+const WebhookPayloadSchema = z.object({
+    threadId: z.number().int().positive(),
+    sender: z.string().min(1).max(64),
+    message: z.string().min(1).max(32768),
+    model: z.string().optional(),
+});
+
+app.post("/api/incoming", (req, res) => {
+    const secret = readSettings().webhook_secret as string | undefined;
+    if (!secret) {
+        res.status(503).json({ error: "Webhook not configured — set webhook_secret in settings.json" });
+        return;
+    }
+
+    const auth = req.headers.authorization;
+    const expected = `Bearer ${secret}`;
+    if (!auth || auth.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(auth), Buffer.from(expected))) {
+        res.status(401).json({ error: "Invalid or missing Authorization header" });
+        return;
+    }
+
+    const parsed = WebhookPayloadSchema.safeParse(req.body);
+    if (!parsed.success) {
+        res.status(400).json({ error: "Invalid payload", details: parsed.error.issues });
+        return;
+    }
+
+    try {
+        const result = enqueueWebhookMessage(parsed.data);
+        res.status(202).json(result);
+    } catch (err) {
+        res.status(500).json({ error: toErrorMessage(err) });
+    }
+});
+
+// ─── Clairvoyant Webhook Endpoint (HMAC-SHA256 auth) ───
+
+const CvEventSchema = z.object({
+    id: z.string(),
+    task_id: z.string(),
+    event_type: z.string(),
+    actor_id: z.string(),
+    body: z.string().optional().nullable(),
+    metadata: z.record(z.string(), z.unknown()).optional(),
+    idempotency_key: z.string(),
+    created_at: z.string(),
+});
+
+const CvTaskSchema = z.object({
+    id: z.string(),
+    title: z.string(),
+    status: z.string(),
+    owner_id: z.string().optional().nullable(),
+    creator_id: z.string(),
+    parent_task_id: z.string().optional().nullable(),
+    priority: z.number().optional().nullable(),
+    due_date: z.string().optional().nullable(),
+    tags: z.array(z.string()).optional(),
+    version: z.number(),
+    created_at: z.string(),
+    updated_at: z.string(),
+});
+
+const CvWebhookPayloadSchema = z.object({
+    event: CvEventSchema,
+    task: CvTaskSchema,
+});
+
+app.post("/api/webhooks/clairvoyant", (req: express.Request & { rawBody?: Buffer }, res) => {
+    const settings = readSettings();
+    const secret = settings.clairvoyant_webhook_secret as string | undefined;
+    if (!secret) {
+        res.status(503).json({ error: "Clairvoyant webhook not configured — set clairvoyant_webhook_secret in settings.json" });
+        return;
+    }
+
+    // Verify HMAC-SHA256 signature
+    const signature = req.headers["x-cv-signature"] as string | undefined;
+    if (!signature || !req.rawBody) {
+        res.status(401).json({ error: "Missing X-CV-Signature header" });
+        return;
+    }
+
+    const expected = crypto.createHmac("sha256", secret).update(req.rawBody).digest("hex");
+    if (signature.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) {
+        res.status(401).json({ error: "Invalid signature" });
+        return;
+    }
+
+    // Validate payload
+    const parsed = CvWebhookPayloadSchema.safeParse(req.body);
+    if (!parsed.success) {
+        res.status(400).json({ error: "Invalid payload", details: parsed.error.issues });
+        return;
+    }
+
+    const { event, task } = parsed.data;
+
+    // Only triage unowned tasks — owned tasks already have someone responsible
+    if (task.owner_id) {
+        res.status(200).json({ filtered: true, reason: "has_owner", owner_id: task.owner_id });
+        return;
+    }
+
+    // Resolve target thread
+    const threadId = settings.clairvoyant_thread_id as number | undefined;
+    if (!threadId) {
+        res.status(503).json({ error: "No target thread — set clairvoyant_thread_id in settings.json" });
+        return;
+    }
+
+    // Format a human-readable message for the thread agent
+    const tags = task.tags?.length ? ` [${task.tags.join(", ")}]` : "";
+    const body = event.body ? `\n\n${event.body}` : "";
+    const message = [
+        `Clairvoyant event: **${event.event_type}**`,
+        `Task: "${task.title}" (${task.id})${tags}`,
+        `Status: ${task.status} | Priority: ${task.priority ?? "none"}`,
+        `Created by: ${task.creator_id} | Owner: ${task.owner_id ?? "unassigned"}`,
+        body,
+    ].join("\n");
+
+    try {
+        const result = enqueueWebhookMessage({
+            threadId,
+            sender: "clairvoyant",
+            message,
+            idempotencyKey: event.idempotency_key,
+        });
+        res.status(202).json(result);
+    } catch (err) {
+        res.status(500).json({ error: toErrorMessage(err) });
+    }
 });
 
 // ─── Start Server ───

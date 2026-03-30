@@ -12,7 +12,7 @@ const HISTORY_FILE = path.join(SCRIPT_DIR, ".borg/message-history.jsonl");
 const HISTORY_BACKUP = path.join(SCRIPT_DIR, ".borg/message-history.1.jsonl");
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
 
-export type MessageSource = "user" | "cross-thread" | "heartbeat" | "cli" | "system" | "broadcast" | "scheduled-task" | "one-shot";
+export type MessageSource = "user" | "cross-thread" | "heartbeat" | "cli" | "system" | "broadcast" | "scheduled-task" | "one-shot" | "webhook";
 
 export interface MessageHistoryEntry {
     ts: number;
@@ -187,8 +187,8 @@ export function buildHistoryContext(threadId: number, isMaster: boolean): string
         } catch { /* fall back to numeric IDs */ }
     }
 
-    // Filter out scheduled task outputs — these are informational for humans, not session context
-    const filtered = entries.filter(e => e.source !== "scheduled-task");
+    // Filter out one-shot outputs — these are informational for humans, not session context
+    const filtered = entries.filter(e => e.source !== "scheduled-task" && e.source !== "webhook");
     if (filtered.length === 0) return "";
 
     const lines = filtered.map(e => {

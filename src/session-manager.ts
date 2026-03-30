@@ -51,6 +51,9 @@ export interface Settings {
     fireworks_api_key?: string;  // API key for Fireworks (budget mode proxy)
     dashboard_url?: string;      // Public base URL for dashboard (e.g. https://borg.example.com)
     cost_alert_threshold?: number; // USD threshold per query — alert in thread when exceeded (default: 5)
+    webhook_secret?: string;         // Bearer token for POST /api/incoming webhook endpoint
+    clairvoyant_webhook_secret?: string; // HMAC secret from Clairvoyant's register_webhook response
+    clairvoyant_thread_id?: number;      // Thread ID to route Clairvoyant events to
 }
 
 // ─── Constants ───

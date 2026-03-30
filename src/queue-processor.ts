@@ -62,7 +62,7 @@ import { z } from "zod/v4";
 
 // ─── Zod Schemas for Queue Messages ───
 
-const MessageSourceSchema = z.enum(["user", "cross-thread", "heartbeat", "cli", "system", "broadcast", "scheduled-task", "one-shot"]);
+const MessageSourceSchema = z.enum(["user", "cross-thread", "heartbeat", "cli", "system", "broadcast", "scheduled-task", "one-shot", "webhook"]);
 
 const IncomingMessageSchema = z.object({
     channel: z.string(),
@@ -572,6 +572,7 @@ function buildSourcePrefix(msg: IncomingMessage): string {
         broadcast: `[Broadcast]:`,
         "scheduled-task": `[Scheduled task]:`,
         "one-shot": `[${msg.sender} via /do]:`,
+        webhook: `[${msg.sender} via webhook]:`,
     };
     return prefixMap[msg.source ?? "user"];
 }
@@ -581,7 +582,7 @@ function buildSourcePrefix(msg: IncomingMessage): string {
 // or /do) ran on the same thread, the persistent session has no awareness of that
 // output. This function checks recent history and returns a hint if needed.
 
-const ONE_SHOT_SOURCES = new Set(["scheduled-task", "heartbeat", "one-shot"]);
+const ONE_SHOT_SOURCES = new Set(["scheduled-task", "heartbeat", "one-shot", "webhook"]);
 
 function getRecentOneShotHint(threadId: number): string {
     const recent = getRecentHistory({ threadId, limit: 10 });
@@ -600,7 +601,9 @@ function getRecentOneShotHint(threadId: number): string {
     const agoMin = Math.round((Date.now() - lastOut.ts) / 60_000);
     const sourceLabel = lastOut.source === "scheduled-task"
         ? "a scheduled task"
-        : lastOut.source === "one-shot" ? "a /do one-shot command" : "a heartbeat";
+        : lastOut.source === "one-shot" ? "a /do one-shot command"
+        : lastOut.source === "webhook" ? "a webhook message"
+        : "a heartbeat";
     return `[Note: ${sourceLabel} ran on this thread ~${agoMin}m ago and posted a response, but it ran outside your session so you don't have direct context. If the user's message seems to reference something you didn't say, check .borg/message-history.jsonl for threadId ${threadId} to see what was posted.]`;
 }
 
@@ -1519,8 +1522,11 @@ async function processOneShot(msg: IncomingMessage): Promise<{ text: string; mod
         ? `\n\nBelow is recent activity in this thread for background context. You are NOT part of this conversation — this is just to help you understand what's been going on. Do not continue or reply to these messages; focus only on the task you've been given.\n\n${historyContext}`
         : "";
 
+    const isWebhook = msg.source === "webhook";
     const systemPreamble = [
-        `You are running as an independent one-shot query via /do — you have no conversation history or session state.`,
+        isWebhook
+            ? `You are running as an independent one-shot query triggered by a webhook from "${msg.sender}" — you have no conversation history or session state.`
+            : `You are running as an independent one-shot query via /do — you have no conversation history or session state.`,
         `Thread: "${threadConfig?.name ?? `Thread ${threadId}`}"`,
         `Working directory: ${cwd}`,
         `Be concise and direct. This is a quick task — no need for lengthy explanations.`,
@@ -1621,8 +1627,8 @@ async function processMessage(messageFile: string): Promise<void> {
     let resolvedSessionId: string | undefined;
 
     try {
-        // ─── One-Shot (/do): no session context, user-specified model ───
-        if (source === "one-shot") {
+        // ─── One-Shot (/do) or Webhook: no session context ───
+        if (source === "one-shot" || source === "webhook") {
             const oneshotResult = await processOneShot(msg);
             effectiveModel = oneshotResult.model;
             responseText = oneshotResult.text;
@@ -2138,7 +2144,7 @@ async function processQueue(): Promise<void> {
             }
 
             // Skip threads that are already processing a message
-            if (busyThreads.has(msg.threadId) && msg.source !== "heartbeat" && msg.source !== "scheduled-task") {
+            if (busyThreads.has(msg.threadId) && msg.source !== "heartbeat" && msg.source !== "scheduled-task" && msg.source !== "webhook") {
                 continue;
             }
 
@@ -2148,7 +2154,7 @@ async function processQueue(): Promise<void> {
             if (msg.source === 'scheduled-task' && activeScheduledTaskCount >= 1) continue;
 
             // ─── One-shot paths: dispatch to existing handlers (unchanged) ───
-            if (msg.source === "heartbeat" || msg.source === "scheduled-task" || msg.source === "one-shot") {
+            if (msg.source === "heartbeat" || msg.source === "scheduled-task" || msg.source === "one-shot" || msg.source === "webhook") {
                 // These use their own one-shot query() calls, not the streaming channel
                 activeCount++;
                 if (msg.source === 'heartbeat') activeHeartbeatCount++;
@@ -2190,7 +2196,7 @@ async function processQueue(): Promise<void> {
                         if (otherMsg.threadId !== msg.threadId) continue;
                         if (otherMsg.message.startsWith("/")) continue;
                         if (otherMsg.audioPath) continue;
-                        if (otherMsg.source === "heartbeat" || otherMsg.source === "scheduled-task" || otherMsg.source === "one-shot") continue;
+                        if (otherMsg.source === "heartbeat" || otherMsg.source === "scheduled-task" || otherMsg.source === "one-shot" || otherMsg.source === "webhook") continue;
                         const otherHasImage = !!(otherMsg.imagePath || otherMsg.imagePaths?.length);
                         if (hasImage !== otherHasImage) continue;
                         coalesced.push(other);
