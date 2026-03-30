@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "clairvoyant": {
+      "url": "http://clairvoyant:3000/mcp"
+    }
+  }
+}
