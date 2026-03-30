@@ -1,13 +1,12 @@
 #!/usr/bin/env node
 /**
- * Queue Processor - Agent SDK v1 query() API with persistent sessions
+ * Queue Processor - Agent SDK v1 query() API with request-response model
  *
  * Processes messages from all channels (Telegram, CLI, heartbeat, cross-thread, etc.)
- * via a file-based queue. Regular messages use persistent sessions (SessionPool) —
- * the SDK subprocess stays alive across messages for near-zero latency on consecutive
- * messages and better prompt caching. Heartbeats, scheduled tasks, and one-shots use
- * standalone query() calls. Background tasks are monitored asynchronously after end_turn
- * without blocking the thread slot.
+ * via a file-based queue. Each message gets a standalone query() call that runs to
+ * completion. Session resume tokens maintain continuity across messages. Status is
+ * written to per-thread status files so telegram-client can show edit-in-place progress.
+ * Background tasks are monitored asynchronously after the primary response.
  */
 
 import fs from "fs";
@@ -25,7 +24,6 @@ import type {
     Query,
     CanUseTool as SDKCanUseTool,
 } from "@anthropic-ai/claude-agent-sdk";
-import { SessionPool } from "./session-pool.js";
 import { toErrorMessage, isValidSessionId, TASK_LISTS_FILENAME } from "./types.js";
 import type { IncomingMessage, OutgoingMessage, TaskListMapping, BackgroundTaskInfo, BackgroundTaskState } from "./types.js";
 import {
@@ -507,12 +505,8 @@ let activeScheduledTaskCount = 0;
 // Background task monitors that run independently after end_turn
 const activeBackgroundMonitors = new Map<number, Promise<void>>();
 
-// Persistent session pool for reusing SDK sessions across messages
-const sessionPool = new SessionPool({
-    idleTimeoutMinutes: 30,
-    maxSessions: 16,
-    log,
-});
+// Threads currently processing a message (for per-thread serialization)
+const busyThreads = new Set<number>();
 
 // ─── SDK canUseTool Adapter ───
 
@@ -617,7 +611,6 @@ function getRecentOneShotHint(threadId: number): string {
 import {
     writeThreadStatus,
     clearThreadStatus,
-    updateThreadStatusAnchor,
 } from "./thread-status.js";
 
 function writeStatus(threadId: number, anchorMessageId: string, label: string, startTs: number, preview?: string, fullText?: string, sessionId?: string): void {
@@ -779,8 +772,6 @@ interface QueryEventObserver {
     onTaskStarted?(taskId: string, description: string): void;
     onTaskProgress?(taskId: string, summary: string | undefined): void;
     onTaskCompleted?(taskId: string, status: string, summary: string): void;
-    /** If true, skip stall detection and drain — next events belong to injected messages. */
-    hasPendingInjections?(): boolean;
 }
 
 // Stall detection: if no active background tasks and end_turn seen, wait this long
@@ -796,19 +787,6 @@ const LIVENESS_POLL_MS = 30_000; // 30 seconds per poll iteration
 
 // Alert threshold for long-running background tasks (2 hours)
 const BACKGROUND_TASK_ALERT_MS = 2 * 60 * 60 * 1000;
-
-interface PrimaryResponseResult {
-    text: string;
-    sessionId: string | undefined;
-    stallRecovered: boolean;
-    usage?: QueryUsageData;
-    /** Active background tasks at end_turn (empty if none) */
-    activeTasks: Map<string, BackgroundTaskInfo>;
-    /** The query object, needed for background monitoring and stopTask */
-    query: Query;
-    /** Whether background tasks are still running and need monitoring */
-    hasBackgroundTasks: boolean;
-}
 
 // ─── Extract usage data from SDK result message ───
 
@@ -1013,12 +991,22 @@ function processSDKMessage(msg: SDKMessage, state: MessageProcessingState): void
     }
 }
 
-// ─── Collect primary response (returns at end_turn if background tasks are active) ───
+// ─── Collect query response (runs to completion) ───
 
-async function collectPrimaryResponse(
+interface QueryResponseResult {
+    text: string;
+    sessionId: string | undefined;
+    stallRecovered: boolean;
+    usage?: QueryUsageData;
+    activeTasks: Map<string, BackgroundTaskInfo>;
+    query: Query;
+    hasBackgroundTasks: boolean;
+}
+
+async function collectQueryResponse(
     q: Query,
     observer?: QueryEventObserver,
-): Promise<PrimaryResponseResult> {
+): Promise<QueryResponseResult> {
     const state: MessageProcessingState = {
         parts: [],
         capturedSessionId: undefined,
@@ -1053,15 +1041,6 @@ async function collectPrimaryResponse(
                 };
             }
 
-            // If there are injected messages pending, DON'T return yet — we need to
-            // consume the trailing `result` event first. In streaming mode, result comes
-            // right after end_turn. If we break before consuming it, the result event
-            // leaks into the next collectPrimaryResponse call and causes it to exit
-            // immediately via sawResult, yielding "(No response generated)".
-            // The sawResult check (after processSDKMessage) will break us out once
-            // the result event is consumed. The drain section already guards against
-            // consuming events meant for injected messages.
-
             // No background tasks — use stall detection to avoid hanging indefinitely
             const elapsed = Date.now() - state.endTurnSeenAt;
             if (elapsed >= END_TURN_STALL_TIMEOUT_MS) {
@@ -1092,8 +1071,6 @@ async function collectPrimaryResponse(
             // Liveness detection: the SDK subprocess should always emit events
             // while working (tool_progress, assistant messages, etc.). If nothing
             // arrives for SUBPROCESS_LIVENESS_TIMEOUT_MS, it's likely dead.
-            // We call iterator.next() once and race the same promise against
-            // repeated short timeouts to avoid creating dangling next() calls.
             const eventPromise = iterator.next().then(
                 (r) => ({ kind: "event" as const, result: r }),
             );
@@ -1131,11 +1108,6 @@ async function collectPrimaryResponse(
         if (iterResult.done) break;
         processSDKMessage(iterResult.value, state);
 
-        // In streaming mode (AsyncIterable prompt), the iterator stays open
-        // after result. We must return here — NOT wait for done — otherwise
-        // we'll block forever waiting for the next message from the generator.
-        // But first: check if background tasks are active — if so, return
-        // early so the caller can fire off the background monitor.
         if (state.sawResult) {
             const runningTasks = [...state.activeTasks.values()].filter(t => t.status === "running");
             if (runningTasks.length > 0) {
@@ -1151,42 +1123,6 @@ async function collectPrimaryResponse(
                 };
             }
             break;
-        }
-    }
-
-    // Drain any buffered events from the iterator after result.
-    // In streaming mode, the subprocess stays alive and may have emitted
-    // system messages, compacting events, or additional results after the
-    // one we consumed. If we don't drain these, they'll be served as
-    // responses to the NEXT message, causing stale/out-of-order replies.
-    // SKIP drain when injected messages are pending — those events belong to them.
-    if (state.sawResult && !stallDetected && !observer?.hasPendingInjections?.()) {
-        let drained = 0;
-        // Use a short timeout — buffered events resolve near-instantly,
-        // while waiting for new events from the subprocess takes longer.
-        // 100ms is enough to drain buffered events without adding latency.
-        const DRAIN_TIMEOUT_MS = 100;
-        while (true) {
-            let drainHandle: ReturnType<typeof setTimeout>;
-            const drainTimeout = new Promise<"timeout">(resolve => {
-                drainHandle = setTimeout(() => resolve("timeout"), DRAIN_TIMEOUT_MS);
-            });
-            const winner = await Promise.race([
-                iterator.next().then(r => ({ kind: "event" as const, result: r })),
-                drainTimeout.then(() => ({ kind: "timeout" as const })),
-            ]);
-            if (winner.kind === "timeout") break;
-            clearTimeout(drainHandle!);
-            const r = (winner as { kind: "event"; result: IteratorResult<SDKMessage, void> }).result;
-            if (r.done) break;
-            drained++;
-            // Process to capture any late session_id updates
-            if ("session_id" in r.value && r.value.session_id) {
-                state.capturedSessionId = r.value.session_id;
-            }
-        }
-        if (drained > 0) {
-            log("DEBUG", `Drained ${drained} buffered event(s) after result for session reuse`);
         }
     }
 
@@ -1207,21 +1143,6 @@ async function collectPrimaryResponse(
         activeTasks: state.activeTasks,
         query: q,
         hasBackgroundTasks: false,
-    };
-}
-
-// ─── Legacy wrapper for heartbeats/scheduled-tasks/one-shots ───
-
-async function collectQueryResponse(
-    q: Query,
-    observer?: QueryEventObserver,
-): Promise<{ text: string; sessionId: string | undefined; stallRecovered: boolean; usage?: QueryUsageData }> {
-    const result = await collectPrimaryResponse(q, observer);
-    return {
-        text: result.text,
-        sessionId: result.sessionId,
-        stallRecovered: result.stallRecovered,
-        usage: result.usage,
     };
 }
 
@@ -1387,13 +1308,8 @@ async function monitorBackgroundTasks(
         // Clean up task state file when all monitoring is done
         clearTaskState(messageId);
 
-        // Mark session idle so we can claim it for the summary response.
-        // (The .finally() callback in processMessage also marks idle, but
-        // this runs first — inside the monitor's own finally block.)
-        sessionPool.markIdle(threadId);
-
-        // Push a summary of completed tasks into the session so the model
-        // can report results without waiting for the user to ask.
+        // Queue a system message with the task summary so it gets processed
+        // as a regular message on the next queue cycle (with session resume for context).
         const completedTasks = [...activeTasks.values()].filter(t => t.status === "completed" || t.status === "failed");
         if (completedTasks.length > 0) {
             const summaryLines = completedTasks.map(t => {
@@ -1402,347 +1318,27 @@ async function monitorBackgroundTasks(
             });
             const summaryPrompt = `[System] Background tasks finished:\n${summaryLines.join("\n")}\n\nPlease review the results and report back to the user.`;
 
-            if (sessionPool.injectMessage(threadId, summaryPrompt)) {
-                log("INFO", `Injected background task completion summary into session for thread ${threadId}`);
-
-                // Consume the model's response to the summary
-                const claimed = sessionPool.tryClaimSession(threadId,
-                    loadThreads()[String(threadId)]?.model ?? "sonnet",
-                    loadThreads()[String(threadId)]?.cwd ?? process.cwd());
-                if (claimed) {
-                    try {
-                        const summaryResponse = collectPrimaryResponse(claimed.query);
-                        claimed.pushMessage(summaryPrompt);
-                        const result = await summaryResponse;
-                        const responseText = result.text.trim();
-
-                        if (result.sessionId) {
-                            updateThread(threadId, { sessionId: result.sessionId, lastActive: Date.now() });
-                        }
-                        sessionPool.markIdle(threadId, result.sessionId);
-
-                        if (responseText) {
-                            // Log and send the response
-                            const bgMessageId = `bg_summary_${threadId}_${Date.now()}`;
-                            appendHistory({
-                                ts: Date.now(), threadId, channel: "system",
-                                sender: "assistant", direction: "out", message: responseText,
-                                model: loadThreads()[String(threadId)]?.model ?? "sonnet",
-                                source: "system", messageId: bgMessageId,
-                                ...(result.usage ? {
-                                    costUSD: result.usage.totalCostUSD,
-                                    inputTokens: result.usage.inputTokens,
-                                    outputTokens: result.usage.outputTokens,
-                                    cacheReadInputTokens: result.usage.cacheReadInputTokens,
-                                    cacheCreationInputTokens: result.usage.cacheCreationInputTokens,
-                                    durationMs: result.usage.durationMs,
-                                    durationApiMs: result.usage.durationApiMs,
-                                    numTurns: result.usage.numTurns,
-                                    modelUsage: result.usage.modelUsage,
-                                } : {}),
-                            });
-
-                            const outgoing: OutgoingMessage = {
-                                channel: "system", threadId, sender: "assistant",
-                                message: responseText, originalMessage: "(background task results)",
-                                timestamp: Date.now(), messageId: bgMessageId,
-                                model: loadThreads()[String(threadId)]?.model ?? "sonnet",
-                            };
-                            const outFile = path.join(QUEUE_OUTGOING, `bg_summary_${threadId}_${Date.now()}.json`);
-                            const tmpFile = outFile + ".tmp";
-                            fs.writeFileSync(tmpFile, JSON.stringify(outgoing, null, 2));
-                            fs.renameSync(tmpFile, outFile);
-
-                            log("INFO", `Background task summary response ready for thread ${threadId} (${responseText.length} chars)`);
-                        }
-                    } catch (summaryErr) {
-                        log("WARN", `Background task summary response error for thread ${threadId}: ${toErrorMessage(summaryErr)}`);
-                        sessionPool.close(threadId);
-                    }
-                }
-            }
+            const bgMessageId = `bg_summary_${threadId}_${Date.now()}`;
+            const incoming = {
+                channel: "system",
+                source: "system",
+                threadId,
+                sender: "system",
+                senderId: "background-tasks",
+                message: summaryPrompt,
+                isReply: false,
+                timestamp: Date.now(),
+                messageId: bgMessageId,
+            };
+            const incomingFile = path.join(QUEUE_INCOMING, `${bgMessageId}.json`);
+            const tmpFile = incomingFile + ".tmp";
+            fs.writeFileSync(tmpFile, JSON.stringify(incoming, null, 2));
+            fs.renameSync(tmpFile, incomingFile);
+            log("INFO", `Queued background task summary for thread ${threadId}`);
         }
 
         log("INFO", `Background task monitoring ended for ${messageId}`);
     }
-}
-
-// ─── Streaming Channel: Event Consumer ───
-// Long-running async function per thread. Consumes SDK events from the query
-// iterator, posts text blocks via outgoing queue, handles tool use status,
-// background tasks, cancel signals, and usage logging. Loops across turns —
-// when a new message is pushed into the channel, the SDK processes it and
-// emits more events which this consumer handles.
-
-// Active consumers keyed by threadId
-const activeConsumers = new Map<number, Promise<void>>();
-
-async function consumeThreadEvents(
-    threadId: number,
-    q: Query,
-    channel: string,
-    sender: string,
-    model: string,
-    messageId: string,
-    cwd: string,
-): Promise<void> {
-    const iterator = q[Symbol.asyncIterator]();
-    let streamSeq = 0;
-    let accumulated = "";
-    let currentAnchorMessageId = messageId;
-    let toolCount = 0;
-    let currentSessionId: string | undefined;
-    let activeTasks = new Map<string, BackgroundTaskInfo>();
-
-    const statusStartTime = Date.now();
-    writeStatus(threadId, currentAnchorMessageId, "Thinking", statusStartTime);
-
-    // Status refresh interval — keep ts fresh for staleness detection,
-    // update label/preview, and check for cancel signals
-    let currentStatusLabel = "Thinking";
-    let currentPreview: string | undefined;
-    let fullAccumulatedText = "";
-    let cancelled = false;
-    const cancelFile = path.join(QUEUE_CANCEL, `${currentAnchorMessageId}.json`);
-
-    const statusInterval = setInterval(() => {
-        // Check for cancel signal
-        const checkFile = path.join(QUEUE_CANCEL, `${currentAnchorMessageId}.json`);
-        if (!cancelled && fs.existsSync(checkFile)) {
-            cancelled = true;
-            currentStatusLabel = "Cancelled";
-            try { fs.unlinkSync(checkFile); } catch { /* best effort */ }
-            Promise.race([q.interrupt(), new Promise<void>(r => setTimeout(r, 10_000))]).catch(() => {});
-            log("INFO", `Cancelled processing for thread ${threadId} (anchor: ${currentAnchorMessageId})`);
-        }
-        // Check for settings file changes
-        invalidateSettingsCacheIfChanged();
-        writeStatus(threadId, currentAnchorMessageId, currentStatusLabel, statusStartTime, currentPreview, fullAccumulatedText, currentSessionId);
-    }, 2000);
-
-    try {
-        while (true) {
-            // Liveness: if no events for 5 min, subprocess is likely dead
-            let iterResult: IteratorResult<SDKMessage, void> | undefined;
-            {
-                const eventPromise = iterator.next().then(
-                    (r) => ({ kind: "event" as const, result: r }),
-                );
-                let livenessElapsed = 0;
-                while (livenessElapsed < SUBPROCESS_LIVENESS_TIMEOUT_MS) {
-                    const remaining = SUBPROCESS_LIVENESS_TIMEOUT_MS - livenessElapsed;
-                    const pollMs = Math.min(LIVENESS_POLL_MS, remaining);
-                    let livenessHandle: ReturnType<typeof setTimeout>;
-                    const livenessPromise = new Promise<"timeout">((resolve) => {
-                        livenessHandle = setTimeout(() => resolve("timeout"), pollMs);
-                    });
-                    const winner = await Promise.race([
-                        eventPromise,
-                        livenessPromise.then(() => ({ kind: "timeout" as const })),
-                    ]);
-                    if (winner.kind === "timeout") {
-                        livenessElapsed += pollMs;
-                        continue;
-                    }
-                    clearTimeout(livenessHandle!);
-                    iterResult = winner.result;
-                    break;
-                }
-                if (livenessElapsed >= SUBPROCESS_LIVENESS_TIMEOUT_MS) {
-                    log("WARN", `No events for ${Math.round(livenessElapsed / 1000)}s on thread ${threadId} — exiting consumer`);
-                    break;
-                }
-            }
-
-            if (!iterResult || iterResult.done) break;
-            const msg = iterResult.value;
-
-            // Capture session ID
-            if ("session_id" in msg && msg.session_id) {
-                const isNew = currentSessionId !== msg.session_id;
-                currentSessionId = msg.session_id;
-                if (isNew) {
-                    persistSessionId(threadId, currentSessionId);
-                }
-            }
-
-            if (msg.type === "assistant") {
-                const assistantMsg = msg as SDKAssistantMessage;
-                const content = assistantMsg.message?.content;
-                if (Array.isArray(content)) {
-                    for (const block of content) {
-                        if (block.type === "text" && typeof block.text === "string") {
-                            accumulated += (accumulated ? "\n\n" : "") + block.text;
-                            fullAccumulatedText += (fullAccumulatedText ? "\n\n" : "") + block.text;
-                            currentPreview = fullAccumulatedText.length > 500
-                                ? "…" + fullAccumulatedText.slice(-500)
-                                : fullAccumulatedText;
-                            // Write streaming text block to outgoing queue
-                            writeStreamingOutgoing(threadId, channel, sender, model, block.text, streamSeq++, currentAnchorMessageId);
-                        }
-                        if (block.type === "tool_use" && "name" in block) {
-                            toolCount++;
-                            currentStatusLabel = `Using ${block.name} [${toolCount}]`;
-                        }
-                    }
-                }
-            }
-
-            if (msg.type === "tool_progress") {
-                const toolMsg = msg as SDKToolProgressMessage;
-                currentStatusLabel = `Using ${toolMsg.tool_name} [${toolCount}]`;
-            }
-
-            if (msg.type === "system" && "subtype" in msg && msg.subtype === "status" && "status" in msg && msg.status === "compacting") {
-                currentStatusLabel = "Compacting context";
-            }
-
-            // Track background tasks
-            applyTaskEvent(msg, activeTasks, {
-                onTaskStarted(taskId: string, description: string) {
-                    currentStatusLabel = `Background: ${description}`;
-                    log("INFO", `Background task started: ${taskId} — ${description}`);
-                },
-                onTaskProgress(_taskId: string, summary: string | undefined) {
-                    if (summary) currentStatusLabel = `Background: ${summary.substring(0, 60)}`;
-                },
-                onTaskCompleted(taskId: string, status: string, summary: string) {
-                    log("INFO", `Background task ${taskId} ${status}: ${summary}`);
-                },
-            });
-
-            if (msg.type === "result") {
-                const result = msg as SDKResultMessage;
-                const usage = extractUsageData(result);
-
-                // Log and write stream-complete marker
-                if (accumulated || streamSeq > 0) {
-                    appendHistory({
-                        ts: Date.now(), threadId, channel,
-                        sender: "assistant", direction: "out",
-                        message: accumulated, model,
-                        source: "user", messageId: currentAnchorMessageId,
-                        ...(currentSessionId ? { sessionId: currentSessionId } : {}),
-                        costUSD: usage.totalCostUSD,
-                        inputTokens: usage.inputTokens,
-                        outputTokens: usage.outputTokens,
-                        cacheReadInputTokens: usage.cacheReadInputTokens,
-                        cacheCreationInputTokens: usage.cacheCreationInputTokens,
-                        durationMs: usage.durationMs,
-                        durationApiMs: usage.durationApiMs,
-                        numTurns: usage.numTurns,
-                        modelUsage: usage.modelUsage,
-                    });
-                    writeStreamCompleteOutgoing(threadId, channel, sender, model, accumulated, currentAnchorMessageId);
-                    writeCostAlert(threadId, channel, model, usage, currentAnchorMessageId);
-                } else {
-                    // Empty response — still write a marker so telegram-client knows the turn ended
-                    writeStreamCompleteOutgoing(threadId, channel, sender, model, "", currentAnchorMessageId);
-                }
-
-                // Handle background tasks
-                const runningTasks = [...activeTasks.values()].filter(t => t.status === "running");
-                if (runningTasks.length > 0) {
-                    // Fire off background monitoring — the consumer keeps running
-                    // to handle task events and eventual completion summary injection
-                    sessionPool.markMonitoring(threadId);
-                    writeTaskState(currentAnchorMessageId, threadId, activeTasks);
-                    const monitor = monitorBackgroundTasks(q, activeTasks, threadId, currentAnchorMessageId);
-                    activeBackgroundMonitors.set(threadId, monitor);
-                    monitor.finally(() => {
-                        activeBackgroundMonitors.delete(threadId);
-                        sessionPool.markIdle(threadId, currentSessionId);
-                    });
-                    log("INFO", `Started background task monitor for thread ${threadId} (${runningTasks.length} task(s))`);
-                    // Consumer returns — background monitor takes over the iterator.
-                    // Next message will create a new consumer.
-                    break;
-                }
-
-                // Reset for next turn
-                accumulated = "";
-                fullAccumulatedText = "";
-                currentPreview = undefined;
-                streamSeq = 0;
-                toolCount = 0;
-                clearStatus(threadId);
-
-                // Session is idle between turns — wait for next message push
-                sessionPool.markIdle(threadId, currentSessionId);
-                if (currentSessionId) {
-                    const threadCwd = loadThreads()[String(threadId)]?.cwd;
-                    if (threadCwd) syncSessionLog(currentSessionId, threadCwd);
-                }
-
-                // Check for cancel
-                if (cancelled) {
-                    break;
-                }
-            }
-        }
-    } catch (err) {
-        log("ERROR", `Consumer error for thread ${threadId}: ${toErrorMessage(err)}`);
-        // Close the persistent session on error
-        sessionPool.close(threadId);
-        deleteThreadField(threadId, "sessionId");
-    } finally {
-        clearInterval(statusInterval);
-        clearStatus(threadId);
-
-        if (cancelled) {
-            // Write cancellation message
-            const cancelText = fullAccumulatedText
-                ? `${fullAccumulatedText}\n\n---\n🚫 Processing was cancelled.`
-                : "🚫 Processing was cancelled.";
-            writeStreamCompleteOutgoing(threadId, channel, sender, model, cancelText, currentAnchorMessageId);
-            sessionPool.close(threadId);
-        }
-
-        activeConsumers.delete(threadId);
-        log("INFO", `Event consumer exited for thread ${threadId}`);
-    }
-}
-
-// Write a streaming text block to the outgoing queue
-function writeStreamingOutgoing(
-    threadId: number, channel: string, sender: string, model: string,
-    text: string, sequence: number, anchorMessageId: string,
-): void {
-    const data: OutgoingMessage = {
-        channel, threadId, sender, model,
-        message: text,
-        originalMessage: "(streaming text block)",
-        timestamp: Date.now(),
-        messageId: anchorMessageId,
-        streaming: true,
-        streamSequence: sequence,
-    };
-    const filename = `stream_${threadId}_${anchorMessageId}_${sequence}_${Date.now()}.json`;
-    const outFile = path.join(QUEUE_OUTGOING, filename);
-    const tmpFile = outFile + ".tmp";
-    fs.writeFileSync(tmpFile, JSON.stringify(data, null, 2));
-    fs.renameSync(tmpFile, outFile);
-}
-
-// Write a stream-complete marker to the outgoing queue
-function writeStreamCompleteOutgoing(
-    threadId: number, channel: string, sender: string, model: string,
-    accumulatedText: string, anchorMessageId: string,
-): void {
-    const data: OutgoingMessage = {
-        channel, threadId, sender, model,
-        message: accumulatedText || "(No response generated)",
-        originalMessage: "(stream complete)",
-        timestamp: Date.now(),
-        messageId: anchorMessageId,
-        streamComplete: true,
-        accumulatedText,
-    };
-    const filename = `stream_complete_${threadId}_${anchorMessageId}_${Date.now()}.json`;
-    const outFile = path.join(QUEUE_OUTGOING, filename);
-    const tmpFile = outFile + ".tmp";
-    fs.writeFileSync(tmpFile, JSON.stringify(data, null, 2));
-    fs.renameSync(tmpFile, outFile);
 }
 
 // ─── Heartbeat Processing (one-shot, no persistent session) ───
@@ -2130,12 +1726,168 @@ async function processMessage(messageFile: string): Promise<void> {
                 return;
             }
         } else {
-            // Regular messages are handled by the streaming channel in processQueue.
-            // If we get here, it's a regular message that somehow ended up in processMessage
-            // (shouldn't happen with the new architecture). Log and skip.
-            log("WARN", `Regular message in processMessage — should be handled by streaming channel: thread=${threadId} messageId=${messageId}`);
-            effectiveModel = "sonnet";
-            responseText = "(Message routed incorrectly — please retry)";
+            // ─── Regular message: one-shot query with session resume ───
+            const threads = loadThreads();
+            const key = String(threadId);
+            let threadConfig = threads[key];
+            if (!threadConfig) {
+                const defaultCwd = process.env.DEFAULT_CWD || process.cwd();
+                threadConfig = {
+                    name: msg.topicName ?? `Thread ${threadId}`,
+                    cwd: defaultCwd, model: "sonnet",
+                    isMaster: false, lastActive: Date.now(),
+                };
+                threads[key] = threadConfig;
+                saveThreads(threads);
+            } else if (msg.topicName && threadConfig.name === `Thread ${threadId}`) {
+                threadConfig.name = msg.topicName;
+                saveThreads(threads);
+            }
+            threads[key].lastActive = Date.now();
+
+            // Determine model
+            if (isBudgetMode()) {
+                effectiveModel = BUDGET_MODEL;
+            } else {
+                effectiveModel = threadConfig.model || DEFAULT_THREAD_MODEL;
+            }
+
+            // Build prompt
+            const now = formatCurrentTime();
+            const prefix = buildSourcePrefix(msg);
+            const isNewSession = !threadConfig.sessionId;
+            const historyContext = isNewSession ? buildHistoryContext(threadId, threadConfig.isMaster) : "";
+            const oneShotHint = isNewSession ? "" : getRecentOneShotHint(threadId);
+            let fullPrompt: string;
+            if (isNewSession) {
+                const contextBlock = historyContext ? `\n\n${historyContext}\n\n` : "\n\n";
+                fullPrompt = `[${now}]${contextBlock}${prefix} ${msg.message}`;
+            } else if (oneShotHint) {
+                fullPrompt = `${oneShotHint}\n\n[${now}] ${prefix} ${msg.message}`;
+            } else {
+                fullPrompt = `[${now}] ${prefix} ${msg.message}`;
+            }
+
+            const threadPrompt = buildThreadPrompt(threadConfig, { threadId, model: effectiveModel });
+            logPrompt({
+                threadId, messageId, model: effectiveModel,
+                systemPromptAppend: threadPrompt,
+                userMessage: `${prefix} ${msg.message}`,
+                historyInjected: isNewSession,
+                historyLines: isNewSession ? historyContext.split("\n").length - 1 : 0,
+                promptLength: fullPrompt.length,
+            });
+
+            // Budget proxy setup
+            if (isBudgetMode() || effectiveModel.includes("fireworks")) {
+                budgetUsageId = crypto.randomUUID();
+                const pendingFile = path.join(BORG_DIR, `minimax-usage-${budgetUsageId}.pending`);
+                fs.writeFileSync(pendingFile, "");
+                process.env.ANTHROPIC_BASE_URL = `${BUDGET_PROXY_URL}/${budgetUsageId}`;
+            }
+
+            // Build query options
+            const stderrLines: string[] = [];
+            const options = await buildQueryOptions(threadId, threadConfig, effectiveModel, stderrLines, msg.message);
+
+            // Write initial status
+            const statusStartTime = Date.now();
+            writeStatus(threadId, messageId, "Thinking", statusStartTime);
+
+            // Status refresh interval — keep ts fresh for staleness detection,
+            // update label/preview, and check for cancel signals
+            let currentStatusLabel = "Thinking";
+            let currentPreview: string | undefined;
+            let fullAccumulatedText = "";
+            let cancelled = false;
+
+            const q = query({ prompt: fullPrompt, options });
+
+            const statusInterval = setInterval(() => {
+                // Check for cancel signal
+                const checkFile = path.join(QUEUE_CANCEL, `${messageId}.json`);
+                if (!cancelled && fs.existsSync(checkFile)) {
+                    cancelled = true;
+                    currentStatusLabel = "Cancelled";
+                    try { fs.unlinkSync(checkFile); } catch { /* best effort */ }
+                    Promise.race([q.interrupt(), new Promise<void>(r => setTimeout(r, 10_000))]).catch(() => {});
+                    log("INFO", `Cancelled processing for thread ${threadId} (messageId: ${messageId})`);
+                }
+                invalidateSettingsCacheIfChanged();
+                writeStatus(threadId, messageId, currentStatusLabel, statusStartTime, currentPreview, fullAccumulatedText);
+            }, 2000);
+
+            try {
+                const result = await collectQueryResponse(q, {
+                    onSessionId(sid: string) {
+                        persistSessionId(threadId, sid);
+                        resolvedSessionId = sid;
+                    },
+                    onToolUse(toolName: string) {
+                        currentStatusLabel = `Using ${toolName}`;
+                    },
+                    onToolProgress(toolName: string) {
+                        currentStatusLabel = `Using ${toolName}`;
+                    },
+                    onCompacting() {
+                        currentStatusLabel = "Compacting context";
+                    },
+                    onStallDetected() {
+                        currentStatusLabel = "Stall detected";
+                    },
+                    onTextContent(text: string) {
+                        fullAccumulatedText += (fullAccumulatedText ? "\n\n" : "") + text;
+                        currentPreview = fullAccumulatedText;
+                    },
+                    onTaskStarted(_taskId: string, description: string) {
+                        currentStatusLabel = `Background: ${description}`;
+                    },
+                    onTaskProgress(_taskId: string, summary: string | undefined) {
+                        if (summary) currentStatusLabel = `Background: ${summary.substring(0, 60)}`;
+                    },
+                });
+
+                clearInterval(statusInterval);
+
+                if (cancelled) {
+                    responseText = fullAccumulatedText
+                        ? `${fullAccumulatedText}\n\n---\n🚫 Processing was cancelled.`
+                        : "🚫 Processing was cancelled.";
+                } else {
+                    responseText = result.text;
+                    usageData = result.usage;
+                    resolvedSessionId = result.sessionId;
+
+                    if (result.sessionId) {
+                        updateThread(threadId, { sessionId: result.sessionId, lastActive: Date.now() });
+                    }
+
+                    // Handle background tasks
+                    if (result.hasBackgroundTasks) {
+                        writeTaskState(messageId, threadId, result.activeTasks);
+                        const monitor = monitorBackgroundTasks(result.query, result.activeTasks, threadId, messageId);
+                        activeBackgroundMonitors.set(threadId, monitor);
+                        monitor.finally(() => {
+                            activeBackgroundMonitors.delete(threadId);
+                        });
+                        log("INFO", `Started background task monitor for thread ${threadId}`);
+                    }
+
+                    if (result.sessionId) {
+                        syncSessionLog(result.sessionId, threadConfig.cwd);
+                    }
+                }
+            } catch (err) {
+                clearInterval(statusInterval);
+                throw err;
+            } finally {
+                clearStatus(threadId);
+                // Clean up budget usage files
+                if (budgetUsageId) {
+                    const pendingFile = path.join(BORG_DIR, `minimax-usage-${budgetUsageId}.pending`);
+                    try { if (fs.existsSync(pendingFile)) fs.unlinkSync(pendingFile); } catch {}
+                }
+            }
         }
     } catch (error) {
         const errorMsg = toErrorMessage(error);
@@ -2301,11 +2053,9 @@ async function processCommands(): Promise<void> {
             const data = parsed.data;
 
             if (data.command === "reset") {
-                sessionPool.close(data.threadId);
                 resetThread(data.threadId);
                 log("INFO", `Command: reset thread ${data.threadId}`);
             } else if (data.command === "setdir" && data.args?.cwd) {
-                sessionPool.close(data.threadId);
                 configureThread(data.threadId, { cwd: data.args.cwd });
                 log(
                     "INFO",
@@ -2387,40 +2137,8 @@ async function processQueue(): Promise<void> {
                 continue; // File may have been picked up by a concurrent scan
             }
 
-            // ─── Streaming channel: push into existing session ───
-            // If a consumer is running for this thread, push the message into the
-            // session channel. The consumer handles it — no separate tracking needed.
-            if (activeConsumers.has(msg.threadId)) {
-                if (!msg.message.startsWith("/") &&
-                    msg.source !== "heartbeat" &&
-                    msg.source !== "scheduled-task" &&
-                    msg.source !== "one-shot") {
-                    const now = formatCurrentTime();
-                    const prefix = buildSourcePrefix(msg);
-                    const oneShotHint = getRecentOneShotHint(msg.threadId);
-                    const pushPrompt = oneShotHint
-                        ? `${oneShotHint}\n\n[${now}] ${prefix} ${msg.message}`
-                        : `[${now}] ${prefix} ${msg.message}`;
-                    if (sessionPool.pushMessage(msg.threadId, pushPrompt)) {
-                        // Log incoming to history
-                        appendHistory({
-                            ts: Date.now(),
-                            threadId: msg.threadId,
-                            channel: msg.channel,
-                            sender: msg.sender,
-                            direction: "in",
-                            message: msg.message,
-                            source: msg.source ?? "user",
-                            sourceThreadId: msg.sourceThreadId,
-                            messageId: msg.messageId,
-                        });
-                        // Update the status anchor to the latest user message
-                        updateThreadStatusAnchor(QUEUE_STATUS, msg.threadId, msg.messageId);
-                        // Delete queue file — message is in the channel now
-                        try { fs.unlinkSync(file.path); } catch {}
-                        log("INFO", `Pushed message into channel for thread ${msg.threadId} from ${msg.sender}: ${msg.message.substring(0, 60)}`);
-                    }
-                }
+            // Skip threads that are already processing a message
+            if (busyThreads.has(msg.threadId) && msg.source !== "heartbeat" && msg.source !== "scheduled-task") {
                 continue;
             }
 
@@ -2505,126 +2223,16 @@ async function processQueue(): Promise<void> {
                 }
             }
 
-            // ─── Streaming channel: create session + start consumer ───
-            const { channel, threadId, sender, messageId, source } = msg;
-
-            // Log incoming message to history
-            appendHistory({
-                ts: Date.now(), threadId, channel, sender,
-                direction: "in", message: msg.message,
-                source: source ?? "user",
-                sourceThreadId: msg.sourceThreadId, messageId,
-            });
-
-            // Load/create thread config
-            const threads = loadThreads();
-            const key = String(threadId);
-            let threadConfig = threads[key];
-            if (!threadConfig) {
-                const defaultCwd = process.env.DEFAULT_CWD || process.cwd();
-                threadConfig = {
-                    name: msg.topicName ?? `Thread ${threadId}`,
-                    cwd: defaultCwd, model: "sonnet",
-                    isMaster: false, lastActive: Date.now(),
-                };
-                threads[key] = threadConfig;
-                saveThreads(threads);
-            } else if (msg.topicName && threadConfig.name === `Thread ${threadId}`) {
-                threadConfig.name = msg.topicName;
-                saveThreads(threads);
-            }
-            threads[key].lastActive = Date.now();
-
-            // Determine model
-            let effectiveModel: string;
-            if (isBudgetMode()) {
-                effectiveModel = BUDGET_MODEL;
-            } else {
-                effectiveModel = threadConfig.model || DEFAULT_THREAD_MODEL;
-            }
-
-            // Build prompt
-            const now = formatCurrentTime();
-            const prefix = buildSourcePrefix(msg);
-            const isNewSession = !threadConfig.sessionId;
-            const historyContext = isNewSession ? buildHistoryContext(threadId, threadConfig.isMaster) : "";
-            const oneShotHint = isNewSession ? "" : getRecentOneShotHint(threadId);
-            let fullPrompt: string;
-            if (isNewSession) {
-                const contextBlock = historyContext ? `\n\n${historyContext}\n\n` : "\n\n";
-                fullPrompt = `[${now}]${contextBlock}${prefix} ${msg.message}`;
-            } else if (oneShotHint) {
-                fullPrompt = `${oneShotHint}\n\n[${now}] ${prefix} ${msg.message}`;
-            } else {
-                fullPrompt = `[${now}] ${prefix} ${msg.message}`;
-            }
-
-            const threadPrompt = buildThreadPrompt(threadConfig, { threadId, model: effectiveModel });
-            logPrompt({
-                threadId, messageId, model: effectiveModel,
-                systemPromptAppend: threadPrompt,
-                userMessage: `${prefix} ${msg.message}`,
-                historyInjected: isNewSession,
-                historyLines: isNewSession ? historyContext.split("\n").length - 1 : 0,
-                promptLength: fullPrompt.length,
-            });
-
-            // Budget proxy setup
-            let budgetUsageId: string | undefined;
-            if (isBudgetMode() || effectiveModel.includes("fireworks")) {
-                budgetUsageId = crypto.randomUUID();
-                const pendingFile = path.join(BORG_DIR, `minimax-usage-${budgetUsageId}.pending`);
-                fs.writeFileSync(pendingFile, "");
-                process.env.ANTHROPIC_BASE_URL = `${BUDGET_PROXY_URL}/${budgetUsageId}`;
-            }
-
-            // Build query options
-            const stderrLines: string[] = [];
-            const options = await buildQueryOptions(threadId, threadConfig, effectiveModel, stderrLines, msg.message);
-
-            // Try to reuse existing session or create new one.
-            // For reused sessions, we need to push the message AFTER the consumer
-            // is set up on the iterator — otherwise events get lost.
-            let q: Query;
-            let needsPush = false;
-            const claimed = sessionPool.tryClaimSession(threadId, effectiveModel, threadConfig.cwd);
-            if (claimed) {
-                q = claimed.query;
-                needsPush = true; // Push after consumer starts
-            } else {
-                // createSession queues firstPrompt in the channel automatically
-                q = sessionPool.createSession(threadId, fullPrompt, options, effectiveModel, threadConfig.cwd);
-            }
-
-            // Claim active slot
+            // ─── Regular message: dispatch to processMessage ───
             activeCount++;
-            log("INFO", `Dispatching thread=${threadId} via streaming channel (active: ${activeCount}/${maxConcurrent})`);
+            busyThreads.add(msg.threadId);
+            log("INFO", `Dispatching thread=${msg.threadId} (active: ${activeCount}/${maxConcurrent})`);
 
-            // Start the event consumer (fire-and-forget)
-            const consumerPromise = consumeThreadEvents(
-                threadId, q, channel, sender, effectiveModel, messageId, threadConfig.cwd,
-            ).catch(err => {
-                log("ERROR", `Consumer error thread ${threadId}: ${toErrorMessage(err)}`);
-            }).finally(() => {
+            processMessage(file.path).finally(() => {
                 activeCount--;
-                activeConsumers.delete(threadId);
-                // Clean up budget usage files
-                if (budgetUsageId) {
-                    const pendingFile = path.join(BORG_DIR, `minimax-usage-${budgetUsageId}.pending`);
-                    try { if (fs.existsSync(pendingFile)) fs.unlinkSync(pendingFile); } catch {}
-                }
+                busyThreads.delete(msg.threadId);
                 void processQueue();
             });
-            activeConsumers.set(threadId, consumerPromise);
-
-            // For reused sessions, push the message now. The consumer is already
-            // waiting on iterator.next(), so the message flows through immediately.
-            if (needsPush && claimed) {
-                claimed.pushMessage(fullPrompt);
-            }
-
-            // Delete queue file
-            try { fs.unlinkSync(file.path); } catch {}
         }
     } catch (error) {
         log("ERROR", `Queue scan error: ${toErrorMessage(error)}`);
@@ -2643,12 +2251,11 @@ async function shutdown(signal: string): Promise<void> {
 
     log(
         "INFO",
-        `Received ${signal}. Shutting down... (${activeCount} active session(s), ${activeConsumers.size} consumer(s), ${activeBackgroundMonitors.size} background monitor(s), ${sessionPool.size} pooled session(s))`,
+        `Received ${signal}. Shutting down... (${activeCount} active session(s), ${activeBackgroundMonitors.size} background monitor(s))`,
     );
 
     clearInterval(queueInterval);
     clearInterval(sessionSyncInterval);
-    sessionPool.closeAll();
 
     try {
         const threads = loadThreads();

@@ -46,11 +46,6 @@ export interface OutgoingMessage {
     replyToVoice?: boolean;    // true if replying to a voice message
     crossThread?: boolean;       // true if this outgoing message needs cross-thread routing by infra
     scheduledTaskName?: string;  // present for scheduled task outputs — used for Telegram framing
-    // Streaming channel fields
-    streaming?: boolean;           // incremental text block from event consumer
-    streamComplete?: boolean;      // end of stream, carries usage info
-    accumulatedText?: string;      // full text for Listen TTS (only on streamComplete)
-    streamSequence?: number;       // ordering within stream (0-based)
 }
 
 // ─── Cross-Zone Pending Approval ───
