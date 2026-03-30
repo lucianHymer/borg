@@ -284,10 +284,6 @@ interface PendingMessage {
 const pendingMessages = new Map<string, PendingMessage>();
 const telegramToQueueId = new Map<number, string>(); // Telegram message_id → queue messageId
 
-// ─── Stream Block Tracking ───
-// Maps anchorMessageId → array of Telegram message_ids for streamed text blocks.
-// Used by streamComplete to add Listen button to the last block.
-const streamBlocks = new Map<string, number[]>();
 const listenInFlight = new Set<number>(); // track message IDs being processed for TTS
 const voiceButtonsInFlight = new Set<string>(); // track voice button callbacks being processed
 
@@ -1333,7 +1329,7 @@ async function pollOutgoingQueue(): Promise<void> {
             }
         }
 
-        // Sort by filename to ensure streaming blocks arrive in order
+        // Sort by filename for consistent ordering
         allFiles.sort((a, b) => a.file.localeCompare(b.file));
 
         for (const { file, filePath } of allFiles) {
@@ -1342,109 +1338,6 @@ async function pollOutgoingQueue(): Promise<void> {
                 const data: OutgoingMessage = JSON.parse(fs.readFileSync(filePath, "utf8"));
 
                 let firstSentId: number | undefined;
-
-                // ─── Streaming text block ───
-                if (data.streaming) {
-                    const chatId = settings.telegram_chat_id;
-                    const pending = pendingMessages.get(data.messageId);
-                    const threadId = data.threadId;
-                    const threadOpt = threadId && threadId !== 1
-                        ? { message_thread_id: threadId }
-                        : {};
-
-                    // On first block (sequence 0), delete the status message
-                    if (data.streamSequence === 0) {
-                        const threadState = threadStatusMap.get(threadId);
-                        if (threadState?.statusMessageId) {
-                            try {
-                                await bot.api.deleteMessage(threadState.chatId, threadState.statusMessageId);
-                            } catch { /* may already be deleted */ }
-                            threadState.statusMessageId = undefined;
-                        }
-                    }
-
-                    // Send text block as a new Telegram message
-                    const markdownV2Text = toTelegramMarkdownV2(data.message);
-                    const chunks = splitMessage(markdownV2Text);
-
-                    // Reply to user's original message on first block
-                    const replyParams = data.streamSequence === 0 && pending && pending.telegramMessageId > 0
-                        ? { reply_parameters: { message_id: pending.telegramMessageId } }
-                        : {};
-
-                    for (let i = 0; i < chunks.length; i++) {
-                        try {
-                            const sent = await bot.api.sendMessage(chatId, chunks[i], {
-                                ...threadOpt,
-                                parse_mode: "MarkdownV2" as const,
-                                ...(i === 0 ? replyParams : {}),
-                                disable_notification: data.streamSequence !== 0, // Only first block notifies
-                            });
-
-                            // Track the Telegram message_id for this stream
-                            const blocks = streamBlocks.get(data.messageId) ?? [];
-                            blocks.push(sent.message_id);
-                            streamBlocks.set(data.messageId, blocks);
-
-                            // Add model reaction on first block
-                            if (data.streamSequence === 0 && i === 0 && data.model) {
-                                storeMessageModel(sent.message_id, data.model, threadId, data.message);
-                                await reactWithModel(chatId, sent.message_id, data.model);
-                            }
-                        } catch (sendErr) {
-                            // Plain text fallback for markdown parse errors
-                            const errMsg = toErrorMessage(sendErr);
-                            if (errMsg.includes("can't parse entities")) {
-                                try {
-                                    const sent = await bot.api.sendMessage(chatId, data.message, {
-                                        ...threadOpt,
-                                        ...(i === 0 ? replyParams : {}),
-                                        disable_notification: data.streamSequence !== 0,
-                                    });
-                                    const blocks = streamBlocks.get(data.messageId) ?? [];
-                                    blocks.push(sent.message_id);
-                                    streamBlocks.set(data.messageId, blocks);
-                                } catch { /* give up on this chunk */ }
-                            } else {
-                                log("WARN", `Failed to send streaming block: ${errMsg}`);
-                            }
-                        }
-                    }
-
-                    fs.unlinkSync(filePath);
-                    continue;
-                }
-
-                // ─── Stream complete marker ───
-                if (data.streamComplete) {
-                    const blocks = streamBlocks.get(data.messageId);
-                    const chatId = settings.telegram_chat_id;
-
-                    // Add Listen button to each text block, store full text on each for TTS
-                    if (blocks && blocks.length > 0 && data.accumulatedText) {
-                        for (const blockId of blocks) {
-                            try {
-                                const keyboard = buildReplyKeyboard(blockId, undefined, undefined, data.messageId);
-                                await bot.api.editMessageReplyMarkup(chatId, blockId, {
-                                    reply_markup: keyboard,
-                                });
-                            } catch { /* Buttons are best-effort */ }
-
-                            if (data.model) {
-                                storeMessageModel(blockId, data.model, data.threadId, data.accumulatedText);
-                            }
-                        }
-                    }
-
-                    // Clean up
-                    streamBlocks.delete(data.messageId);
-                    pendingMessages.delete(data.messageId);
-                    telegramToQueueId.delete(pendingMessages.get(data.messageId)?.telegramMessageId ?? -1);
-
-                    fs.unlinkSync(filePath);
-                    log("INFO", `Stream complete for thread ${data.threadId} (${blocks?.length ?? 0} block(s))`);
-                    continue;
-                }
 
                 if (data.crossThread && data.targetThreadId && data.sourceThreadId) {
                     // Cross-thread message: infra handles zone routing
@@ -1683,25 +1576,28 @@ async function pollOutgoingQueue(): Promise<void> {
                             ? { message_thread_id: data.threadId }
                             : {};
 
+                        // Silence cost alerts and system messages
+                        const isSilent = data.model === "system" || data.messageId.startsWith("cost_alert_") || data.messageId.startsWith("bg_alert_");
+
                         for (const chunk of chunks) {
-                            const sent = await bot.api.sendMessage(chatId, chunk, { ...threadOpt, parse_mode: "MarkdownV2" });
+                            const sent = await bot.api.sendMessage(chatId, chunk, { ...threadOpt, parse_mode: "MarkdownV2", disable_notification: isSilent });
                             if (!firstSentId) {
                                 firstSentId = sent.message_id;
                                 // Store full text ONLY for multi-segment messages, on the first segment
-                                if (data.model && chunks.length > 1) {
+                                if (data.model && data.model !== "system" && chunks.length > 1) {
                                     storeMessageModel(sent.message_id, data.model, data.threadId, data.message);
                                     await reactWithModel(chatId, sent.message_id, data.model);
-                                } else if (data.model) {
+                                } else if (data.model && data.model !== "system") {
                                     storeMessageModel(sent.message_id, data.model, data.threadId);
                                     await reactWithModel(chatId, sent.message_id, data.model);
                                 }
-                            } else if (data.model) {
+                            } else if (data.model && data.model !== "system") {
                                 storeMessageModel(sent.message_id, data.model, data.threadId);
                                 await reactWithModel(chatId, sent.message_id, data.model);
                             }
                         }
 
-                        if (firstSentId) {
+                        if (firstSentId && !isSilent) {
                             try {
                                 const keyboard = buildReplyKeyboard(firstSentId, data.replyToMessageId, data.replyToVoice, data.messageId);
                                 await bot.api.editMessageReplyMarkup(settings.telegram_chat_id, firstSentId, {
@@ -1910,25 +1806,29 @@ async function pollThreadStatus(): Promise<void> {
                 ? `🕐 ${statusData.label}... — stalled`
                 : `🕐 ${statusData.label}... (${elapsed}s)`;
 
-            // Append preview text
-            const previewText = statusData.preview;
+            // Show accumulated response text (growing in place) or just the status line
+            const fullText = statusData.fullText;
             let displayText: string;
-            if (previewText) {
-                const maxPreview = 500;
-                const truncated = previewText.length > maxPreview
-                    ? "…" + previewText.slice(-maxPreview)
-                    : previewText;
-                displayText = `${statusLine}\n\n💬 ${truncated}\n\n[still processing...]`;
+            if (fullText) {
+                // Show the full accumulated text with a processing indicator at the end.
+                // Use plain text during progress to avoid MarkdownV2 entity corruption.
+                // Telegram message limit is 4096 chars — truncate from the head if needed.
+                const indicator = `\n\n${statusLine}`;
+                const maxTextLen = 4096 - indicator.length - 10; // margin
+                const truncatedText = fullText.length > maxTextLen
+                    ? "…" + fullText.slice(-maxTextLen)
+                    : fullText;
+                displayText = `${truncatedText}${indicator}`;
             } else {
                 displayText = statusLine;
             }
 
             // Change detection & throttling
-            const previewChanged = previewText !== state.lastPreview;
+            const textChanged = fullText !== state.lastPreview;
             const labelChanged = statusData.label !== state.lastStatusLabel;
             const timeSinceLastEdit = Date.now() - (state.lastEditTs ?? 0);
             if (displayText === state.lastStatusText) continue;
-            if (!labelChanged && !previewChanged && !isStale && timeSinceLastEdit < 20_000) continue;
+            if (!labelChanged && !textChanged && !isStale && timeSinceLastEdit < 20_000) continue;
 
             // Cancel button — references the current anchor messageId
             let cancelKeyboard: InlineKeyboard | undefined;
@@ -1968,7 +1868,7 @@ async function pollThreadStatus(): Promise<void> {
                 }
                 state.lastStatusText = displayText;
                 state.lastStatusLabel = statusData.label;
-                state.lastPreview = previewText;
+                state.lastPreview = fullText;
                 state.lastEditTs = Date.now();
             } catch {
                 // editMessageText may fail if message was deleted or content unchanged — ignore
