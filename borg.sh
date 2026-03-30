@@ -5,7 +5,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-COMPOSE_FILE="$SCRIPT_DIR/docker-compose.yml"
+COMPOSE_FILE="${COMPOSE_FILE:-$SCRIPT_DIR/docker-compose.yml}"
 
 # One-time migration from .tinyclaw/ to .borg/
 if [ -d "$SCRIPT_DIR/.tinyclaw" ] && [ ! -d "$SCRIPT_DIR/.borg" ]; then
