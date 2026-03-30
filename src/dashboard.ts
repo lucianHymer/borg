@@ -1793,6 +1793,7 @@ app.post("/api/webhooks/clairvoyant", (req: express.Request & { rawBody?: Buffer
             threadId,
             sender: "clairvoyant",
             message,
+            model: "opus",
             idempotencyKey: event.idempotency_key,
         });
         res.status(202).json(result);
