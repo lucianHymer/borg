@@ -27,6 +27,7 @@ import { storeVoiceTranscript } from "./voice-cache.js";
 import { startPeriodicCleanup as startImageCleanup } from "./images.js";
 import { toTelegramMarkdownV2, escapeMarkdownV2 } from "./markdown-v2.js";
 import { loadZoneConfig, getThreadZone, isSameZone } from "./zone-config.js";
+import { startWebhookServer, stopWebhookServer } from "./webhook-server.js";
 
 // ─── Constants ───
 
@@ -2396,8 +2397,8 @@ bot.catch((err) => {
 
 // ─── Graceful Shutdown ───
 
-process.once("SIGINT", () => bot.stop());
-process.once("SIGTERM", () => bot.stop());
+process.once("SIGINT", () => { stopWebhookServer(); bot.stop(); });
+process.once("SIGTERM", () => { stopWebhookServer(); bot.stop(); });
 
 // ─── Cross-Zone Pending Approval Reminder ───
 
@@ -2493,6 +2494,9 @@ setTimeout(checkPendingApprovalReminder, 30_000);
 
 // Ensure Speaches models are installed (fire-and-forget, cached across restarts)
 ensureModels().catch(() => {});
+
+// Start webhook HTTP server (external integrations)
+startWebhookServer();
 
 bot.start({
     allowed_updates: [...API_CONSTANTS.DEFAULT_UPDATE_TYPES, "message_reaction"],
