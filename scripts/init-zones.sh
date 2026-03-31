@@ -26,6 +26,11 @@ for zone in core perimeter; do
     touch ".borg-${zone}/message-history.jsonl"
     # Claude Code user settings (MCP tools, etc.) — per-zone to isolate secrets
     [ -f ".borg-${zone}/claude-settings.json" ] || echo '{}' > ".borg-${zone}/claude-settings.json"
+    # Claude Code skills — persistent + refreshed from repo on each startup
+    mkdir -p ".borg-${zone}/claude-skills"
+    if [ -d skills/global ]; then
+        cp -f skills/global/* ".borg-${zone}/claude-skills/" 2>/dev/null || true
+    fi
 done
 
 for dir in "${INFRA_DIRS[@]}"; do

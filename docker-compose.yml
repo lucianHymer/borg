@@ -86,7 +86,7 @@ services:
       # Credentials
       - ./secrets/github-installations.json:/secrets/github-installations.json:ro
       - ${CLAUDE_CREDENTIALS}:/home/node/.claude/.credentials.json
-      - ./skills/global:/home/node/.claude/skills:ro
+      - ./.borg-core/claude-skills:/home/node/.claude/skills
       - claude-plugins-core:/home/node/.claude/plugins
       - ./.borg-core/claude-settings.json:/home/node/.claude/settings.json
     environment:
@@ -129,6 +129,7 @@ services:
       # Credentials (limited)
       - ./secrets/github-installations.json:/secrets/github-installations.json:ro
       - ${CLAUDE_CREDENTIALS}:/home/node/.claude/.credentials.json
+      - ./.borg-perimeter/claude-skills:/home/node/.claude/skills
       - claude-plugins-perimeter:/home/node/.claude/plugins
       - ./.borg-perimeter/claude-settings.json:/home/node/.claude/settings.json
       # NO SSH keys, NO docker-proxy access
