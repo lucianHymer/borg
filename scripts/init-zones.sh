@@ -24,6 +24,8 @@ for zone in core perimeter; do
         mkdir -p ".borg-${zone}/${dir}"
     done
     touch ".borg-${zone}/message-history.jsonl"
+    # Claude Code user settings (MCP tools, etc.) — per-zone to isolate secrets
+    [ -f ".borg-${zone}/claude-settings.json" ] || echo '{}' > ".borg-${zone}/claude-settings.json"
 done
 
 for dir in "${INFRA_DIRS[@]}"; do
