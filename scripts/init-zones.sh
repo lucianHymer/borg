@@ -24,6 +24,15 @@ for zone in core perimeter; do
         mkdir -p ".borg-${zone}/${dir}"
     done
     touch ".borg-${zone}/message-history.jsonl"
+    # Claude Code user settings (MCP tools, etc.) — per-zone to isolate secrets
+    # Handle Docker's directory-for-missing-file mount quirk
+    [ -d ".borg-${zone}/claude-settings.json" ] && rmdir ".borg-${zone}/claude-settings.json" 2>/dev/null || true
+    [ -f ".borg-${zone}/claude-settings.json" ] || echo '{}' > ".borg-${zone}/claude-settings.json"
+    # Claude Code skills — persistent (writable by agents) + refreshed from repo on each startup
+    mkdir -p ".borg-${zone}/claude-skills"
+    if [ -d skills/global ]; then
+        cp -rf skills/global/. ".borg-${zone}/claude-skills/" 2>/dev/null || true
+    fi
 done
 
 for dir in "${INFRA_DIRS[@]}"; do
