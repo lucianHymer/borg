@@ -1721,6 +1721,7 @@ app.post("/api/talk/send", express.raw({ type: "audio/*", limit: "10mb" }), asyn
                     message_thread_id: threadId === 1 ? undefined : threadId,
                     text: `🎙 *From ${sender} via Talk Mode:*\n\n${transcript}`,
                     parse_mode: "Markdown",
+                    disable_notification: true,
                 }),
             }).catch(() => { /* best effort — don't block on Telegram failure */ });
         }
