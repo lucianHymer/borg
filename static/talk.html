@@ -73,6 +73,110 @@ body {
   font-family: var(--font-mono);
   font-size: 12px;
   min-width: 200px;
+  flex: 1;
+  max-width: 300px;
+}
+
+/* ─── Thread Drawer (mobile-friendly) ─── */
+
+#thread-drawer {
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+  display: none;
+}
+
+#thread-drawer.open { display: flex; }
+
+#thread-drawer .overlay {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+}
+
+#thread-drawer .panel {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: min(320px, 85vw);
+  background: var(--bg-secondary);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+#thread-drawer .panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+  font-size: 14px;
+  font-weight: 700;
+}
+
+#thread-drawer .panel-header button {
+  background: none;
+  border: none;
+  color: var(--text-secondary);
+  font-size: 18px;
+  cursor: pointer;
+  padding: 4px;
+}
+
+#thread-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px 0;
+}
+
+.thread-item {
+  display: flex;
+  align-items: center;
+  padding: 10px 16px;
+  cursor: pointer;
+  gap: 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.thread-item:hover, .thread-item:active { background: var(--bg-tertiary); }
+.thread-item.active { background: var(--bg-tertiary); border-left: 3px solid var(--accent-blue); }
+
+.thread-item .star {
+  font-size: 16px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  flex-shrink: 0;
+  padding: 4px;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.thread-item .star.pinned { color: var(--accent-yellow); }
+.thread-item .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+#thread-btn {
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  padding: 4px 10px;
+  cursor: pointer;
+  display: none;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 200px;
+}
+
+@media (max-width: 600px) {
+  #thread-select { display: none; }
+  #thread-btn { display: block; }
+  #topbar { padding: 8px 12px; gap: 8px; }
+  #auto-play-toggle span { display: none; }
 }
 
 #topbar .spacer { flex: 1; }
@@ -302,6 +406,7 @@ body {
 
 <div id="topbar">
   <span class="brand"><a href="/">Borg</a> / Talk Mode</span>
+  <button id="thread-btn" title="Switch thread"></button>
   <select id="thread-select"></select>
   <span class="spacer"></span>
   <label id="auto-play-toggle">
@@ -321,6 +426,17 @@ body {
 </div>
 
 <audio id="audio-player"></audio>
+
+<div id="thread-drawer">
+  <div class="overlay"></div>
+  <div class="panel">
+    <div class="panel-header">
+      <span>Threads</span>
+      <button id="drawer-close">&times;</button>
+    </div>
+    <div id="thread-list"></div>
+  </div>
+</div>
 
 <div id="name-modal" class="hidden">
   <div class="modal-content">
@@ -349,6 +465,10 @@ const messagesEl = document.getElementById('messages');
 const micBtn = document.getElementById('mic-btn');
 const micLabel = document.getElementById('mic-label');
 const threadSelect = document.getElementById('thread-select');
+const threadBtn = document.getElementById('thread-btn');
+const threadDrawer = document.getElementById('thread-drawer');
+const threadList = document.getElementById('thread-list');
+const drawerClose = document.getElementById('drawer-close');
 const statusEl = document.getElementById('status-indicator');
 const userNameEl = document.getElementById('user-name');
 const nameModal = document.getElementById('name-modal');
@@ -356,6 +476,12 @@ const nameInput = document.getElementById('name-input');
 const nameSubmit = document.getElementById('name-submit');
 const audioPlayer = document.getElementById('audio-player');
 const autoPlayCb = document.getElementById('auto-play-cb');
+
+// ─── Secure Context Check ───
+if (!window.isSecureContext) {
+  micLabel.textContent = 'HTTPS required for mic';
+  micBtn.title = 'Microphone requires HTTPS. Access this page via https:// or localhost.';
+}
 
 // ─── Name Setup ───
 
@@ -386,34 +512,105 @@ if (!userName) {
 
 // ─── Thread Loading ───
 
+function getPinned() {
+  return JSON.parse(localStorage.getItem('talk-mode-pinned') || '[]');
+}
+
+function togglePin(id) {
+  const pinned = getPinned();
+  const idx = pinned.indexOf(id);
+  if (idx >= 0) pinned.splice(idx, 1);
+  else pinned.push(id);
+  localStorage.setItem('talk-mode-pinned', JSON.stringify(pinned));
+  return pinned;
+}
+
+function sortedEntries() {
+  const pinned = getPinned();
+  return Object.entries(threads).sort((a, b) => {
+    const aPinned = pinned.includes(Number(a[0]));
+    const bPinned = pinned.includes(Number(b[0]));
+    if (aPinned !== bPinned) return aPinned ? -1 : 1;
+    return (a[1].name || '').localeCompare(b[1].name || '');
+  });
+}
+
+function selectThread(id) {
+  selectedThreadId = id;
+  localStorage.setItem('talk-mode-thread', String(id));
+  threadSelect.value = String(id);
+  const name = threads[id]?.name || `Thread ${id}`;
+  threadBtn.textContent = name;
+  renderedMessageIds.clear();
+  loadRecentMessages();
+  connectSSE();
+  closeDrawer();
+}
+
+function renderDrawer() {
+  const pinned = getPinned();
+  const entries = sortedEntries();
+  threadList.innerHTML = '';
+  for (const [id, cfg] of entries) {
+    const numId = Number(id);
+    const item = document.createElement('div');
+    item.className = 'thread-item' + (numId === selectedThreadId ? ' active' : '');
+
+    const star = document.createElement('span');
+    star.className = 'star' + (pinned.includes(numId) ? ' pinned' : '');
+    star.textContent = pinned.includes(numId) ? '\u2605' : '\u2606';
+    star.addEventListener('click', (e) => {
+      e.stopPropagation();
+      togglePin(numId);
+      renderDrawer();
+      renderSelect();
+    });
+
+    const name = document.createElement('span');
+    name.className = 'name';
+    name.textContent = cfg.name || `Thread ${id}`;
+
+    item.appendChild(star);
+    item.appendChild(name);
+    item.addEventListener('click', () => selectThread(numId));
+    threadList.appendChild(item);
+  }
+}
+
+function renderSelect() {
+  const pinned = getPinned();
+  const entries = sortedEntries();
+  threadSelect.innerHTML = '';
+  for (const [id, cfg] of entries) {
+    const opt = document.createElement('option');
+    opt.value = id;
+    const prefix = pinned.includes(Number(id)) ? '\u2605 ' : '';
+    opt.textContent = `${prefix}${cfg.name || 'Thread ' + id}`;
+    threadSelect.appendChild(opt);
+  }
+  if (selectedThreadId && threads[selectedThreadId]) {
+    threadSelect.value = String(selectedThreadId);
+  }
+}
+
+function openDrawer() { threadDrawer.classList.add('open'); renderDrawer(); }
+function closeDrawer() { threadDrawer.classList.remove('open'); }
+
 async function loadThreads() {
   try {
     const res = await fetch('/api/threads');
     threads = await res.json();
-    threadSelect.innerHTML = '';
-    const pinned = JSON.parse(localStorage.getItem('talk-mode-pinned') || '[]');
-
-    // Sort: pinned first, then alphabetical
-    const entries = Object.entries(threads).sort((a, b) => {
-      const aPinned = pinned.includes(Number(a[0]));
-      const bPinned = pinned.includes(Number(b[0]));
-      if (aPinned !== bPinned) return aPinned ? -1 : 1;
-      return (a[1].name || '').localeCompare(b[1].name || '');
-    });
-
-    for (const [id, cfg] of entries) {
-      const opt = document.createElement('option');
-      opt.value = id;
-      const prefix = pinned.includes(Number(id)) ? '\u2606 ' : '';
-      opt.textContent = `${prefix}${cfg.name || 'Thread ' + id}`;
-      threadSelect.appendChild(opt);
-    }
+    renderSelect();
 
     // Restore selection
     if (selectedThreadId && threads[selectedThreadId]) {
       threadSelect.value = String(selectedThreadId);
+      threadBtn.textContent = threads[selectedThreadId].name || `Thread ${selectedThreadId}`;
     } else if (threadSelect.options.length) {
       selectedThreadId = parseInt(threadSelect.value, 10);
+      threadBtn.textContent = threads[selectedThreadId]?.name || `Thread ${selectedThreadId}`;
+    } else {
+      threadBtn.textContent = 'Select thread';
     }
 
     loadRecentMessages();
@@ -423,25 +620,10 @@ async function loadThreads() {
   }
 }
 
-threadSelect.addEventListener('change', () => {
-  selectedThreadId = parseInt(threadSelect.value, 10);
-  localStorage.setItem('talk-mode-thread', String(selectedThreadId));
-  renderedMessageIds.clear();
-  loadRecentMessages();
-  connectSSE();
-});
-
-// ─── Double-click to pin/unpin thread ───
-threadSelect.addEventListener('dblclick', () => {
-  const id = parseInt(threadSelect.value, 10);
-  if (!id) return;
-  const pinned = JSON.parse(localStorage.getItem('talk-mode-pinned') || '[]');
-  const idx = pinned.indexOf(id);
-  if (idx >= 0) pinned.splice(idx, 1);
-  else pinned.push(id);
-  localStorage.setItem('talk-mode-pinned', JSON.stringify(pinned));
-  loadThreads();
-});
+threadSelect.addEventListener('change', () => selectThread(parseInt(threadSelect.value, 10)));
+threadBtn.addEventListener('click', openDrawer);
+drawerClose.addEventListener('click', closeDrawer);
+threadDrawer.querySelector('.overlay').addEventListener('click', closeDrawer);
 
 // ─── Messages ───
 
@@ -589,7 +771,15 @@ async function startRecording() {
     micLabel.textContent = 'recording... tap to stop';
   } catch (err) {
     console.error('Mic access error:', err);
-    micLabel.textContent = 'mic access denied';
+    if (!window.isSecureContext) {
+      micLabel.textContent = 'HTTPS required for mic access';
+    } else if (err.name === 'NotAllowedError') {
+      micLabel.textContent = 'mic permission denied — check browser settings';
+    } else if (err.name === 'NotFoundError') {
+      micLabel.textContent = 'no microphone found';
+    } else {
+      micLabel.textContent = `mic error: ${err.message || err.name}`;
+    }
   }
 }
 

@@ -192,26 +192,47 @@ app.get("/api/heartbeats", (_req, res) => {
     res.json(results);
 });
 
-// GET /api/threads/:id/messages — message history filtered by threadId
+// GET /api/threads/:id/messages — message history filtered by threadId (reads all zones)
 app.get("/api/threads/:id/messages", (req, res) => {
     const threadId = parseInt(req.params.id, 10);
     const limit = Math.min(parseInt(String(req.query.n ?? "50"), 10) || 50, 200);
-    const entries = readRecentJsonl<Record<string, unknown>>(
-        path.join(BORG_DIR, "message-history.jsonl"),
-        500,
-    );
-    const filtered = entries.filter(e => e.threadId === threadId).slice(-limit);
+    const allEntries: Record<string, unknown>[] = [];
+    const zoneDirs = [BORG_DIR, path.join(SCRIPT_DIR, ".borg-core"), path.join(SCRIPT_DIR, ".borg-perimeter")];
+    for (const dir of zoneDirs) {
+        const histFile = path.join(dir, "message-history.jsonl");
+        if (!fs.existsSync(histFile)) continue;
+        const entries = readRecentJsonl<Record<string, unknown>>(histFile, 500);
+        allEntries.push(...entries);
+    }
+    // Sort by timestamp, deduplicate by messageId, filter by threadId
+    allEntries.sort((a: any, b: any) => (a.timestamp || 0) - (b.timestamp || 0));
+    const seen = new Set<string>();
+    const filtered = allEntries.filter((e: any) => {
+        if (e.threadId !== threadId) return false;
+        if (e.messageId) {
+            if (seen.has(e.messageId)) return false;
+            seen.add(e.messageId);
+        }
+        return true;
+    }).slice(-limit);
     res.json(filtered);
 });
 
-// GET /api/messages/recent?n=50 — recent messages across all threads
+// GET /api/messages/recent?n=50 — recent messages across all threads (all zones)
 app.get("/api/messages/recent", (req, res) => {
     const n = Math.min(parseInt(String(req.query.n ?? "50"), 10) || 50, 200);
-    const entries = readRecentJsonl(path.join(BORG_DIR, "message-history.jsonl"), n);
-    res.json(entries);
+    const allEntries: Record<string, unknown>[] = [];
+    const zoneDirs = [BORG_DIR, path.join(SCRIPT_DIR, ".borg-core"), path.join(SCRIPT_DIR, ".borg-perimeter")];
+    for (const dir of zoneDirs) {
+        const histFile = path.join(dir, "message-history.jsonl");
+        if (!fs.existsSync(histFile)) continue;
+        allEntries.push(...readRecentJsonl<Record<string, unknown>>(histFile, 200));
+    }
+    allEntries.sort((a: any, b: any) => (a.timestamp || 0) - (b.timestamp || 0));
+    res.json(allEntries.slice(-n));
 });
 
-// GET /api/messages/feed — SSE stream of new messages (broadcast pattern)
+// GET /api/messages/feed — SSE stream of new messages (broadcast pattern, all zones)
 app.get("/api/messages/feed", (_req, res) => {
     res.writeHead(200, {
         "Content-Type": "text/event-stream",
@@ -220,16 +241,20 @@ app.get("/api/messages/feed", (_req, res) => {
     });
     res.write(":\n\n"); // SSE comment to establish connection
 
-    const historyFile = path.join(BORG_DIR, "message-history.jsonl");
-    const tailState: TailState = { offset: 0 };
-
-    // Initialize to current EOF so we only send new messages
-    if (fs.existsSync(historyFile)) {
-        const stat = fs.statSync(historyFile);
-        tailState.offset = stat.size;
+    // Track tail state for each zone's history file
+    const zoneStates: { file: string; tailState: TailState }[] = [];
+    const zoneDirs = [BORG_DIR, path.join(SCRIPT_DIR, ".borg-core"), path.join(SCRIPT_DIR, ".borg-perimeter")];
+    for (const dir of zoneDirs) {
+        const histFile = path.join(dir, "message-history.jsonl");
+        const tailState: TailState = { offset: 0 };
+        if (fs.existsSync(histFile)) {
+            const stat = fs.statSync(histFile);
+            tailState.offset = stat.size;
+        }
+        zoneStates.push({ file: histFile, tailState });
     }
 
-    const client: FeedClient = { res, tailState };
+    const client: MultiFeedClient = { res, zoneStates };
     messageFeedClients.add(client);
     startMessageFeed();
 
@@ -320,27 +345,33 @@ interface FeedClient {
     tailState: TailState;
 }
 
-// ─── Message Feed (broadcast pattern) ───
+interface MultiFeedClient {
+    res: http.ServerResponse;
+    zoneStates: { file: string; tailState: TailState }[];
+}
 
-const messageFeedClients = new Set<FeedClient>();
+// ─── Message Feed (broadcast pattern, multi-zone) ───
+
+const messageFeedClients = new Set<MultiFeedClient>();
 let messageFeedInterval: ReturnType<typeof setInterval> | null = null;
 
 function startMessageFeed(): void {
     if (messageFeedInterval) return;
-    const historyFile = path.join(BORG_DIR, "message-history.jsonl");
     messageFeedInterval = setInterval(() => {
         if (messageFeedClients.size === 0) return;
         for (const client of messageFeedClients) {
-            const content = readNewBytes(historyFile, client.tailState);
-            if (content === null) continue;
-            const lines = content.split("\n").filter(l => l.trim());
-            for (const line of lines) {
-                try { JSON.parse(line); } catch { continue; } // skip malformed
-                try {
-                    client.res.write(`data: ${line}\n\n`);
-                } catch {
-                    messageFeedClients.delete(client);
-                    break;
+            for (const { file, tailState } of client.zoneStates) {
+                const content = readNewBytes(file, tailState);
+                if (content === null) continue;
+                const lines = content.split("\n").filter(l => l.trim());
+                for (const line of lines) {
+                    try { JSON.parse(line); } catch { continue; }
+                    try {
+                        client.res.write(`data: ${line}\n\n`);
+                    } catch {
+                        messageFeedClients.delete(client);
+                        break;
+                    }
                 }
             }
         }
