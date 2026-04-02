@@ -693,11 +693,8 @@ function connectSSE() {
 
       // Auto-synthesize and play bot responses
       if (result.isOutgoing && autoPlayCb.checked && result.message) {
-        // Only auto-play if this is a response to our pending message
-        if (pendingMessageId) {
-          pendingMessageId = null;
-          synthesizeAndPlay(result.message);
-        }
+        pendingMessageId = null;
+        synthesizeAndPlay(result.message);
       }
     } catch { /* ignore parse errors */ }
   };

@@ -25,7 +25,7 @@ import type { PendingApproval, BackgroundTaskState } from "./types.js";
 import { mergeCorrectionsOntoDecisions } from "./routing-logger.js";
 import { readRecentJsonl } from "./jsonl-reader.js";
 import { loadZoneConfig, getThreadZone, addThreadToZone, removeThreadFromZones, saveZoneConfig, clearZoneConfigCache } from "./zone-config.js";
-import { transcribe, distillForSpeech, synthesize, ensureModels, isAvailable } from "./audio.js";
+import { transcribe, ensureModels } from "./audio.js";
 import { loadSettings } from "./session-manager.js";
 
 const SCRIPT_DIR = path.resolve(__dirname, "..");
@@ -1654,8 +1654,11 @@ app.get("/talk", (_req, res) => {
     }
 });
 
-// Serve synthesized audio files
+// Serve synthesized audio files (from both .borg/audio and writable talk audio dir)
 app.use("/audio", express.static(path.join(BORG_DIR, "audio")));
+const TALK_SYNTH_DIR = path.join(os.tmpdir(), "borg-talk-synth");
+if (!fs.existsSync(TALK_SYNTH_DIR)) fs.mkdirSync(TALK_SYNTH_DIR, { recursive: true });
+app.use("/talk-audio", express.static(TALK_SYNTH_DIR));
 
 // POST /api/talk/send — receive audio, transcribe, queue as incoming message
 app.post("/api/talk/send", express.raw({ type: "audio/*", limit: "10mb" }), async (req, res) => {
@@ -1747,7 +1750,13 @@ app.post("/api/talk/send", express.raw({ type: "audio/*", limit: "10mb" }), asyn
     }
 });
 
-// POST /api/talk/synthesize — distill + TTS, return audio URL
+// POST /api/talk/synthesize — TTS via speaches, return audio URL
+// Dashboard has no Anthropic API credentials, so we call speaches directly
+// (no distillForSpeech step — that needs the agent SDK).
+const SPEACHES_URL = process.env.SPEACHES_URL || "http://speaches:8000";
+const TTS_MODEL = "speaches-ai/Kokoro-82M-v1.0-ONNX";
+const TTS_CHUNK_SIZE = 800;
+
 app.post("/api/talk/synthesize", express.json(), async (req, res) => {
     const { text } = req.body as { text?: string };
     if (!text) {
@@ -1756,24 +1765,60 @@ app.post("/api/talk/synthesize", express.json(), async (req, res) => {
     }
 
     try {
-        const available = await isAvailable();
-        if (!available) {
-            res.status(503).json({ error: "TTS service unavailable" });
-            return;
+        // Load TTS settings
+        const settings = loadSettings();
+        const voice = settings.tts_voice || "bf_alice";
+        const speed = settings.tts_speed || 1.0;
+
+        // Chunk text for Kokoro (truncates beyond ~500 tokens)
+        const chunks = text.length <= TTS_CHUNK_SIZE ? [text] : splitTextChunks(text, TTS_CHUNK_SIZE);
+        const buffers: Buffer[] = [];
+        for (const chunk of chunks) {
+            const ttsRes = await fetch(`${SPEACHES_URL}/v1/audio/speech`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ model: TTS_MODEL, voice, input: chunk, speed, response_format: "mp3" }),
+                signal: AbortSignal.timeout(60_000),
+            });
+            if (!ttsRes.ok) {
+                const body = await ttsRes.text().catch(() => "");
+                throw new Error(`TTS failed (${ttsRes.status}): ${body}`);
+            }
+            buffers.push(Buffer.from(await ttsRes.arrayBuffer()));
         }
 
-        await ensureModels();
+        const combined = Buffer.concat(buffers);
+        const filename = `tts_${Date.now()}_${Math.random().toString(36).slice(2, 6)}.mp3`;
+        const outPath = path.join(TALK_SYNTH_DIR, filename);
+        const tmpPath = outPath + ".tmp";
+        fs.writeFileSync(tmpPath, combined);
+        fs.renameSync(tmpPath, outPath);
 
-        // Same pipeline as the Listen button in telegram-client
-        const speechText = await distillForSpeech(text);
-        const audioPath = await synthesize(speechText);
-        const filename = path.basename(audioPath);
-
-        res.json({ audioUrl: `/audio/${filename}` });
+        res.json({ audioUrl: `/talk-audio/${filename}` });
     } catch (err) {
         res.status(500).json({ error: toErrorMessage(err) });
     }
 });
+
+/** Split text at sentence boundaries for TTS chunking. */
+function splitTextChunks(text: string, maxLen: number): string[] {
+    const chunks: string[] = [];
+    let remaining = text;
+    while (remaining.length > 0) {
+        if (remaining.length <= maxLen) { chunks.push(remaining); break; }
+        const window = remaining.slice(0, maxLen);
+        let splitAt = -1;
+        for (const sep of [". ", "! ", "? ", ".\n", "!\n", "?\n"]) {
+            const idx = window.lastIndexOf(sep);
+            if (idx > splitAt) splitAt = idx + sep.length;
+        }
+        if (splitAt <= 0) splitAt = window.lastIndexOf(" ");
+        if (splitAt <= 0) splitAt = maxLen;
+        chunks.push(remaining.slice(0, splitAt).trim());
+        remaining = remaining.slice(splitAt).trim();
+    }
+    return chunks.filter(c => c.length > 0);
+}
 
 // ─── Start Server ───
 
