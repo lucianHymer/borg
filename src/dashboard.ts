@@ -24,12 +24,15 @@ import type { PendingApproval, BackgroundTaskState } from "./types.js";
 import { mergeCorrectionsOntoDecisions } from "./routing-logger.js";
 import { readRecentJsonl } from "./jsonl-reader.js";
 import { loadZoneConfig, getThreadZone, addThreadToZone, removeThreadFromZones, saveZoneConfig, clearZoneConfigCache } from "./zone-config.js";
+import { transcribe, distillForSpeech, synthesize, ensureModels, isAvailable } from "./audio.js";
+import { loadSettings } from "./session-manager.js";
 
 const SCRIPT_DIR = path.resolve(__dirname, "..");
 const BORG_DIR = path.join(SCRIPT_DIR, ".borg");
 const BORG_INFRA_DIR = path.join(SCRIPT_DIR, ".borg-infra");
 const STATIC_DIR = path.join(SCRIPT_DIR, "static");
 const SESSIONS_DIR = path.join(BORG_DIR, "sessions");
+const TALK_AUDIO_DIR = path.join(BORG_DIR, "audio/talk");
 // threads.json is at project root (shared across all zone containers)
 const THREADS_FILE = path.join(SCRIPT_DIR, "threads.json");
 const PORT = parseInt(process.env.DASHBOARD_PORT || "3100", 10);
@@ -1603,6 +1606,138 @@ app.get("/api/response/:messageId/feed", (req, res) => {
     req.on("close", () => {
         clearInterval(interval);
     });
+});
+
+// ─── Talk Mode ───
+
+// Serve talk mode page
+app.get("/talk", (_req, res) => {
+    const htmlPath = path.join(STATIC_DIR, "talk.html");
+    if (fs.existsSync(htmlPath)) {
+        res.sendFile(htmlPath);
+    } else {
+        res.status(404).send("Talk mode HTML not found. Place static/talk.html.");
+    }
+});
+
+// Serve synthesized audio files
+app.use("/audio", express.static(path.join(BORG_DIR, "audio")));
+
+// POST /api/talk/send — receive audio, transcribe, queue as incoming message
+app.post("/api/talk/send", express.raw({ type: "audio/*", limit: "10mb" }), async (req, res) => {
+    const threadId = parseInt(String(req.query.threadId), 10);
+    const sender = String(req.query.sender || "Talk Mode User");
+
+    if (!Number.isFinite(threadId)) {
+        res.status(400).json({ error: "threadId is required" });
+        return;
+    }
+
+    if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
+        res.status(400).json({ error: "No audio data received" });
+        return;
+    }
+
+    try {
+        // Ensure audio dirs exist
+        if (!fs.existsSync(TALK_AUDIO_DIR)) fs.mkdirSync(TALK_AUDIO_DIR, { recursive: true });
+
+        // Save audio to temp file for transcription
+        const messageId = `talk_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+        const audioFile = path.join(TALK_AUDIO_DIR, `${messageId}.webm`);
+        const tmpFile = audioFile + ".tmp";
+        fs.writeFileSync(tmpFile, req.body);
+        fs.renameSync(tmpFile, audioFile);
+
+        // Transcribe using existing STT pipeline
+        await ensureModels();
+        const transcript = await transcribe(audioFile);
+
+        // Cleanup temp audio
+        try { fs.unlinkSync(audioFile); } catch { /* best effort */ }
+
+        if (!transcript) {
+            res.status(422).json({ error: "No speech detected" });
+            return;
+        }
+
+        // Resolve target zone's incoming queue (same pattern as telegram-client)
+        let incomingDir: string;
+        try {
+            const config = loadZoneConfig(ZONE_CONFIG_PATH);
+            if (!config) {
+                incomingDir = path.join(SCRIPT_DIR, ".borg-core/queue/incoming");
+            } else {
+                const zone = getThreadZone(config, threadId);
+                incomingDir = path.join(SCRIPT_DIR, `.borg-${zone}/queue/incoming`);
+            }
+        } catch {
+            incomingDir = path.join(SCRIPT_DIR, ".borg-core/queue/incoming");
+        }
+        fs.mkdirSync(incomingDir, { recursive: true });
+
+        // Post info message to Telegram thread so conversation is visible there
+        const settings = loadSettings();
+        if (settings.telegram_bot_token && settings.telegram_chat_id) {
+            fetch(`https://api.telegram.org/bot${settings.telegram_bot_token}/sendMessage`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    chat_id: settings.telegram_chat_id,
+                    message_thread_id: threadId === 1 ? undefined : threadId,
+                    text: `🎙 *From ${sender} via Talk Mode:*\n\n${transcript}`,
+                    parse_mode: "Markdown",
+                }),
+            }).catch(() => { /* best effort — don't block on Telegram failure */ });
+        }
+
+        // Write queue message (same schema as telegram-client voice handler)
+        const queueData = {
+            channel: "talk-mode",
+            source: "user",
+            threadId,
+            sender,
+            message: transcript,
+            timestamp: Date.now(),
+            messageId,
+        };
+        const queueFile = path.join(incomingDir, `talk_${messageId}.json`);
+        const queueTmp = queueFile + ".tmp";
+        fs.writeFileSync(queueTmp, JSON.stringify(queueData, null, 2));
+        fs.renameSync(queueTmp, queueFile);
+
+        res.json({ messageId, transcript });
+    } catch (err) {
+        res.status(500).json({ error: toErrorMessage(err) });
+    }
+});
+
+// POST /api/talk/synthesize — distill + TTS, return audio URL
+app.post("/api/talk/synthesize", express.json(), async (req, res) => {
+    const { text } = req.body as { text?: string };
+    if (!text) {
+        res.status(400).json({ error: "text is required" });
+        return;
+    }
+
+    try {
+        const available = await isAvailable();
+        if (!available) {
+            res.status(503).json({ error: "TTS service unavailable" });
+            return;
+        }
+
+        await ensureModels();
+
+        // Same pipeline as the Listen button in telegram-client
+        const speechText = await distillForSpeech(text);
+        const audioPath = await synthesize(speechText);
+        const filename = path.basename(audioPath);
+
+        res.json({ audioUrl: `/audio/${filename}` });
+    } catch (err) {
+        res.status(500).json({ error: toErrorMessage(err) });
+    }
 });
 
 // ─── Start Server ───

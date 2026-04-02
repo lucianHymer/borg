@@ -1,0 +1,671 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Borg Talk Mode</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎙</text></svg>">
+<style>
+:root {
+  --bg-primary: #0d1117;
+  --bg-secondary: #161b22;
+  --bg-tertiary: #21262d;
+  --border: #30363d;
+  --text-primary: #e6edf3;
+  --text-secondary: #8b949e;
+  --accent-green: #3fb950;
+  --accent-blue: #58a6ff;
+  --accent-purple: #bc8cff;
+  --accent-red: #f85149;
+  --accent-yellow: #d29922;
+  --font-mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+html, body {
+  height: 100%;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 1.5;
+  overflow: hidden;
+}
+
+body {
+  display: flex;
+  flex-direction: column;
+}
+
+/* ─── Top Bar ─── */
+
+#topbar {
+  display: flex;
+  align-items: center;
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border);
+  padding: 10px 20px;
+  gap: 12px;
+  flex-shrink: 0;
+}
+
+#topbar .brand {
+  font-weight: 700;
+  font-size: 14px;
+  color: var(--accent-blue);
+  white-space: nowrap;
+}
+
+#topbar .brand a {
+  color: var(--accent-blue);
+  text-decoration: none;
+}
+
+#topbar .brand a:hover { text-decoration: underline; }
+
+#thread-select {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px 8px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  min-width: 200px;
+}
+
+#topbar .spacer { flex: 1; }
+
+#user-name {
+  color: var(--text-secondary);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+#user-name:hover { color: var(--text-primary); }
+
+#status-indicator {
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+#auto-play-toggle {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  user-select: none;
+}
+
+#auto-play-toggle input { cursor: pointer; }
+
+/* ─── Main Area ─── */
+
+#main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 24px;
+  padding: 20px;
+  overflow: hidden;
+}
+
+/* ─── Transcript / Messages Area ─── */
+
+#messages {
+  width: 100%;
+  max-width: 700px;
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 0;
+  min-height: 0;
+}
+
+.msg {
+  padding: 8px 12px;
+  border-radius: 8px;
+  max-width: 85%;
+  word-wrap: break-word;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.msg.incoming {
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border);
+  align-self: flex-start;
+}
+
+.msg.outgoing {
+  background: #1a2332;
+  border: 1px solid #1f3350;
+  align-self: flex-end;
+}
+
+.msg .sender {
+  font-size: 11px;
+  color: var(--accent-blue);
+  margin-bottom: 2px;
+}
+
+.msg .text { color: var(--text-primary); }
+
+.msg .listen-btn {
+  display: inline-block;
+  margin-top: 4px;
+  padding: 2px 8px;
+  font-size: 11px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-family: var(--font-mono);
+}
+
+.msg .listen-btn:hover { color: var(--text-primary); border-color: var(--accent-blue); }
+.msg .listen-btn.loading { opacity: 0.5; pointer-events: none; }
+
+/* ─── Mic Button ─── */
+
+#mic-area {
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding-bottom: 20px;
+}
+
+#mic-btn {
+  width: 80px;
+  height: 80px;
+  border-radius: 50%;
+  border: 3px solid var(--border);
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  font-size: 32px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  user-select: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+#mic-btn:hover {
+  border-color: var(--accent-blue);
+  color: var(--text-primary);
+}
+
+#mic-btn.recording {
+  border-color: var(--accent-red);
+  background: #2d1518;
+  color: var(--accent-red);
+  animation: pulse 1.5s ease-in-out infinite;
+}
+
+#mic-btn.processing {
+  border-color: var(--accent-yellow);
+  color: var(--accent-yellow);
+  opacity: 0.7;
+  pointer-events: none;
+}
+
+@keyframes pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(248, 81, 73, 0.3); }
+  50% { box-shadow: 0 0 0 15px rgba(248, 81, 73, 0); }
+}
+
+#mic-label {
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+/* ─── Audio Player (hidden, for auto-play) ─── */
+
+#audio-player { display: none; }
+
+/* ─── Name Modal ─── */
+
+#name-modal {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.7);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+
+#name-modal.hidden { display: none; }
+
+#name-modal .modal-content {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 24px;
+  text-align: center;
+}
+
+#name-modal h2 {
+  font-size: 16px;
+  margin-bottom: 12px;
+  color: var(--text-primary);
+}
+
+#name-input {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 8px 12px;
+  font-family: var(--font-mono);
+  font-size: 14px;
+  width: 250px;
+  text-align: center;
+}
+
+#name-input:focus { outline: none; border-color: var(--accent-blue); }
+
+#name-submit {
+  display: block;
+  margin: 12px auto 0;
+  padding: 6px 20px;
+  background: var(--accent-blue);
+  color: #fff;
+  border: none;
+  border-radius: 4px;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+/* ─── Scrollbar ─── */
+
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--text-secondary); }
+</style>
+</head>
+<body>
+
+<div id="topbar">
+  <span class="brand"><a href="/">Borg</a> / Talk Mode</span>
+  <select id="thread-select"></select>
+  <span class="spacer"></span>
+  <label id="auto-play-toggle">
+    <input type="checkbox" id="auto-play-cb" checked>
+    auto-play
+  </label>
+  <span id="status-indicator"></span>
+  <span id="user-name" title="Click to change name"></span>
+</div>
+
+<div id="main">
+  <div id="messages"></div>
+  <div id="mic-area">
+    <button id="mic-btn" title="Hold or click to record">🎙</button>
+    <span id="mic-label">tap to talk</span>
+  </div>
+</div>
+
+<audio id="audio-player"></audio>
+
+<div id="name-modal" class="hidden">
+  <div class="modal-content">
+    <h2>What's your name?</h2>
+    <input id="name-input" type="text" placeholder="Your name" autofocus>
+    <button id="name-submit">Start Talking</button>
+  </div>
+</div>
+
+<script>
+// ─── State ───
+
+let userName = localStorage.getItem('talk-mode-name') || '';
+let selectedThreadId = parseInt(localStorage.getItem('talk-mode-thread') || '0', 10);
+let threads = {};
+let recording = false;
+let processing = false;
+let mediaRecorder = null;
+let audioChunks = [];
+let eventSource = null;
+let pendingMessageId = null;
+// Track message IDs we've already rendered to avoid SSE duplicates
+const renderedMessageIds = new Set();
+
+const messagesEl = document.getElementById('messages');
+const micBtn = document.getElementById('mic-btn');
+const micLabel = document.getElementById('mic-label');
+const threadSelect = document.getElementById('thread-select');
+const statusEl = document.getElementById('status-indicator');
+const userNameEl = document.getElementById('user-name');
+const nameModal = document.getElementById('name-modal');
+const nameInput = document.getElementById('name-input');
+const nameSubmit = document.getElementById('name-submit');
+const audioPlayer = document.getElementById('audio-player');
+const autoPlayCb = document.getElementById('auto-play-cb');
+
+// ─── Name Setup ───
+
+function showNameModal() {
+  nameModal.classList.remove('hidden');
+  nameInput.value = userName;
+  nameInput.focus();
+}
+
+function saveName() {
+  const name = nameInput.value.trim();
+  if (!name) return;
+  userName = name;
+  localStorage.setItem('talk-mode-name', name);
+  nameModal.classList.add('hidden');
+  userNameEl.textContent = userName;
+}
+
+nameSubmit.addEventListener('click', saveName);
+nameInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') saveName(); });
+userNameEl.addEventListener('click', showNameModal);
+
+if (!userName) {
+  showNameModal();
+} else {
+  userNameEl.textContent = userName;
+}
+
+// ─── Thread Loading ───
+
+async function loadThreads() {
+  try {
+    const res = await fetch('/api/threads');
+    threads = await res.json();
+    threadSelect.innerHTML = '';
+    const pinned = JSON.parse(localStorage.getItem('talk-mode-pinned') || '[]');
+
+    // Sort: pinned first, then alphabetical
+    const entries = Object.entries(threads).sort((a, b) => {
+      const aPinned = pinned.includes(Number(a[0]));
+      const bPinned = pinned.includes(Number(b[0]));
+      if (aPinned !== bPinned) return aPinned ? -1 : 1;
+      return (a[1].name || '').localeCompare(b[1].name || '');
+    });
+
+    for (const [id, cfg] of entries) {
+      const opt = document.createElement('option');
+      opt.value = id;
+      const prefix = pinned.includes(Number(id)) ? '\u2606 ' : '';
+      opt.textContent = `${prefix}${cfg.name || 'Thread ' + id}`;
+      threadSelect.appendChild(opt);
+    }
+
+    // Restore selection
+    if (selectedThreadId && threads[selectedThreadId]) {
+      threadSelect.value = String(selectedThreadId);
+    } else if (threadSelect.options.length) {
+      selectedThreadId = parseInt(threadSelect.value, 10);
+    }
+
+    loadRecentMessages();
+    connectSSE();
+  } catch (err) {
+    console.error('Failed to load threads:', err);
+  }
+}
+
+threadSelect.addEventListener('change', () => {
+  selectedThreadId = parseInt(threadSelect.value, 10);
+  localStorage.setItem('talk-mode-thread', String(selectedThreadId));
+  renderedMessageIds.clear();
+  loadRecentMessages();
+  connectSSE();
+});
+
+// ─── Double-click to pin/unpin thread ───
+threadSelect.addEventListener('dblclick', () => {
+  const id = parseInt(threadSelect.value, 10);
+  if (!id) return;
+  const pinned = JSON.parse(localStorage.getItem('talk-mode-pinned') || '[]');
+  const idx = pinned.indexOf(id);
+  if (idx >= 0) pinned.splice(idx, 1);
+  else pinned.push(id);
+  localStorage.setItem('talk-mode-pinned', JSON.stringify(pinned));
+  loadThreads();
+});
+
+// ─── Messages ───
+
+function addMessage(entry) {
+  // Dedup by messageId
+  if (entry.messageId && renderedMessageIds.has(entry.messageId)) return;
+  if (entry.messageId) renderedMessageIds.add(entry.messageId);
+
+  const div = document.createElement('div');
+  const isOutgoing = entry.direction === 'outgoing';
+  div.className = `msg ${isOutgoing ? 'outgoing' : 'incoming'}`;
+
+  const senderDiv = document.createElement('div');
+  senderDiv.className = 'sender';
+  senderDiv.textContent = isOutgoing ? 'Borg' : (entry.sender || 'You');
+  div.appendChild(senderDiv);
+
+  const textDiv = document.createElement('div');
+  textDiv.className = 'text';
+  textDiv.textContent = entry.message;
+  div.appendChild(textDiv);
+
+  // Add listen button for bot responses
+  if (isOutgoing && entry.message) {
+    const listenBtn = document.createElement('button');
+    listenBtn.className = 'listen-btn';
+    listenBtn.textContent = 'listen';
+    listenBtn.addEventListener('click', () => synthesizeAndPlay(entry.message, listenBtn));
+    div.appendChild(listenBtn);
+  }
+
+  messagesEl.appendChild(div);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+  return { isOutgoing, message: entry.message };
+}
+
+async function loadRecentMessages() {
+  messagesEl.innerHTML = '';
+  renderedMessageIds.clear();
+  if (!selectedThreadId) return;
+
+  try {
+    const res = await fetch(`/api/threads/${selectedThreadId}/messages?n=30`);
+    const entries = await res.json();
+    for (const entry of entries) {
+      addMessage(entry);
+    }
+  } catch (err) {
+    console.error('Failed to load messages:', err);
+  }
+}
+
+// ─── SSE for live messages ───
+
+function connectSSE() {
+  if (eventSource) eventSource.close();
+
+  eventSource = new EventSource('/api/messages/feed');
+  eventSource.onmessage = (event) => {
+    try {
+      const entry = JSON.parse(event.data);
+      if (entry.threadId !== selectedThreadId) return;
+
+      const result = addMessage(entry);
+      if (!result) return;
+
+      // Auto-synthesize and play bot responses
+      if (result.isOutgoing && autoPlayCb.checked && result.message) {
+        // Only auto-play if this is a response to our pending message
+        if (pendingMessageId) {
+          pendingMessageId = null;
+          synthesizeAndPlay(result.message);
+        }
+      }
+    } catch { /* ignore parse errors */ }
+  };
+
+  eventSource.onerror = () => {
+    statusEl.textContent = 'disconnected';
+    setTimeout(connectSSE, 5000);
+  };
+
+  eventSource.onopen = () => {
+    statusEl.textContent = 'connected';
+  };
+}
+
+// ─── TTS Pipeline ───
+
+async function synthesizeAndPlay(text, btn) {
+  if (btn) {
+    btn.classList.add('loading');
+    btn.textContent = 'synthesizing...';
+  }
+
+  try {
+    const res = await fetch('/api/talk/synthesize', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text }),
+    });
+
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'Synthesis failed');
+    }
+
+    const { audioUrl } = await res.json();
+    audioPlayer.src = audioUrl;
+    await audioPlayer.play();
+
+    if (btn) {
+      btn.textContent = 'playing...';
+      audioPlayer.onended = () => { btn.textContent = 'listen'; btn.classList.remove('loading'); };
+    }
+  } catch (err) {
+    console.error('TTS error:', err);
+    if (btn) { btn.textContent = 'listen'; btn.classList.remove('loading'); }
+  }
+}
+
+// ─── Recording ───
+
+async function startRecording() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    audioChunks = [];
+    mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus' });
+
+    mediaRecorder.ondataavailable = (e) => {
+      if (e.data.size > 0) audioChunks.push(e.data);
+    };
+
+    mediaRecorder.onstop = async () => {
+      stream.getTracks().forEach(t => t.stop());
+      if (audioChunks.length === 0) return;
+
+      const blob = new Blob(audioChunks, { type: 'audio/webm' });
+      await sendAudio(blob);
+    };
+
+    mediaRecorder.start(250); // collect chunks every 250ms
+    recording = true;
+    micBtn.classList.add('recording');
+    micLabel.textContent = 'recording... tap to stop';
+  } catch (err) {
+    console.error('Mic access error:', err);
+    micLabel.textContent = 'mic access denied';
+  }
+}
+
+function stopRecording() {
+  if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+    mediaRecorder.stop();
+  }
+  recording = false;
+  micBtn.classList.remove('recording');
+}
+
+async function sendAudio(blob) {
+  if (!selectedThreadId || !userName) return;
+
+  processing = true;
+  micBtn.classList.add('processing');
+  micLabel.textContent = 'transcribing...';
+
+  try {
+    const res = await fetch(
+      `/api/talk/send?threadId=${selectedThreadId}&sender=${encodeURIComponent(userName)}`,
+      { method: 'POST', headers: { 'Content-Type': 'audio/webm' }, body: blob }
+    );
+
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'Send failed');
+    }
+
+    const { messageId, transcript } = await res.json();
+    pendingMessageId = messageId;
+
+    // Show our message immediately
+    addMessage({
+      direction: 'incoming',
+      sender: userName,
+      message: transcript,
+      threadId: selectedThreadId,
+      messageId: messageId,
+    });
+
+    micLabel.textContent = 'sent! waiting for response...';
+    setTimeout(() => {
+      if (!recording && !processing) micLabel.textContent = 'tap to talk';
+    }, 3000);
+  } catch (err) {
+    console.error('Send error:', err);
+    micLabel.textContent = err.message || 'send failed';
+    setTimeout(() => { micLabel.textContent = 'tap to talk'; }, 3000);
+  } finally {
+    processing = false;
+    micBtn.classList.remove('processing');
+  }
+}
+
+// Mic button: click to toggle
+micBtn.addEventListener('click', () => {
+  if (processing) return;
+  if (recording) {
+    stopRecording();
+  } else {
+    if (!userName) { showNameModal(); return; }
+    if (!selectedThreadId) { micLabel.textContent = 'select a thread first'; return; }
+    startRecording();
+  }
+});
+
+// ─── Init ───
+
+// Restore auto-play preference
+autoPlayCb.checked = localStorage.getItem('talk-mode-autoplay') !== 'false';
+autoPlayCb.addEventListener('change', () => {
+  localStorage.setItem('talk-mode-autoplay', autoPlayCb.checked);
+});
+
+loadThreads();
+</script>
+</body>
+</html>
