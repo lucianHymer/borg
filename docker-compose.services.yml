@@ -11,7 +11,7 @@
 # - Prefix service names with the project name (e.g. clairvoyant-db, not just db)
 
 services:
-  # ── Clairvoyant: event-sourced task management MCP server ──
+  # ── Quest Log: event-sourced task management MCP server ──
   clairvoyant-db:
     image: postgres:16
     restart: unless-stopped
@@ -34,7 +34,7 @@ services:
           memory: 256M
 
   clairvoyant:
-    image: ghcr.io/passportxyz/clairvoyant:latest
+    image: ghcr.io/passportxyz/questlog:latest
     restart: unless-stopped
     depends_on:
       clairvoyant-db:
@@ -44,9 +44,8 @@ services:
     environment:
       - NODE_ENV=production
       - DATABASE_URL=postgresql://clairvoyant:${CLAIRVOYANT_DB_PASSWORD:?CLAIRVOYANT_DB_PASSWORD must be set in .env}@clairvoyant-db:5432/clairvoyant
-      - CV_TRANSPORT=http
-      - CV_PORT=3000
-      - CV_JWT_SECRET=${CV_JWT_SECRET:?CV_JWT_SECRET must be set in .env}
+      - PORT=3000
+      - QL_JWT_SECRET=${QL_JWT_SECRET:?QL_JWT_SECRET must be set in .env}
       - CREDENTIAL_BROKER_URL=http://broker:3000
       - BROKER_SECRET=${BROKER_SECRET}
     networks:
