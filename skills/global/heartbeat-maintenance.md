@@ -1,6 +1,9 @@
-# Heartbeat Maintenance
+---
+name: heartbeat-maintenance
+description: Managing HEARTBEAT.md task lists for Borg threads. Use when adding, removing, or organizing heartbeat tasks across quick, hourly, daily, and timed tiers.
+---
 
-How to manage HEARTBEAT.md files for Borg threads.
+# Heartbeat Maintenance
 
 ## Structure
 

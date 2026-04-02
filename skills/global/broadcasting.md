@@ -1,3 +1,8 @@
+---
+name: broadcasting
+description: Cross-repo knowledge sharing via Borg broadcast system. Use when sharing patterns, gotchas, or workflow changes with other repos, or when receiving and evaluating incoming broadcasts.
+---
+
 # Broadcasting: Cross-Repo Knowledge Sharing
 
 Borg has a broadcast system for sharing knowledge across repos. A shared Telegram group acts as transport — all Borg instances are members.

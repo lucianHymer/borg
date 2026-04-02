@@ -1,3 +1,8 @@
+---
+name: persistent-storage
+description: Managing state that survives container resets via /app/.borg/persistent/. Use when storing SSH keys, credentials, config files, or any lightweight infrastructure state that must persist across restarts.
+---
+
 # Persistent Storage
 
 State that needs to survive container resets (restarts, rebuilds, redeployments).
