@@ -1,3 +1,8 @@
+---
+name: cross-thread-messaging
+description: Guidelines for cross-thread communication in Borg. Use when sending messages to other threads via send_message, especially when referencing files or directories across different working contexts.
+---
+
 # Cross-Thread Messaging
 
 When communicating with agents in other Borg threads, always use absolute paths when referring to files or directories. This ensures clarity across threads working in different contexts and prevents path ambiguity.

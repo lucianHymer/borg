@@ -1,3 +1,8 @@
+---
+name: speaches-audio
+description: Local text-to-speech and speech-to-text via the Speaches container (OpenAI-compatible API). Use when generating spoken audio from text, transcribing audio files, or working with voice messages.
+---
+
 # Speaches Audio (TTS/STT)
 
 You have access to a local text-to-speech and speech-to-text server via the Speaches container.

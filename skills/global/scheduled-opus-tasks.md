@@ -1,3 +1,8 @@
+---
+name: scheduled-opus-tasks
+description: Schedule opus-level processing for any thread at specific times using the [use opus] prefix and HEARTBEAT.md timed tasks. Use when scheduling deep analysis, reviews, or any task requiring opus routing.
+---
+
 # Scheduled Opus Tasks
 
 Schedule a message to be sent to any thread at a specific time, forcing opus-level processing via the `[use opus]` prefix.

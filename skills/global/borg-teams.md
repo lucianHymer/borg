@@ -1,6 +1,9 @@
-# Borg Team Operations
+---
+name: borg-team-operations
+description: Maps generic team workflow concepts to Borg MCP tools. Use when creating agent teams, spawning threads for roles, managing worktrees, messaging teammates, or cleaning up teams.
+---
 
-This skill maps generic team concepts to Borg's MCP tools.
+# Borg Team Operations
 
 ## Creating Threads
 When a workflow says "create a thread for each role", use the `create_thread`
