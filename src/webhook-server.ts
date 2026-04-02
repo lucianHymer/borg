@@ -25,6 +25,28 @@ function readSettings(): Record<string, unknown> {
     }
 }
 
+/** Send a message directly to a Telegram thread via HTTP API (fire-and-forget). */
+async function sendTelegramMessage(threadId: number, text: string): Promise<void> {
+    const settings = readSettings();
+    const token = settings.telegram_bot_token as string | undefined;
+    const chatId = settings.telegram_chat_id as string | undefined;
+    if (!token || !chatId) return;
+
+    try {
+        await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                chat_id: chatId,
+                message_thread_id: threadId,
+                text,
+            }),
+        });
+    } catch {
+        // Best-effort — don't fail the webhook response
+    }
+}
+
 /** Write a webhook message to the correct zone's incoming queue. Returns messageId. */
 function enqueueWebhookMessage(opts: {
     threadId: number;
@@ -215,6 +237,11 @@ app.post("/api/webhooks/clairvoyant", (req: express.Request & { rawBody?: Buffer
             model: "opus",
             idempotencyKey: event.idempotency_key,
         });
+
+        // Immediate feedback in the triage thread
+        const statusLine = `⏳ Processing: "${task.title}" (${task.id})`;
+        sendTelegramMessage(threadId, statusLine);
+
         res.status(202).json(result);
     } catch (err) {
         res.status(500).json({ error: toErrorMessage(err) });
