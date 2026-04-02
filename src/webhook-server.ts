@@ -11,6 +11,7 @@ import express from "express";
 import { z } from "zod";
 import { loadZoneConfig, getThreadZone } from "./zone-config.js";
 import { toErrorMessage } from "./types.js";
+import { transcribe, distillForSpeech, synthesize, ensureModels, isAvailable } from "./audio.js";
 
 const SCRIPT_DIR = path.resolve(__dirname, "..");
 const ZONE_CONFIG_PATH = process.env.ZONE_CONFIG_PATH || path.join(SCRIPT_DIR, "zone-config.json");
@@ -247,6 +248,114 @@ app.post("/api/webhooks/clairvoyant", (req: express.Request & { rawBody?: Buffer
         res.status(500).json({ error: toErrorMessage(err) });
     }
 });
+
+// ─── Talk Mode Endpoints ───
+// Used by dashboard (proxied here) — infra has rw zone access, speaches, and Anthropic credentials.
+
+const TALK_AUDIO_DIR = path.join(SCRIPT_DIR, ".borg", "audio", "talk");
+
+app.post("/api/talk/send", express.raw({ type: "audio/*", limit: "10mb" }), async (req, res) => {
+    const threadId = parseInt(String(req.query.threadId), 10);
+    const sender = String(req.query.sender || "Talk Mode User");
+
+    if (!Number.isFinite(threadId)) {
+        res.status(400).json({ error: "threadId is required" });
+        return;
+    }
+    if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
+        res.status(400).json({ error: "No audio data received" });
+        return;
+    }
+
+    try {
+        fs.mkdirSync(TALK_AUDIO_DIR, { recursive: true });
+        const messageId = `talk_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+        const audioFile = path.join(TALK_AUDIO_DIR, `${messageId}.webm`);
+        const tmpFile = audioFile + ".tmp";
+        fs.writeFileSync(tmpFile, req.body);
+        fs.renameSync(tmpFile, audioFile);
+
+        await ensureModels();
+        const transcript = await transcribe(audioFile);
+        try { fs.unlinkSync(audioFile); } catch { /* best effort */ }
+
+        if (!transcript) {
+            res.status(422).json({ error: "No speech detected" });
+            return;
+        }
+
+        // Enqueue using the same zone-aware pattern
+        const zoneConfig = loadZoneConfig(ZONE_CONFIG_PATH);
+        const zone = zoneConfig ? getThreadZone(zoneConfig, threadId) : "core";
+        const incomingDir = path.join(SCRIPT_DIR, `.borg-${zone}`, "queue", "incoming");
+        fs.mkdirSync(incomingDir, { recursive: true });
+
+        // Post silent info message to Telegram thread
+        const settings = readSettings();
+        if (settings.telegram_bot_token && settings.telegram_chat_id) {
+            fetch(`https://api.telegram.org/bot${settings.telegram_bot_token as string}/sendMessage`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    chat_id: settings.telegram_chat_id,
+                    message_thread_id: threadId === 1 ? undefined : threadId,
+                    text: `🎙 *From ${sender} via Talk Mode:*\n\n${transcript}`,
+                    parse_mode: "Markdown",
+                    disable_notification: true,
+                }),
+            }).catch(() => {});
+        }
+
+        // Write queue message
+        const incoming = {
+            channel: "talk-mode",
+            source: "user",
+            threadId,
+            sender,
+            senderId: `talk:${sender}`,
+            message: transcript,
+            isReply: false,
+            timestamp: Date.now(),
+            messageId,
+        };
+        const queueTmp = path.join(incomingDir, `${messageId}.json.tmp`);
+        const queueFinal = path.join(incomingDir, `${messageId}.json`);
+        fs.writeFileSync(queueTmp, JSON.stringify(incoming));
+        fs.renameSync(queueTmp, queueFinal);
+
+        res.json({ messageId, transcript });
+    } catch (err) {
+        res.status(500).json({ error: toErrorMessage(err) });
+    }
+});
+
+app.post("/api/talk/synthesize", express.json(), async (req, res) => {
+    const { text } = req.body as { text?: string };
+    if (!text) {
+        res.status(400).json({ error: "text is required" });
+        return;
+    }
+
+    try {
+        const available = await isAvailable();
+        if (!available) {
+            res.status(503).json({ error: "TTS service unavailable" });
+            return;
+        }
+
+        await ensureModels();
+        const speechText = await distillForSpeech(text);
+        const audioPath = await synthesize(speechText);
+        const filename = path.basename(audioPath);
+
+        res.json({ audioUrl: `/audio/${filename}` });
+    } catch (err) {
+        res.status(500).json({ error: toErrorMessage(err) });
+    }
+});
+
+// Serve synthesized audio files
+app.use("/audio", express.static(path.join(SCRIPT_DIR, ".borg", "audio")));
 
 // ─── Start/Stop ───
 

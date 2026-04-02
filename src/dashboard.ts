@@ -5,7 +5,6 @@
 
 import express from "express";
 import fs from "fs";
-import os from "os";
 import path from "path";
 import http from "http";
 import { Cron } from "croner";
@@ -25,15 +24,15 @@ import type { PendingApproval, BackgroundTaskState } from "./types.js";
 import { mergeCorrectionsOntoDecisions } from "./routing-logger.js";
 import { readRecentJsonl } from "./jsonl-reader.js";
 import { loadZoneConfig, getThreadZone, addThreadToZone, removeThreadFromZones, saveZoneConfig, clearZoneConfigCache } from "./zone-config.js";
-import { transcribe, ensureModels } from "./audio.js";
-import { loadSettings } from "./session-manager.js";
+
 
 const SCRIPT_DIR = path.resolve(__dirname, "..");
 const BORG_DIR = path.join(SCRIPT_DIR, ".borg");
 const BORG_INFRA_DIR = path.join(SCRIPT_DIR, ".borg-infra");
 const STATIC_DIR = path.join(SCRIPT_DIR, "static");
 const SESSIONS_DIR = path.join(BORG_DIR, "sessions");
-const TALK_AUDIO_DIR = path.join(os.tmpdir(), "borg-talk-audio");
+// Talk Mode endpoints live in infra (webhook-server.ts) — dashboard proxies to them
+const INFRA_URL = process.env.INFRA_URL || "http://infra:3001";
 // threads.json is at project root (shared across all zone containers)
 const THREADS_FILE = path.join(SCRIPT_DIR, "threads.json");
 const PORT = parseInt(process.env.DASHBOARD_PORT || "3100", 10);
@@ -1654,171 +1653,53 @@ app.get("/talk", (_req, res) => {
     }
 });
 
-// Serve synthesized audio files (from both .borg/audio and writable talk audio dir)
+// Serve audio files: try local .borg/audio first, fall through to infra proxy
 app.use("/audio", express.static(path.join(BORG_DIR, "audio")));
-const TALK_SYNTH_DIR = path.join(os.tmpdir(), "borg-talk-synth");
-if (!fs.existsSync(TALK_SYNTH_DIR)) fs.mkdirSync(TALK_SYNTH_DIR, { recursive: true });
-app.use("/talk-audio", express.static(TALK_SYNTH_DIR));
-
-// POST /api/talk/send — receive audio, transcribe, queue as incoming message
-app.post("/api/talk/send", express.raw({ type: "audio/*", limit: "10mb" }), async (req, res) => {
-    const threadId = parseInt(String(req.query.threadId), 10);
-    const sender = String(req.query.sender || "Talk Mode User");
-
-    if (!Number.isFinite(threadId)) {
-        res.status(400).json({ error: "threadId is required" });
-        return;
-    }
-
-    if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
-        res.status(400).json({ error: "No audio data received" });
-        return;
-    }
-
+app.get("/audio/*", async (req, res) => {
+    // Fallback: proxy to infra (synthesized audio lives there)
     try {
-        // Ensure audio dirs exist
-        if (!fs.existsSync(TALK_AUDIO_DIR)) fs.mkdirSync(TALK_AUDIO_DIR, { recursive: true });
-
-        // Save audio to temp file for transcription
-        const messageId = `talk_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-        const audioFile = path.join(TALK_AUDIO_DIR, `${messageId}.webm`);
-        const tmpFile = audioFile + ".tmp";
-        fs.writeFileSync(tmpFile, req.body);
-        fs.renameSync(tmpFile, audioFile);
-
-        // Transcribe using existing STT pipeline
-        await ensureModels();
-        const transcript = await transcribe(audioFile);
-
-        // Cleanup temp audio
-        try { fs.unlinkSync(audioFile); } catch { /* best effort */ }
-
-        if (!transcript) {
-            res.status(422).json({ error: "No speech detected" });
-            return;
-        }
-
-        // Resolve target zone's incoming queue (same pattern as telegram-client)
-        let incomingDir: string;
-        try {
-            const config = loadZoneConfig(ZONE_CONFIG_PATH);
-            if (!config) {
-                incomingDir = path.join(SCRIPT_DIR, ".borg-core/queue/incoming");
-            } else {
-                const zone = getThreadZone(config, threadId);
-                incomingDir = path.join(SCRIPT_DIR, `.borg-${zone}/queue/incoming`);
-            }
-        } catch {
-            incomingDir = path.join(SCRIPT_DIR, ".borg-core/queue/incoming");
-        }
-        fs.mkdirSync(incomingDir, { recursive: true });
-
-        // Post info message to Telegram thread so conversation is visible there
-        const settings = loadSettings();
-        if (settings.telegram_bot_token && settings.telegram_chat_id) {
-            fetch(`https://api.telegram.org/bot${settings.telegram_bot_token}/sendMessage`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    chat_id: settings.telegram_chat_id,
-                    message_thread_id: threadId === 1 ? undefined : threadId,
-                    text: `🎙 *From ${sender} via Talk Mode:*\n\n${transcript}`,
-                    parse_mode: "Markdown",
-                    disable_notification: true,
-                }),
-            }).catch(() => { /* best effort — don't block on Telegram failure */ });
-        }
-
-        // Write queue message (same schema as telegram-client voice handler)
-        const queueData = {
-            channel: "talk-mode",
-            source: "user",
-            threadId,
-            sender,
-            message: transcript,
-            timestamp: Date.now(),
-            messageId,
-        };
-        const queueFile = path.join(incomingDir, `talk_${messageId}.json`);
-        const queueTmp = queueFile + ".tmp";
-        fs.writeFileSync(queueTmp, JSON.stringify(queueData, null, 2));
-        fs.renameSync(queueTmp, queueFile);
-
-        res.json({ messageId, transcript });
-    } catch (err) {
-        res.status(500).json({ error: toErrorMessage(err) });
+        const upstream = await fetch(`${INFRA_URL}${req.path}`, { signal: AbortSignal.timeout(30_000) });
+        if (!upstream.ok) { res.status(upstream.status).end(); return; }
+        res.setHeader("Content-Type", upstream.headers.get("content-type") || "audio/mpeg");
+        res.send(Buffer.from(await upstream.arrayBuffer()));
+    } catch {
+        res.status(502).end();
     }
 });
 
-// POST /api/talk/synthesize — TTS via speaches, return audio URL
-// Dashboard has no Anthropic API credentials, so we call speaches directly
-// (no distillForSpeech step — that needs the agent SDK).
-const SPEACHES_URL = process.env.SPEACHES_URL || "http://speaches:8000";
-const TTS_MODEL = "speaches-ai/Kokoro-82M-v1.0-ONNX";
-const TTS_CHUNK_SIZE = 800;
+// ─── Talk Mode Proxy — forward to infra's webhook server ───
+
+app.post("/api/talk/send", express.raw({ type: "audio/*", limit: "10mb" }), async (req, res) => {
+    try {
+        const qs = new URLSearchParams(req.query as Record<string, string>).toString();
+        const upstream = await fetch(`${INFRA_URL}/api/talk/send?${qs}`, {
+            method: "POST",
+            headers: { "Content-Type": req.headers["content-type"] || "audio/webm" },
+            body: req.body,
+            signal: AbortSignal.timeout(120_000),
+        });
+        const data = await upstream.json();
+        res.status(upstream.status).json(data);
+    } catch (err) {
+        res.status(502).json({ error: `Infra proxy error: ${toErrorMessage(err)}` });
+    }
+});
 
 app.post("/api/talk/synthesize", express.json(), async (req, res) => {
-    const { text } = req.body as { text?: string };
-    if (!text) {
-        res.status(400).json({ error: "text is required" });
-        return;
-    }
-
     try {
-        // Load TTS settings
-        const settings = loadSettings();
-        const voice = settings.tts_voice || "bf_alice";
-        const speed = settings.tts_speed || 1.0;
-
-        // Chunk text for Kokoro (truncates beyond ~500 tokens)
-        const chunks = text.length <= TTS_CHUNK_SIZE ? [text] : splitTextChunks(text, TTS_CHUNK_SIZE);
-        const buffers: Buffer[] = [];
-        for (const chunk of chunks) {
-            const ttsRes = await fetch(`${SPEACHES_URL}/v1/audio/speech`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ model: TTS_MODEL, voice, input: chunk, speed, response_format: "mp3" }),
-                signal: AbortSignal.timeout(60_000),
-            });
-            if (!ttsRes.ok) {
-                const body = await ttsRes.text().catch(() => "");
-                throw new Error(`TTS failed (${ttsRes.status}): ${body}`);
-            }
-            buffers.push(Buffer.from(await ttsRes.arrayBuffer()));
-        }
-
-        const combined = Buffer.concat(buffers);
-        const filename = `tts_${Date.now()}_${Math.random().toString(36).slice(2, 6)}.mp3`;
-        const outPath = path.join(TALK_SYNTH_DIR, filename);
-        const tmpPath = outPath + ".tmp";
-        fs.writeFileSync(tmpPath, combined);
-        fs.renameSync(tmpPath, outPath);
-
-        res.json({ audioUrl: `/talk-audio/${filename}` });
+        const upstream = await fetch(`${INFRA_URL}/api/talk/synthesize`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(req.body),
+            signal: AbortSignal.timeout(120_000),
+        });
+        const data = await upstream.json();
+        res.status(upstream.status).json(data);
     } catch (err) {
-        res.status(500).json({ error: toErrorMessage(err) });
+        res.status(502).json({ error: `Infra proxy error: ${toErrorMessage(err)}` });
     }
 });
 
-/** Split text at sentence boundaries for TTS chunking. */
-function splitTextChunks(text: string, maxLen: number): string[] {
-    const chunks: string[] = [];
-    let remaining = text;
-    while (remaining.length > 0) {
-        if (remaining.length <= maxLen) { chunks.push(remaining); break; }
-        const window = remaining.slice(0, maxLen);
-        let splitAt = -1;
-        for (const sep of [". ", "! ", "? ", ".\n", "!\n", "?\n"]) {
-            const idx = window.lastIndexOf(sep);
-            if (idx > splitAt) splitAt = idx + sep.length;
-        }
-        if (splitAt <= 0) splitAt = window.lastIndexOf(" ");
-        if (splitAt <= 0) splitAt = maxLen;
-        chunks.push(remaining.slice(0, splitAt).trim());
-        remaining = remaining.slice(splitAt).trim();
-    }
-    return chunks.filter(c => c.length > 0);
-}
 
 // ─── Start Server ───
 
