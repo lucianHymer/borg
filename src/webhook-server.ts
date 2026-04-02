@@ -183,9 +183,9 @@ app.post("/api/webhooks/clairvoyant", (req: express.Request & { rawBody?: Buffer
     }
 
     // Verify HMAC-SHA256 signature
-    const signature = req.headers["x-cv-signature"] as string | undefined;
+    const signature = req.headers["x-ql-signature"] as string | undefined;
     if (!signature || !req.rawBody) {
-        res.status(401).json({ error: "Missing X-CV-Signature header" });
+        res.status(401).json({ error: "Missing X-QL-Signature header" });
         return;
     }
 
