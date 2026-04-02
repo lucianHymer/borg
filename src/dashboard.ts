@@ -5,6 +5,7 @@
 
 import express from "express";
 import fs from "fs";
+import os from "os";
 import path from "path";
 import http from "http";
 import { Cron } from "croner";
@@ -32,7 +33,7 @@ const BORG_DIR = path.join(SCRIPT_DIR, ".borg");
 const BORG_INFRA_DIR = path.join(SCRIPT_DIR, ".borg-infra");
 const STATIC_DIR = path.join(SCRIPT_DIR, "static");
 const SESSIONS_DIR = path.join(BORG_DIR, "sessions");
-const TALK_AUDIO_DIR = path.join(BORG_DIR, "audio/talk");
+const TALK_AUDIO_DIR = path.join(os.tmpdir(), "borg-talk-audio");
 // threads.json is at project root (shared across all zone containers)
 const THREADS_FILE = path.join(SCRIPT_DIR, "threads.json");
 const PORT = parseInt(process.env.DASHBOARD_PORT || "3100", 10);

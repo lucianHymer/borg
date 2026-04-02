@@ -193,6 +193,9 @@ services:
       # rw mounts for background task stop signals (dashboard writes, queue-processor reads)
       - ./.borg-core/queue/task-stop:/app/.borg-core/queue/task-stop
       - ./.borg-perimeter/queue/task-stop:/app/.borg-perimeter/queue/task-stop
+      # rw mounts for Talk Mode — dashboard writes incoming queue messages
+      - ./.borg-core/queue/incoming:/app/.borg-core/queue/incoming
+      - ./.borg-perimeter/queue/incoming:/app/.borg-perimeter/queue/incoming
       - ./threads.json:/app/threads.json:ro
       - ./zone-config.json:/app/zone-config.json:ro
       - ./settings.json:/app/settings.json:ro
