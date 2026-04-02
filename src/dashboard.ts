@@ -205,14 +205,16 @@ app.get("/api/threads/:id/messages", (req, res) => {
         const entries = readRecentJsonl<Record<string, unknown>>(histFile, 500);
         allEntries.push(...entries);
     }
-    // Sort by timestamp, deduplicate by messageId, filter by threadId
+    // Sort by timestamp, deduplicate by messageId+direction, filter by threadId
+    // NOTE: incoming and outgoing share the same messageId — must include direction in dedup key
     allEntries.sort((a: any, b: any) => (a.timestamp || 0) - (b.timestamp || 0));
     const seen = new Set<string>();
     const filtered = allEntries.filter((e: any) => {
         if (e.threadId !== threadId) return false;
         if (e.messageId) {
-            if (seen.has(e.messageId)) return false;
-            seen.add(e.messageId);
+            const key = `${e.messageId}:${e.direction || "unknown"}`;
+            if (seen.has(key)) return false;
+            seen.add(key);
         }
         return true;
     }).slice(-limit);
