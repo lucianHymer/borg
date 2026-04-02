@@ -628,12 +628,13 @@ threadDrawer.querySelector('.overlay').addEventListener('click', closeDrawer);
 // ─── Messages ───
 
 function addMessage(entry) {
-  // Dedup by messageId
-  if (entry.messageId && renderedMessageIds.has(entry.messageId)) return;
-  if (entry.messageId) renderedMessageIds.add(entry.messageId);
+  // Dedup by messageId+direction (incoming/outgoing share the same messageId)
+  const dedupKey = entry.messageId ? `${entry.messageId}:${entry.direction}` : null;
+  if (dedupKey && renderedMessageIds.has(dedupKey)) return;
+  if (dedupKey) renderedMessageIds.add(dedupKey);
 
   const div = document.createElement('div');
-  const isOutgoing = entry.direction === 'outgoing';
+  const isOutgoing = entry.direction === 'out' || entry.direction === 'outgoing';
   div.className = `msg ${isOutgoing ? 'outgoing' : 'incoming'}`;
 
   const senderDiv = document.createElement('div');
