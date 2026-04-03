@@ -1655,7 +1655,7 @@ app.get("/talk", (_req, res) => {
 
 // Serve audio files: try local .borg/audio first, fall through to infra proxy
 app.use("/audio", express.static(path.join(BORG_DIR, "audio")));
-app.get("/audio/*", async (req, res) => {
+app.get("/audio/:file", async (req, res) => {
     // Fallback: proxy to infra (synthesized audio lives there)
     try {
         const upstream = await fetch(`${INFRA_URL}${req.path}`, { signal: AbortSignal.timeout(30_000) });
