@@ -48,6 +48,10 @@ services:
       - QL_JWT_SECRET=${QL_JWT_SECRET:?QL_JWT_SECRET must be set in .env}
       - CREDENTIAL_BROKER_URL=http://broker:3000
       - BROKER_SECRET=${BROKER_SECRET}
+      - ATTACHMENTS_DIR=/data/attachments
+      - PUBLIC_URL=${CLAIRVOYANT_PUBLIC_URL:-}
+    volumes:
+      - clairvoyant-attachments:/data/attachments
     networks:
       - internal
     healthcheck:
@@ -62,6 +66,7 @@ services:
 
 volumes:
   clairvoyant-pgdata:
+  clairvoyant-attachments:
 
 networks:
   internal: {}
