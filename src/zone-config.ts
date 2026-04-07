@@ -133,9 +133,9 @@ export function removeThreadFromZones(config: ZoneConfig, threadId: number): Zon
  * Save zone-config.json atomically (tmp + rename).
  */
 export function saveZoneConfig(configPath: string, config: ZoneConfig): void {
-    const tmpPath = configPath + ".tmp";
-    fs.writeFileSync(tmpPath, JSON.stringify(config, null, 2) + "\n");
-    fs.renameSync(tmpPath, configPath);
+    // Write directly instead of tmp+rename — zone-config.json is bind-mounted as a
+    // single file in Docker, and rename() replaces the inode which causes EBUSY.
+    fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");
     // Invalidate cache so next load picks up the new file
     cachedConfig = null;
     cachedMtime = 0;
