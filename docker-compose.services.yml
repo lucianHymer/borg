@@ -50,6 +50,8 @@ services:
       - BROKER_SECRET=${BROKER_SECRET}
       - ATTACHMENTS_DIR=/data/attachments
       - PUBLIC_URL=${CLAIRVOYANT_PUBLIC_URL:-}
+      - NTFY_URL=http://ntfy:80
+      - NTFY_DEBOUNCE_MS=120000
     volumes:
       - clairvoyant-attachments:/data/attachments
     networks:
@@ -64,9 +66,37 @@ services:
         limits:
           memory: 256M
 
+  # ── ntfy: push notification server for Quest Log ──
+  ntfy:
+    image: binwiederhier/ntfy
+    restart: unless-stopped
+    command: serve
+    environment:
+      - NTFY_BASE_URL=${NTFY_BASE_URL:-http://ntfy:80}
+      - NTFY_CACHE_FILE=/var/cache/ntfy/cache.db
+      - NTFY_AUTH_FILE=/var/lib/ntfy/user.db
+      - NTFY_AUTH_DEFAULT_ACCESS=deny-all
+      - NTFY_BEHIND_PROXY=true
+    volumes:
+      - ntfy-cache:/var/cache/ntfy
+      - ntfy-auth:/var/lib/ntfy
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--tries=1", "http://localhost:80/v1/health", "-O", "/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 64M
+
 volumes:
   clairvoyant-pgdata:
   clairvoyant-attachments:
+  ntfy-cache:
+  ntfy-auth:
 
 networks:
   internal: {}
