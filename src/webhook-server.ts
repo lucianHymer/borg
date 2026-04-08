@@ -226,7 +226,6 @@ app.post("/api/webhooks/clairvoyant", (req: express.Request & { rawBody?: Buffer
         `Status: ${task.status} | Priority: ${task.priority ?? "none"}`,
         `Created by: ${task.creator_id} | Owner: ${task.owner_id ?? "unassigned"}`,
         body,
-        `\nCheck your triage instructions in \`.claude/skills/triage.md\` and handle this event accordingly.`,
     ].join("\n");
 
     try {

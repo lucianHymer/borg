@@ -280,6 +280,8 @@ interface PendingMessage {
     lastStatusLabel?: string;   // base label for change detection
     lastPreview?: string;       // last preview text shown
     lastEditTs?: number;        // last Telegram edit timestamp for throttling
+    isDm?: boolean;             // true if this message came from a DM
+    dmChatId?: number;          // Telegram chat ID for DM responses
 }
 
 const pendingMessages = new Map<string, PendingMessage>();
@@ -304,6 +306,123 @@ interface ThreadStatusState {
     lastEditTs?: number;
 }
 const threadStatusMap = new Map<number, ThreadStatusState>();
+
+// ─── DM Support Helpers ───
+
+// Cache of DM thread ID → Telegram chat ID (private chat ID = user ID for Telegram)
+// Populated from settings on startup and updated when DM users send messages
+const dmChatIds = new Map<number, number>(); // threadId → Telegram chat ID
+
+// Pre-populate from settings so outgoing messages route correctly after restarts
+{
+    const initSettings = loadSettings();
+    if (initSettings.dm_threads) {
+        for (const [userId, config] of Object.entries(initSettings.dm_threads)) {
+            dmChatIds.set(config.threadId, Number(userId));
+        }
+    }
+}
+
+/**
+ * Check if a message context is from an allowed source (forum chat or whitelisted DM user).
+ * Returns true if the message should be processed.
+ */
+function isAllowedChat(ctx: Context, settings: Settings): boolean {
+    if (!ctx.chat) return false;
+    // Forum chat (existing behavior)
+    if (String(ctx.chat.id) === settings.telegram_chat_id) return true;
+    // DM from whitelisted user
+    if (ctx.chat.type === "private" && ctx.from) {
+        const userId = String(ctx.from.id);
+        return !!settings.dm_allowed_user_ids?.includes(userId);
+    }
+    return false;
+}
+
+/**
+ * Resolve the Borg thread ID for a message context.
+ * For forum messages: uses message_thread_id (or 1 for main topic).
+ * For DM messages: looks up the user's configured thread ID from settings.
+ * Returns undefined if the DM user has no configured thread.
+ */
+function resolveThreadId(ctx: Context, settings: Settings): number | undefined {
+    if (!ctx.chat) return undefined;
+    if (ctx.chat.type === "private" && ctx.from) {
+        const userId = String(ctx.from.id);
+        const dmConfig = settings.dm_threads?.[userId];
+        if (!dmConfig) return undefined;
+        // Cache the chat ID for outgoing message routing
+        dmChatIds.set(dmConfig.threadId, ctx.chat.id);
+        return dmConfig.threadId;
+    }
+    // Forum: use message_thread_id or default to 1
+    return ctx.msg?.message_thread_id ?? 1;
+}
+
+/**
+ * Check if a context is a DM (private chat).
+ */
+function isDmChat(ctx: Context): boolean {
+    return ctx.chat?.type === "private";
+}
+
+/**
+ * Get the message_thread_id for API calls from a context. Returns undefined for DMs.
+ */
+function getCtxThreadOpt(ctx: Context): number | undefined {
+    if (isDmChat(ctx)) return undefined;
+    return ctx.msg?.message_thread_id;
+}
+
+// ─── Inline Keyboard Config ───
+
+interface KeyboardButton {
+    label: string;
+    data: string; // callback data, prefixed with "kb:" for routing
+}
+
+interface KeyboardConfig {
+    welcome?: {
+        text?: string;
+        buttons: KeyboardButton[][];
+    };
+}
+
+/**
+ * Load keyboard config from a JSON file specified in ThreadConfig.keyboards.
+ * Returns null if not configured or file missing.
+ */
+function loadKeyboardConfig(config: ThreadConfig): KeyboardConfig | null {
+    if (!config.keyboards) return null;
+    const resolved = path.resolve(config.cwd, config.keyboards);
+    // Path traversal protection
+    if (!resolved.startsWith(path.resolve(config.cwd) + path.sep) && resolved !== path.resolve(config.cwd)) {
+        log("WARN", `Keyboard config path escapes cwd: ${config.keyboards}`);
+        return null;
+    }
+    try {
+        return JSON.parse(fs.readFileSync(resolved, "utf8")) as KeyboardConfig;
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * Build an InlineKeyboard from a keyboard config button layout.
+ */
+function buildConfigKeyboard(buttons: KeyboardButton[][]): InlineKeyboard {
+    const kb = new InlineKeyboard();
+    for (const row of buttons) {
+        for (const btn of row) {
+            kb.text(btn.label, btn.data);
+        }
+        kb.row();
+    }
+    return kb;
+}
+
+// Track which threads have had their welcome keyboard shown (reset on session clear)
+const welcomeKeyboardShown = new Set<number>();
 
 // ─── Message Splitting ───
 
@@ -448,6 +567,7 @@ async function sendInThread(
 
 /** Resolve the Telegram message_thread_id for a pending message */
 function getThreadOpt(pending: PendingMessage): number | undefined {
+    if (pending.isDm) return undefined; // DMs don't have forum topics
     return pending.ctx?.msg?.message_thread_id
         ?? (pending.threadId !== 1 ? pending.threadId : undefined);
 }
@@ -481,31 +601,33 @@ bot.on("message:forum_topic_edited", (ctx) => {
 // Currently an alias for /clear — may add summarization in the future.
 for (const cmd of ["clear", "compact"] as const) {
     bot.command(cmd, async (ctx) => {
-        if (String(ctx.chat?.id) !== settings.telegram_chat_id) return;
-        const threadId = ctx.msg.message_thread_id ?? 1;
+        if (!isAllowedChat(ctx, settings)) return;
+        const threadId = resolveThreadId(ctx, settings);
+    if (!threadId) return;
         resetThread(threadId);
         await ctx.reply("Session reset. Recent message history will be available on next message.", {
-            message_thread_id: ctx.msg.message_thread_id,
+            message_thread_id: getCtxThreadOpt(ctx),
         });
         log("INFO", `Thread ${threadId} ${cmd} by ${ctx.from?.first_name ?? "unknown"}`);
     });
 }
 
 bot.command("setdir", async (ctx) => {
-    if (String(ctx.chat?.id) !== settings.telegram_chat_id) return;
-    const threadId = ctx.msg.message_thread_id ?? 1;
+    if (!isAllowedChat(ctx, settings)) return;
+    const threadId = resolveThreadId(ctx, settings);
+    if (!threadId) return;
     const dir = ctx.match?.trim();
 
     if (!dir) {
         await ctx.reply("Usage: /setdir <path>", {
-            message_thread_id: ctx.msg.message_thread_id,
+            message_thread_id: getCtxThreadOpt(ctx),
         });
         return;
     }
 
     configureThread(threadId, { cwd: dir });
     await ctx.reply(`Working directory set to: ${dir}`, {
-        message_thread_id: ctx.msg.message_thread_id,
+        message_thread_id: getCtxThreadOpt(ctx),
     });
     log("INFO", `Thread ${threadId} cwd set to ${dir} by ${ctx.from?.first_name ?? "unknown"}`);
 });
@@ -517,15 +639,16 @@ const VALID_MODEL_ARGS: Record<string, string> = {
     opus: "opus[1m]",
 };
 bot.command("model", async (ctx) => {
-    if (String(ctx.chat?.id) !== settings.telegram_chat_id) return;
-    const threadId = ctx.msg.message_thread_id ?? 1;
+    if (!isAllowedChat(ctx, settings)) return;
+    const threadId = resolveThreadId(ctx, settings);
+    if (!threadId) return;
     const arg = ctx.match?.trim().toLowerCase();
 
     if (!arg || !VALID_MODEL_ARGS[arg]) {
         const current = loadThreads()[String(threadId)]?.model ?? "sonnet";
         await ctx.reply(
             `Current model: ${current}\nUsage: /model <haiku|sonnet|opus>`,
-            { message_thread_id: ctx.msg.message_thread_id },
+            { message_thread_id: getCtxThreadOpt(ctx) },
         );
         return;
     }
@@ -535,20 +658,21 @@ bot.command("model", async (ctx) => {
     resetThread(threadId); // Clear session so new model starts fresh with full cache
     await ctx.reply(
         `Model set to ${newModel}. Session reset — recent history will be injected on next message.`,
-        { message_thread_id: ctx.msg.message_thread_id },
+        { message_thread_id: getCtxThreadOpt(ctx) },
     );
     log("INFO", `Thread ${threadId} model set to ${newModel} by ${ctx.from?.first_name ?? "unknown"}`);
 });
 
 // /do <haiku|sonnet|opus> <message> — one-shot query, no session context
 bot.command("do", async (ctx) => {
-    if (String(ctx.chat?.id) !== settings.telegram_chat_id) return;
-    const threadId = ctx.msg.message_thread_id ?? 1;
+    if (!isAllowedChat(ctx, settings)) return;
+    const threadId = resolveThreadId(ctx, settings);
+    if (!threadId) return;
     const args = ctx.match?.trim();
 
     if (!args) {
         await ctx.reply("Usage: /do <haiku|sonnet|opus> <message>\nDefaults to haiku if no model specified.", {
-            message_thread_id: ctx.msg.message_thread_id,
+            message_thread_id: getCtxThreadOpt(ctx),
         });
         return;
     }
@@ -570,7 +694,7 @@ bot.command("do", async (ctx) => {
 
     if (!message) {
         await ctx.reply("Usage: /do <haiku|sonnet|opus> <message>", {
-            message_thread_id: ctx.msg.message_thread_id,
+            message_thread_id: getCtxThreadOpt(ctx),
         });
         return;
     }
@@ -601,7 +725,7 @@ bot.command("do", async (ctx) => {
 
     const modelLabel = model.replace("[1m]", "");
     await ctx.reply(`⚡ Running with ${modelLabel}...`, {
-        message_thread_id: ctx.msg.message_thread_id,
+        message_thread_id: getCtxThreadOpt(ctx),
     });
     log("INFO", `One-shot /do command: thread=${threadId} model=${model} message="${message.slice(0, 100)}"`);
 });
@@ -610,7 +734,7 @@ bot.command("do", async (ctx) => {
 // Writes to shared settings.json at project root - accessible by all zone containers
 for (const cmd of ["budget_on", "budget_off"] as const) {
     bot.command(cmd, async (ctx) => {
-        if (String(ctx.chat?.id) !== settings.telegram_chat_id) return;
+        if (!isAllowedChat(ctx, settings)) return;
         const isOn = cmd === "budget_on";
         const currentSettings = loadSettings();
         currentSettings.budgetMode = isOn;
@@ -620,12 +744,12 @@ for (const cmd of ["budget_on", "budget_off"] as const) {
         } catch (err) {
             log("ERROR", `Failed to write shared settings.json: ${toErrorMessage(err)}`);
             await ctx.reply(`❌ Failed to save budget mode setting: ${toErrorMessage(err)}`, {
-                message_thread_id: ctx.msg?.message_thread_id,
+                message_thread_id: getCtxThreadOpt(ctx),
             });
             return;
         }
         await ctx.reply(isOn ? "💰 Budget mode enabled" : "💰 Budget mode disabled", {
-            message_thread_id: ctx.msg?.message_thread_id,
+            message_thread_id: getCtxThreadOpt(ctx),
         });
         log("INFO", `Budget mode ${isOn ? "enabled" : "disabled"} by ${ctx.from?.first_name ?? "unknown"}`);
     });
@@ -634,13 +758,14 @@ for (const cmd of ["budget_on", "budget_off"] as const) {
 // /compact_team resets all team sessions; an alias for /clear_team.
 for (const cmd of ["clear_team", "compact_team"] as const) {
     bot.command(cmd, async (ctx) => {
-        if (String(ctx.chat?.id) !== settings.telegram_chat_id) return;
-        const threadId = ctx.msg?.message_thread_id ?? 1;
+        if (!isAllowedChat(ctx, settings)) return;
+        const threadId = resolveThreadId(ctx, settings);
+        if (!threadId) return;
         const threads = loadThreads();
         const config = threads[String(threadId)];
         if (!config?.team) {
             await ctx.reply("This thread isn't part of a team.", {
-                message_thread_id: ctx.msg?.message_thread_id,
+                message_thread_id: getCtxThreadOpt(ctx),
             });
             return;
         }
@@ -656,7 +781,7 @@ for (const cmd of ["clear_team", "compact_team"] as const) {
             }
         }
         await ctx.reply(toTelegramMarkdownV2(`Reset ${teamThreads.length} session(s) in team **${config.team}**. Recent history available on next message.`), {
-            message_thread_id: ctx.msg?.message_thread_id,
+            message_thread_id: getCtxThreadOpt(ctx),
             parse_mode: "MarkdownV2",
         });
         log("INFO", `Team ${config.team} ${cmd} by ${ctx.from?.first_name ?? "unknown"} (${teamThreads.length} threads)`);
@@ -665,8 +790,8 @@ for (const cmd of ["clear_team", "compact_team"] as const) {
 
 // /clear_all resets all thread sessions.
 bot.command("clear_all", async (ctx) => {
-    if (String(ctx.chat?.id) !== settings.telegram_chat_id) return;
-    const invokerThreadId = ctx.msg?.message_thread_id ?? 1;
+    if (!isAllowedChat(ctx, settings)) return;
+    const invokerThreadId = resolveThreadId(ctx, settings) ?? 1;
     const threads = loadThreads();
     const allThreadIds = Object.keys(threads).map(Number);
     for (const tid of allThreadIds) {
@@ -679,13 +804,13 @@ bot.command("clear_all", async (ctx) => {
         }
     }
     await ctx.reply(`Reset ${allThreadIds.length} session(s). Recent history available on next message.`, {
-        message_thread_id: ctx.msg?.message_thread_id,
+        message_thread_id: getCtxThreadOpt(ctx),
     });
     log("INFO", `clear_all by ${ctx.from?.first_name ?? "unknown"} (${allThreadIds.length} threads)`);
 });
 
 bot.command("status", async (ctx) => {
-    if (String(ctx.chat?.id) !== settings.telegram_chat_id) return;
+    if (!isAllowedChat(ctx, settings)) return;
     const threads = loadThreads();
     const lines: string[] = ["Active threads:"];
 
@@ -699,7 +824,7 @@ bot.command("status", async (ctx) => {
     }
 
     await ctx.reply(lines.join("\n"), {
-        message_thread_id: ctx.msg.message_thread_id,
+        message_thread_id: getCtxThreadOpt(ctx),
     });
 });
 
@@ -750,6 +875,12 @@ function queueIncomingMessage(
     ctx: any,
     telegramMessageId: number,
 ): void {
+    const isDm = ctx.chat?.type === "private";
+    // For DMs, include the chat ID so queue-processor can propagate it to outgoing messages
+    if (isDm && ctx.chat?.id) {
+        queueData.dmChatId = ctx.chat.id;
+    }
+
     const incomingDir = resolveIncomingForThread(threadId);
     fs.mkdirSync(incomingDir, { recursive: true });
     const queueFile = path.join(incomingDir, `telegram_${messageId}.json`);
@@ -762,6 +893,8 @@ function queueIncomingMessage(
         chatId: ctx.chat.id,
         threadId,
         telegramMessageId,
+        isDm,
+        dmChatId: isDm ? ctx.chat.id : undefined,
     });
     telegramToQueueId.set(telegramMessageId, messageId);
 }
@@ -770,13 +903,14 @@ function queueIncomingMessage(
 // Reply to any message with /retry to reprocess it (voice: re-download + STT, photo: re-download, text: re-queue)
 
 bot.command("retry", async (ctx) => {
-    if (String(ctx.chat?.id) !== settings.telegram_chat_id) return;
-    const threadId = ctx.msg.message_thread_id ?? 1;
+    if (!isAllowedChat(ctx, settings)) return;
+    const threadId = resolveThreadId(ctx, settings);
+    if (!threadId) return;
 
     const reply = ctx.msg.reply_to_message;
     if (!reply) {
         await ctx.reply("Reply to a message with /retry to reprocess it.", {
-            message_thread_id: ctx.msg.message_thread_id,
+            message_thread_id: getCtxThreadOpt(ctx),
         });
         return;
     }
@@ -824,7 +958,7 @@ bot.command("retry", async (ctx) => {
             message = reply.text;
 
         } else {
-            await ctx.reply("Unsupported message type for /retry.", { message_thread_id: ctx.msg.message_thread_id });
+            await ctx.reply("Unsupported message type for /retry.", { message_thread_id: getCtxThreadOpt(ctx) });
             return;
         }
 
@@ -840,7 +974,7 @@ bot.command("retry", async (ctx) => {
         log("INFO", `Retry: reprocessed message for thread ${threadId}`);
     } catch (err) {
         log("ERROR", `Retry failed: ${toErrorMessage(err)}`);
-        await ctx.reply(`Retry failed: ${toErrorMessage(err)}`, { message_thread_id: ctx.msg.message_thread_id });
+        await ctx.reply(`Retry failed: ${toErrorMessage(err)}`, { message_thread_id: getCtxThreadOpt(ctx) });
     }
 });
 
@@ -865,11 +999,34 @@ async function reactAcknowledge(chatId: number, telegramMsgId: number, threadId:
 bot.on("message:text").filter(
     (ctx) => ctx.from.id !== bot.botInfo.id,
     async (ctx) => {
-        const threadId = ctx.msg.message_thread_id ?? 1;
+        const threadId = resolveThreadId(ctx, settings);
+        if (!threadId) return;
         const { isReplyToBot, replyToModel, replyToText } = extractReplyContext(ctx);
 
         // Restrict to configured chat ID
-        if (String(ctx.chat.id) !== settings.telegram_chat_id) return;
+        if (!isAllowedChat(ctx, settings)) return;
+
+        // Show welcome keyboard for DM threads on first interaction (or after session reset)
+        // Check if session was cleared (timeout or /clear) — re-show welcome
+        const threads0 = loadThreads();
+        if (!threads0[String(threadId)]?.sessionId && welcomeKeyboardShown.has(threadId)) {
+            welcomeKeyboardShown.delete(threadId);
+        }
+        if (isDmChat(ctx) && !welcomeKeyboardShown.has(threadId)) {
+            const threads = loadThreads();
+            const threadConfig = threads[String(threadId)];
+            if (threadConfig) {
+                const kbConfig = loadKeyboardConfig(threadConfig);
+                if (kbConfig?.welcome?.buttons) {
+                    const keyboard = buildConfigKeyboard(kbConfig.welcome.buttons);
+                    const welcomeText = kbConfig.welcome.text || "How can I help?";
+                    try {
+                        await ctx.reply(welcomeText, { reply_markup: keyboard });
+                    } catch { /* best effort */ }
+                }
+            }
+            welcomeKeyboardShown.add(threadId);
+        }
 
         // Deduplicate: skip if same sender + thread + text within window
         if (isDuplicate(threadId, String(ctx.from.id), ctx.message.text)) {
@@ -957,8 +1114,9 @@ bot.on("message:text").filter(
 bot.on("message:voice").filter(
     (ctx) => ctx.from.id !== bot.botInfo.id,
     async (ctx) => {
-        const threadId = ctx.msg.message_thread_id ?? 1;
-        if (String(ctx.chat.id) !== settings.telegram_chat_id) return;
+        const threadId = resolveThreadId(ctx, settings);
+    if (!threadId) return;
+        if (!isAllowedChat(ctx, settings)) return;
 
         const duration = ctx.msg.voice.duration;
 
@@ -983,7 +1141,7 @@ bot.on("message:voice").filter(
         const senderId = String(ctx.from.id);
         const chatId = ctx.chat.id;
         const telegramMessageId = ctx.msg.message_id;
-        const threadMsgId = ctx.msg.message_thread_id;
+        const threadMsgId = getCtxThreadOpt(ctx);
         const filePath = file.file_path!;
         const { isReplyToBot, replyToModel, replyToText } = extractReplyContext(ctx);
 
@@ -1097,8 +1255,9 @@ function flushMediaGroup(groupId: string): void {
 bot.on("message:photo").filter(
     (ctx) => ctx.from.id !== bot.botInfo.id,
     async (ctx) => {
-        const threadId = ctx.msg.message_thread_id ?? 1;
-        if (String(ctx.chat.id) !== settings.telegram_chat_id) return;
+        const threadId = resolveThreadId(ctx, settings);
+    if (!threadId) return;
+        if (!isAllowedChat(ctx, settings)) return;
 
         // Get the largest photo (last in array)
         const photo = ctx.msg.photo[ctx.msg.photo.length - 1];
@@ -1109,7 +1268,7 @@ bot.on("message:photo").filter(
         // Reject oversized images (Claude Read tool limit)
         if (file.file_size && file.file_size > 5 * 1024 * 1024) {
             await ctx.reply("Image too large (max 5MB). Please send a smaller image.", {
-                message_thread_id: ctx.msg.message_thread_id,
+                message_thread_id: getCtxThreadOpt(ctx),
             });
             return;
         }
@@ -1133,7 +1292,7 @@ bot.on("message:photo").filter(
         } catch (err) {
             log("ERROR", `Failed to download image file: ${toErrorMessage(err)}`);
             await ctx.reply("Couldn't download your image. Please try again.", {
-                message_thread_id: ctx.msg.message_thread_id,
+                message_thread_id: getCtxThreadOpt(ctx),
             });
             return;
         }
@@ -1214,15 +1373,16 @@ bot.on("message:photo").filter(
 bot.on("message:document").filter(
     (ctx) => ctx.from.id !== bot.botInfo.id,
     async (ctx) => {
-        const threadId = ctx.msg.message_thread_id ?? 1;
-        if (String(ctx.chat.id) !== settings.telegram_chat_id) return;
+        const threadId = resolveThreadId(ctx, settings);
+    if (!threadId) return;
+        if (!isAllowedChat(ctx, settings)) return;
 
         const doc = ctx.msg.document;
 
         // Reject oversized files (Claude Read tool limit for images; text files can be larger)
         if (doc.file_size && doc.file_size > 10 * 1024 * 1024) {
             await ctx.reply("File too large (max 10MB). Please send a smaller file.", {
-                message_thread_id: ctx.msg.message_thread_id,
+                message_thread_id: getCtxThreadOpt(ctx),
             });
             return;
         }
@@ -1237,7 +1397,7 @@ bot.on("message:document").filter(
         const file = await ctx.getFile();
         if (!file.file_path) {
             await ctx.reply("Couldn't get the file from Telegram. Please try again.", {
-                message_thread_id: ctx.msg.message_thread_id,
+                message_thread_id: getCtxThreadOpt(ctx),
             });
             return;
         }
@@ -1252,7 +1412,7 @@ bot.on("message:document").filter(
             await downloadTelegramFile(telegramFileUrl(file.file_path), localPath);
         } catch (err) {
             log("ERROR", `Failed to download document: ${toErrorMessage(err)}`);
-            await ctx.reply("Couldn't download your file. Please try again.", { message_thread_id: ctx.msg.message_thread_id });
+            await ctx.reply("Couldn't download your file. Please try again.", { message_thread_id: getCtxThreadOpt(ctx) });
             return;
         }
 
@@ -1436,8 +1596,9 @@ async function pollOutgoingQueue(): Promise<void> {
                 }
 
                 if (data.targetThreadId) {
-                    // Cross-thread message: post to the target topic
-                    const chatId = settings.telegram_chat_id;
+                    // Cross-thread message: post to target topic or DM chat
+                    const targetDmChatId = dmChatIds.get(data.targetThreadId);
+                    const chatId = targetDmChatId ? String(targetDmChatId) : settings.telegram_chat_id;
 
                     // Convert GFM markdown to Telegram MarkdownV2, with optional cross-thread indicator
                     let markdownV2Text = toTelegramMarkdownV2(data.message);
@@ -1451,9 +1612,9 @@ async function pollOutgoingQueue(): Promise<void> {
                     }
                     const chunks = splitMessage(markdownV2Text);
 
-                    const threadOpt = data.targetThreadId !== 1
+                    const threadOpt = targetDmChatId ? {} : (data.targetThreadId !== 1
                         ? { message_thread_id: data.targetThreadId }
-                        : {};
+                        : {});
 
                     // Register pending message BEFORE sending to ensure typing indicator
                     // and status updates work immediately when queue-processor starts work.
@@ -1565,17 +1726,17 @@ async function pollOutgoingQueue(): Promise<void> {
                             `No pending message found for messageId ${data.messageId}, sending to chat directly`,
                         );
 
-                        // Fallback: send to the configured chat, routing to the correct thread
-                        const chatId = settings.telegram_chat_id;
+                        // Fallback: send to DM chat if dmChatId set, otherwise to forum thread
+                        const chatId = data.dmChatId ? String(data.dmChatId) : settings.telegram_chat_id;
                         // Frame scheduled task output for human readability
                         const messageToSend = data.scheduledTaskName
                             ? `**Scheduled task "${data.scheduledTaskName}"**\n\n${data.message}`
                             : data.message;
                         const markdownV2Fallback = toTelegramMarkdownV2(messageToSend);
                         const chunks = splitMessage(markdownV2Fallback);
-                        const threadOpt = data.threadId && data.threadId !== 1
+                        const threadOpt = data.dmChatId ? {} : (data.threadId && data.threadId !== 1
                             ? { message_thread_id: data.threadId }
-                            : {};
+                            : {});
 
                         // Silence cost alerts and system messages
                         const isSilent = data.model === "system" || data.messageId.startsWith("cost_alert_") || data.messageId.startsWith("bg_alert_");
@@ -1601,7 +1762,7 @@ async function pollOutgoingQueue(): Promise<void> {
                         if (firstSentId && !isSilent) {
                             try {
                                 const keyboard = buildReplyKeyboard(firstSentId, data.replyToMessageId, data.replyToVoice, data.messageId);
-                                await bot.api.editMessageReplyMarkup(settings.telegram_chat_id, firstSentId, {
+                                await bot.api.editMessageReplyMarkup(chatId, firstSentId, {
                                     reply_markup: keyboard,
                                 });
                             } catch { /* Buttons are best-effort */ }
@@ -1640,11 +1801,12 @@ async function pollOutgoingQueue(): Promise<void> {
                             threadId: data.targetThreadId,
                             source: "response", // could be "response", "transcript", "summary"
                         });
-                        const chatId = settings.telegram_chat_id;
+                        const targetDmChat = data.dmChatId || (data.targetThreadId && dmChatIds.get(data.targetThreadId)) || dmChatIds.get(data.threadId);
+                        const chatId = targetDmChat ? String(targetDmChat) : settings.telegram_chat_id;
                         const threadId = data.targetThreadId || data.threadId;
-                        const threadOpt = threadId && threadId !== 1
+                        const threadOpt = targetDmChat ? {} : (threadId && threadId !== 1
                             ? { message_thread_id: threadId }
-                            : {};
+                            : {});
 
                         let messageText = data.message;
                         if (data.sourceThreadId) {
@@ -1775,8 +1937,10 @@ async function pollThreadStatus(): Promise<void> {
 
             let state = threadStatusMap.get(threadId);
             if (!state) {
+                // For DM threads, use the cached DM chat ID; otherwise use the forum chat
+                const dmChat = dmChatIds.get(threadId);
                 state = {
-                    chatId: Number(settings.telegram_chat_id),
+                    chatId: dmChat ?? Number(settings.telegram_chat_id),
                     threadId,
                 };
                 threadStatusMap.set(threadId, state);
@@ -1859,7 +2023,7 @@ async function pollThreadStatus(): Promise<void> {
                         state.chatId,
                         displayText,
                         {
-                            message_thread_id: threadId === 1 ? undefined : threadId,
+                            message_thread_id: dmChatIds.has(threadId) || threadId === 1 ? undefined : threadId,
                             reply_markup: cancelKeyboard,
                             disable_notification: true,
                             ...replyOpts,
@@ -1912,7 +2076,7 @@ async function sendTypingForPending(): Promise<void> {
 
 bot.on("message_reaction", async (ctx) => {
     // Filter: correct chat
-    if (!ctx.chat || String(ctx.chat.id) !== settings.telegram_chat_id) return;
+    if (!isAllowedChat(ctx, settings)) return;
 
     // Note: bot self-reactions do NOT trigger this handler (Telegram API guarantee)
 
@@ -1959,6 +2123,46 @@ bot.on("message_reaction", async (ctx) => {
 
 bot.on("callback_query:data", async (ctx) => {
     const data = ctx.callbackQuery.data;
+
+    // ─── Keyboard Config Button (queue message from button press) ───
+    if (data.startsWith("kb:")) {
+        if (!isAllowedChat(ctx, settings)) return;
+        await ctx.answerCallbackQuery();
+        const buttonAction = data.slice(3); // strip "kb:" prefix
+        const threadId = resolveThreadId(ctx, settings);
+        if (!threadId) return;
+
+        const threads = loadThreads();
+        const threadConfig = threads[String(threadId)];
+        const kbConfig = threadConfig ? loadKeyboardConfig(threadConfig) : null;
+
+        // Find the button label to use as the message text
+        let buttonLabel = buttonAction;
+        if (kbConfig?.welcome?.buttons) {
+            for (const row of kbConfig.welcome.buttons) {
+                for (const btn of row) {
+                    if (btn.data === data) {
+                        buttonLabel = btn.label;
+                        break;
+                    }
+                }
+            }
+        }
+
+        const messageId = generateMessageId();
+        const chatId = ctx.callbackQuery.message?.chat.id;
+        if (!chatId) return;
+        const telegramMessageId = ctx.callbackQuery.message?.message_id ?? 0;
+
+        queueIncomingMessage({
+            channel: "telegram", source: "user", threadId,
+            sender: ctx.from.first_name, senderId: String(ctx.from.id),
+            message: buttonLabel, isReply: false,
+            topicName: topicNames.get(threadId),
+            timestamp: Date.now(), messageId,
+        }, threadId, messageId, ctx, telegramMessageId);
+        return;
+    }
 
     // ─── Cancel Button (abort running SDK process) ───
     if (data.startsWith("cancel:")) {

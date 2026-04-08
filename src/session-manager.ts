@@ -19,6 +19,9 @@ export interface ThreadConfig {
     role?: string;          // Agent role (e.g., "planner", "reviewer")
     mainThread?: boolean;   // Receives broadcast fan-outs (only long-lived threads)
     workflow?: string;      // Path to workflow skill file (e.g., ".claude/skills/workflows/dev-team.md")
+    sessionTimeout?: number; // Minutes of inactivity before session auto-clears (overrides global setting)
+    prompt?: string;         // Path to prompt file (relative to cwd) appended to system prompt
+    keyboards?: string;      // Path to keyboard config JSON (relative to cwd) for inline button layouts
 }
 
 export type ThreadsMap = Record<string, ThreadConfig>;
@@ -54,6 +57,8 @@ export interface Settings {
     webhook_secret?: string;         // Bearer token for POST /api/incoming webhook endpoint
     clairvoyant_webhook_secret?: string; // HMAC secret from Clairvoyant's register_webhook response
     clairvoyant_thread_id?: number;      // Thread ID to route Clairvoyant events to
+    dm_allowed_user_ids?: string[];       // Telegram user IDs allowed to DM the bot
+    dm_threads?: Record<string, { threadId: number; name: string }>; // Telegram user ID → thread config for DMs
 }
 
 // ─── Constants ───
@@ -704,8 +709,25 @@ Your runtime context:
 
 // ─── System Prompts ───
 
+function loadCustomPrompt(config: ThreadConfig): string {
+    if (!config.prompt) return "";
+    const resolved = path.resolve(config.cwd, config.prompt);
+    // Path traversal protection: resolved path must be under cwd
+    if (!resolved.startsWith(path.resolve(config.cwd) + path.sep) && resolved !== path.resolve(config.cwd)) {
+        console.warn(`[session-manager] Custom prompt path escapes cwd: ${config.prompt} → ${resolved}`);
+        return "";
+    }
+    try {
+        return fs.readFileSync(resolved, "utf8");
+    } catch {
+        console.warn(`[session-manager] Custom prompt file not found: ${resolved}`);
+        return "";
+    }
+}
+
 export function buildThreadPrompt(config: ThreadConfig, runtime: { threadId: number; model: string }): string {
     const runtimeBlock = buildRuntimeBlock(config, runtime);
+    const customPrompt = loadCustomPrompt(config);
 
     if (config.isMaster) {
         const parts = [
@@ -723,6 +745,7 @@ export function buildThreadPrompt(config: ThreadConfig, runtime: { threadId: num
             parts.push(buildHeartbeatBlock());
         }
         parts.push(`Keep responses concise — Telegram messages over 4000 characters get split.${runtimeBlock}`);
+        if (customPrompt) parts.push(customPrompt);
         return parts.join("\n\n");
     }
 
@@ -739,6 +762,7 @@ export function buildThreadPrompt(config: ThreadConfig, runtime: { threadId: num
         parts.push(buildHeartbeatBlock());
     }
     parts.push(`Keep responses concise — Telegram messages over 4000 characters get split.${runtimeBlock}`);
+    if (customPrompt) parts.push(customPrompt);
     return parts.join("\n\n");
 }
 
