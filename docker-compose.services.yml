@@ -74,12 +74,9 @@ services:
     environment:
       - NTFY_BASE_URL=${NTFY_BASE_URL:-http://ntfy:80}
       - NTFY_CACHE_FILE=/var/cache/ntfy/cache.db
-      - NTFY_AUTH_FILE=/var/lib/ntfy/user.db
-      - NTFY_AUTH_DEFAULT_ACCESS=deny-all
       - NTFY_BEHIND_PROXY=true
     volumes:
       - ntfy-cache:/var/cache/ntfy
-      - ntfy-auth:/var/lib/ntfy
     networks:
       - internal
     healthcheck:
@@ -96,7 +93,6 @@ volumes:
   clairvoyant-pgdata:
   clairvoyant-attachments:
   ntfy-cache:
-  ntfy-auth:
 
 networks:
   internal: {}
