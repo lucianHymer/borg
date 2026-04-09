@@ -11,6 +11,16 @@ import express from "express";
 import { z } from "zod";
 import { loadZoneConfig, getThreadZone } from "./zone-config.js";
 import { toErrorMessage } from "./types.js";
+import {
+    claimAuthCode,
+    checkRateLimit,
+    recordFailedAttempt,
+    createToken,
+    validateToken,
+    getGitHubToken,
+    startAuthSweep,
+    stopAuthSweep,
+} from "./auth.js";
 
 const SCRIPT_DIR = path.resolve(__dirname, "..");
 const ZONE_CONFIG_PATH = process.env.ZONE_CONFIG_PATH || path.join(SCRIPT_DIR, "zone-config.json");
@@ -119,11 +129,73 @@ app.post("/api/incoming", (req, res) => {
     }
 });
 
+// ─── Auth Endpoints ───
+
+app.post("/auth/claim", async (req, res) => {
+    const ip = req.ip || req.socket.remoteAddress || "unknown";
+    if (!checkRateLimit(ip)) {
+        res.status(429).json({ error: "Too many attempts" });
+        return;
+    }
+
+    const code = req.body?.code;
+    if (!code || typeof code !== "string") {
+        res.status(400).json({ error: "Missing code" });
+        return;
+    }
+
+    const result = claimAuthCode(code);
+    if (!result) {
+        recordFailedAttempt(ip);
+        res.status(401).json({ error: "Invalid or expired code" });
+        return;
+    }
+
+    const tokenInfo = await createToken(result.telegramUserId, result.userName);
+    res.json({ token: tokenInfo.token, expires_at: tokenInfo.expiresAt, userName: tokenInfo.userName });
+});
+
+app.post("/auth/gh-token", async (req, res) => {
+    const auth = req.headers.authorization;
+    const token = auth?.startsWith("Bearer ") ? auth.slice(7) : null;
+    if (!token) {
+        res.status(401).json({ error: "Missing or invalid Authorization header" });
+        return;
+    }
+
+    const org = req.body?.org as string | undefined;
+    const result = await getGitHubToken(token, org);
+    if (!result) {
+        res.status(401).json({ error: "Invalid token or no access" });
+        return;
+    }
+
+    res.json(result);
+});
+
+app.post("/auth/validate", async (req, res) => {
+    const auth = req.headers.authorization;
+    const token = auth?.startsWith("Bearer ") ? auth.slice(7) : null;
+    if (!token) {
+        res.status(401).json({ error: "Missing or invalid Authorization header" });
+        return;
+    }
+
+    const tokenInfo = await validateToken(token);
+    if (!tokenInfo) {
+        res.status(401).json({ error: "Invalid or expired token" });
+        return;
+    }
+
+    res.json({ valid: true, userName: tokenInfo.userName, scopes: tokenInfo.scopes });
+});
+
 // ─── Start/Stop ───
 
 let server: http.Server | null = null;
 
 export function startWebhookServer(): http.Server {
+    startAuthSweep();
     server = http.createServer(app);
     server.listen(PORT, "0.0.0.0", () => {
         console.log(`Webhook server listening on http://0.0.0.0:${PORT}`);
@@ -132,6 +204,7 @@ export function startWebhookServer(): http.Server {
 }
 
 export function stopWebhookServer(): Promise<void> {
+    stopAuthSweep();
     return new Promise((resolve) => {
         if (server) {
             server.close(() => resolve());
