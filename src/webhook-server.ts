@@ -176,6 +176,125 @@ app.post("/api/incoming", (req, res) => {
     }
 });
 
+// ─── Webhook Helpers ───
+
+function extractToken(req: express.Request): string | null {
+    const auth = req.headers.authorization;
+    if (!auth?.startsWith("Bearer ")) return null;
+    return auth.slice(7);
+}
+
+async function requireToken(req: express.Request, res: express.Response, next: express.NextFunction) {
+    const token = extractToken(req);
+    if (!token) { res.status(401).json({ error: "Missing token" }); return; }
+    const valid = await validateToken(token);
+    if (!valid) { res.status(401).json({ error: "Invalid token" }); return; }
+    next();
+}
+
+function writeWebhooks(webhooks: WebhooksFile): void {
+    fs.mkdirSync(path.dirname(WEBHOOKS_FILE), { recursive: true });
+    const tmpFile = WEBHOOKS_FILE + ".tmp";
+    fs.writeFileSync(tmpFile, JSON.stringify(webhooks, null, 2));
+    fs.renameSync(tmpFile, WEBHOOKS_FILE);
+    // Invalidate mtime cache so next loadWebhooks() re-reads
+    cachedWebhooks = null;
+    cachedWebhooksMtime = 0;
+}
+
+function redactSecret(config: WebhookConfig): WebhookConfig & { secret: string } {
+    return { ...config, secret: "***" };
+}
+
+// ─── Webhook CRUD Routes (Bearer token auth) ───
+
+app.get("/api/webhooks/list", requireToken, (_req, res) => {
+    const webhooks = loadWebhooks();
+    const redacted: Record<string, WebhookConfig> = {};
+    for (const [id, config] of Object.entries(webhooks)) {
+        redacted[id] = redactSecret(config);
+    }
+    res.json(redacted);
+});
+
+app.post("/api/webhooks/create", requireToken, (req, res) => {
+    const { name, signatureHeader, hmacAlgorithm, threadId, formatter, eventFilter, ntfy } = req.body || {};
+    if (!name || typeof name !== "string") {
+        res.status(400).json({ error: "name is required" });
+        return;
+    }
+
+    const id = "wh_" + crypto.randomBytes(4).toString("hex");
+    const secret = crypto.randomBytes(32).toString("hex");
+
+    const config: WebhookConfig = {
+        name,
+        secret,
+        signatureHeader: signatureHeader || "x-hub-signature-256",
+        signaturePrefix: "sha256=",
+        hmacAlgorithm: hmacAlgorithm || "sha256",
+        formatter: formatter || "github",
+        createdAt: Date.now(),
+        ...(threadId != null ? { threadId } : {}),
+        ...(eventFilter ? { eventFilter } : {}),
+        ...(ntfy ? { ntfy } : {}),
+    };
+
+    const webhooks = loadWebhooks();
+    webhooks[id] = config;
+    writeWebhooks(webhooks);
+
+    res.status(201).json({ id, ...config });
+});
+
+app.put("/api/webhooks/:id/update", requireToken, (req: express.Request<{ id: string }>, res) => {
+    const webhooks = loadWebhooks();
+    const existing = webhooks[req.params.id];
+    if (!existing) {
+        res.status(404).json({ error: "Webhook not found" });
+        return;
+    }
+
+    const { name, threadId, ntfy, formatter, eventFilter } = req.body || {};
+    if (name !== undefined) existing.name = name;
+    if (threadId !== undefined) existing.threadId = threadId;
+    if (ntfy !== undefined) existing.ntfy = ntfy;
+    if (formatter !== undefined) existing.formatter = formatter;
+    if (eventFilter !== undefined) existing.eventFilter = eventFilter;
+
+    webhooks[req.params.id] = existing;
+    writeWebhooks(webhooks);
+
+    res.json({ id: req.params.id, ...redactSecret(existing) });
+});
+
+app.delete("/api/webhooks/:id/delete", requireToken, (req: express.Request<{ id: string }>, res) => {
+    const webhooks = loadWebhooks();
+    if (!webhooks[req.params.id]) {
+        res.status(404).json({ error: "Webhook not found" });
+        return;
+    }
+
+    delete webhooks[req.params.id];
+    writeWebhooks(webhooks);
+
+    res.json({ deleted: true });
+});
+
+app.post("/api/webhooks/:id/rotate", requireToken, (req: express.Request<{ id: string }>, res) => {
+    const webhooks = loadWebhooks();
+    if (!webhooks[req.params.id]) {
+        res.status(404).json({ error: "Webhook not found" });
+        return;
+    }
+
+    const newSecret = crypto.randomBytes(32).toString("hex");
+    webhooks[req.params.id].secret = newSecret;
+    writeWebhooks(webhooks);
+
+    res.json({ id: req.params.id, secret: newSecret });
+});
+
 // ─── Generic Webhook Handler (HMAC signature auth) ───
 
 app.post("/api/webhooks/:id", (req: express.Request<{ id: string }> & { rawBody?: Buffer }, res) => {
