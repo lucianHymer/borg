@@ -1681,6 +1681,76 @@ app.get("/api/response/:messageId/feed", (req, res) => {
     });
 });
 
+// ─── Webhook CRUD Proxy to Infra ───
+
+app.get("/api/webhooks/list", async (req, res) => {
+    try {
+        const response = await fetch("http://infra:3001/api/webhooks/list", {
+            headers: { Authorization: req.headers.authorization || "" },
+        });
+        const data = await response.json();
+        res.status(response.status).json(data);
+    } catch { res.status(502).json({ error: "Infra unreachable" }); }
+});
+
+app.post("/api/webhooks/create", async (req, res) => {
+    try {
+        const response = await fetch("http://infra:3001/api/webhooks/create", {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                Authorization: req.headers.authorization || "",
+            },
+            body: JSON.stringify(req.body),
+        });
+        const data = await response.json();
+        res.status(response.status).json(data);
+    } catch { res.status(502).json({ error: "Infra unreachable" }); }
+});
+
+app.put("/api/webhooks/:id/update", async (req, res) => {
+    try {
+        const response = await fetch(`http://infra:3001/api/webhooks/${req.params.id}/update`, {
+            method: "PUT",
+            headers: {
+                "Content-Type": "application/json",
+                Authorization: req.headers.authorization || "",
+            },
+            body: JSON.stringify(req.body),
+        });
+        const data = await response.json();
+        res.status(response.status).json(data);
+    } catch { res.status(502).json({ error: "Infra unreachable" }); }
+});
+
+app.delete("/api/webhooks/:id/delete", async (req, res) => {
+    try {
+        const response = await fetch(`http://infra:3001/api/webhooks/${req.params.id}/delete`, {
+            method: "DELETE",
+            headers: { Authorization: req.headers.authorization || "" },
+        });
+        const data = await response.json();
+        res.status(response.status).json(data);
+    } catch { res.status(502).json({ error: "Infra unreachable" }); }
+});
+
+app.post("/api/webhooks/:id/rotate", async (req, res) => {
+    try {
+        const response = await fetch(`http://infra:3001/api/webhooks/${req.params.id}/rotate`, {
+            method: "POST",
+            headers: { Authorization: req.headers.authorization || "" },
+        });
+        const data = await response.json();
+        res.status(response.status).json(data);
+    } catch { res.status(502).json({ error: "Infra unreachable" }); }
+});
+
+app.get("/api/webhooks/deliveries", (_req, res) => {
+    const deliveryFile = path.join(BORG_INFRA_DIR, "webhook-deliveries.jsonl");
+    const entries = readRecentJsonl<Record<string, unknown>>(deliveryFile, 100);
+    res.json(entries);
+});
+
 // ─── Start Server ───
 
 const server = http.createServer(app);
