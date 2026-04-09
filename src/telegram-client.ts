@@ -28,6 +28,7 @@ import { startPeriodicCleanup as startImageCleanup } from "./images.js";
 import { toTelegramMarkdownV2, escapeMarkdownV2 } from "./markdown-v2.js";
 import { loadZoneConfig, getThreadZone, isSameZone } from "./zone-config.js";
 import { startWebhookServer, stopWebhookServer } from "./webhook-server.js";
+import { generateAuthCode } from "./auth.js";
 
 // ─── Constants ───
 
@@ -966,6 +967,16 @@ bot.command("retry", async (ctx) => {
         log("ERROR", `Retry failed: ${toErrorMessage(err)}`);
         await ctx.reply(`Retry failed: ${toErrorMessage(err)}`, { message_thread_id: getCtxThreadOpt(ctx) });
     }
+});
+
+bot.command("authcode", async (ctx) => {
+    if (!isAllowedChat(ctx, settings)) return;
+    if (!ctx.from) return;
+    const code = generateAuthCode(ctx.from.id, ctx.from.first_name);
+    await ctx.reply(`Your auth code: \`${code}\`\nExpires in 10 minutes\\.`, {
+        parse_mode: "MarkdownV2",
+        message_thread_id: getCtxThreadOpt(ctx),
+    });
 });
 
 // ─── Shared acknowledgement reaction ───
@@ -2709,6 +2720,7 @@ bot.start({
             { command: "do", description: "One-shot query: /do [haiku|sonnet|opus] <message>" },
             { command: "clear_all", description: "Reset all thread sessions" },
             { command: "retry", description: "Reply to a voice message to reprocess it" },
+            { command: "authcode", description: "Get auth code for dashboard/CLI login" },
         ]);
         // Start task watcher
         setInterval(() => { pollTaskUpdates().catch(() => {}); }, TASK_POLL_INTERVAL);
