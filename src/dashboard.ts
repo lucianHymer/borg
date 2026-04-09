@@ -104,6 +104,87 @@ app.use(express.json());
 // Serve static files
 app.use("/static", express.static(STATIC_DIR));
 
+// GET /health (unauthenticated)
+app.get("/health", (_req, res) => {
+    res.json({ status: "ok", uptime: process.uptime() });
+});
+
+// GET /login (unauthenticated)
+app.get("/login", (_req, res) => {
+    res.sendFile(path.join(STATIC_DIR, "login.html"));
+});
+
+// Auth proxy routes (unauthenticated — these ARE the login flow)
+app.post("/auth/claim", async (req, res) => {
+    try {
+        const response = await fetch("http://infra:3001/auth/claim", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(req.body),
+        });
+        const data = await response.json();
+        res.status(response.status).json(data);
+    } catch (err) {
+        res.status(502).json({ error: "Auth service unreachable" });
+    }
+});
+
+app.post("/auth/validate", async (req, res) => {
+    try {
+        const response = await fetch("http://infra:3001/auth/validate", {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                ...(req.headers.authorization ? { Authorization: req.headers.authorization } : {}),
+            },
+        });
+        const data = await response.json();
+        res.status(response.status).json(data);
+    } catch (err) {
+        res.status(502).json({ error: "Auth service unreachable" });
+    }
+});
+
+// ─── Auth Middleware ───
+
+function getCookieValue(req: express.Request, name: string): string | undefined {
+    const cookie = req.headers.cookie;
+    if (!cookie) return undefined;
+    const match = cookie.split(";").map(s => s.trim()).find(s => s.startsWith(`${name}=`));
+    return match ? match.slice(name.length + 1) : undefined;
+}
+
+async function requireAuth(req: express.Request, res: express.Response, next: express.NextFunction) {
+    const authHeader = req.headers.authorization;
+    const token = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : getCookieValue(req, "borg_token");
+
+    if (!token) {
+        if (req.path.startsWith("/api/")) {
+            return res.status(401).json({ error: "Unauthorized" });
+        }
+        return res.redirect("/login");
+    }
+
+    try {
+        const response = await fetch("http://infra:3001/auth/validate", {
+            method: "POST",
+            headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+        });
+        if (!response.ok) {
+            if (req.path.startsWith("/api/")) {
+                return res.status(401).json({ error: "Unauthorized" });
+            }
+            return res.redirect("/login");
+        }
+        next();
+    } catch {
+        // If infra is unreachable, let requests through (graceful degradation during startup)
+        next();
+    }
+}
+
+app.use(requireAuth);
+
 // GET / — serves the dashboard HTML
 app.get("/", (_req, res) => {
     const htmlPath = path.join(STATIC_DIR, "dashboard.html");
@@ -112,11 +193,6 @@ app.get("/", (_req, res) => {
     } else {
         res.status(404).send("Dashboard HTML not found. Place static/dashboard.html.");
     }
-});
-
-// GET /health
-app.get("/health", (_req, res) => {
-    res.json({ status: "ok", uptime: process.uptime() });
 });
 
 // GET /api/status — service health, queue depth, thread summary, host metrics
