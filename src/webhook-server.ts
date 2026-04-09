@@ -123,6 +123,36 @@ function enqueueWebhookMessage(opts: {
     return { messageId, zone };
 }
 
+// ─── Ntfy Debounce State ───
+
+const ntfyBatches = new Map<string, { timer: NodeJS.Timeout; messages: string[] }>();
+
+function debounceNtfy(topic: string, debounceMs: number, message: string): void {
+    const existing = ntfyBatches.get(topic);
+    if (existing) {
+        existing.messages.push(message);
+        return; // timer already running
+    }
+
+    const batch = { timer: null as any, messages: [message] };
+    batch.timer = setTimeout(async () => {
+        ntfyBatches.delete(topic);
+        const summary = batch.messages.length === 1
+            ? batch.messages[0]
+            : `${batch.messages.length} events:\n\n${batch.messages.join("\n\n---\n\n")}`;
+        try {
+            await fetch(`http://ntfy:80/${topic}`, {
+                method: "POST",
+                body: summary.slice(0, 4000), // ntfy has message size limits
+            });
+        } catch (err) {
+            console.error("ntfy send failed:", err);
+        }
+    }, debounceMs);
+    batch.timer.unref(); // don't keep process alive
+    ntfyBatches.set(topic, batch);
+}
+
 // ─── Express App ───
 
 const app = express();
@@ -366,7 +396,10 @@ app.post("/api/webhooks/:id", (req: express.Request<{ id: string }> & { rawBody?
         }
     }
 
-    // TODO: Phase 3d — ntfy debounce integration
+    // Ntfy debounce — batch notifications for the same topic
+    if (config.ntfy && formatted) {
+        debounceNtfy(config.ntfy.topic, config.ntfy.debounceMs, formatted);
+    }
 
     // Log delivery
     try {
@@ -376,7 +409,7 @@ app.post("/api/webhooks/:id", (req: express.Request<{ id: string }> & { rawBody?
             event: githubEvent ? `${githubEvent}${req.body?.action ? `.${req.body.action}` : ""}` : "unknown",
             status: "ok",
             ...(config.threadId ? { threadId: config.threadId } : {}),
-            ...(config.ntfy ? { ntfy: false } : {}), // TODO: set true when ntfy is implemented
+            ...(config.ntfy ? { ntfy: true } : {}),
         });
         fs.appendFileSync(DELIVERIES_FILE, deliveryEntry + "\n");
     } catch {
