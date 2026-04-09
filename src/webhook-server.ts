@@ -21,11 +21,58 @@ import {
     startAuthSweep,
     stopAuthSweep,
 } from "./auth.js";
+import { formatters } from "./webhook-formatters.js";
 
 const SCRIPT_DIR = path.resolve(__dirname, "..");
 const ZONE_CONFIG_PATH = process.env.ZONE_CONFIG_PATH || path.join(SCRIPT_DIR, "zone-config.json");
 const SETTINGS_FILE = process.env.SETTINGS_FILE || path.join(SCRIPT_DIR, "settings.json");
+const BORG_DIR = path.join(SCRIPT_DIR, ".borg");
+const WEBHOOKS_FILE = path.join(BORG_DIR, "webhooks.json");
+const DELIVERIES_FILE = path.join(BORG_DIR, "webhook-deliveries.jsonl");
 const PORT = parseInt(process.env.WEBHOOK_PORT || "3001", 10);
+
+// ─── Webhook Config Types ───
+
+interface WebhookConfig {
+    name: string;
+    secret: string;
+    signatureHeader: string;   // e.g. "x-hub-signature-256"
+    signaturePrefix: string;   // e.g. "sha256="
+    hmacAlgorithm: string;     // e.g. "sha256"
+    threadId?: number;
+    formatter: string;         // "github" | "raw"
+    eventFilter?: string[];    // e.g. ["issues", "pull_request"]
+    ntfy?: { topic: string; debounceMs: number };
+    createdAt: number;
+}
+
+interface WebhooksFile {
+    [id: string]: WebhookConfig;
+}
+
+// ─── Mtime-Cached Webhooks Loader ───
+
+let cachedWebhooks: WebhooksFile | null = null;
+let cachedWebhooksMtime: number = 0;
+
+function loadWebhooks(): WebhooksFile {
+    try {
+        const stat = fs.statSync(WEBHOOKS_FILE);
+        if (cachedWebhooks && stat.mtimeMs === cachedWebhooksMtime) {
+            return cachedWebhooks;
+        }
+        const raw = fs.readFileSync(WEBHOOKS_FILE, "utf-8");
+        const parsed = JSON.parse(raw) as WebhooksFile;
+        cachedWebhooks = parsed;
+        cachedWebhooksMtime = stat.mtimeMs;
+        return parsed;
+    } catch (err: unknown) {
+        if (err instanceof Error && "code" in err && (err as NodeJS.ErrnoException).code === "ENOENT") {
+            return {};
+        }
+        throw err;
+    }
+}
 
 function readSettings(): Record<string, unknown> {
     try {
@@ -127,6 +174,97 @@ app.post("/api/incoming", (req, res) => {
     } catch (err) {
         res.status(500).json({ error: toErrorMessage(err) });
     }
+});
+
+// ─── Generic Webhook Handler (HMAC signature auth) ───
+
+app.post("/api/webhooks/:id", (req: express.Request<{ id: string }> & { rawBody?: Buffer }, res) => {
+    const webhooks = loadWebhooks();
+    const config = webhooks[req.params.id];
+    if (!config) {
+        res.status(404).json({ error: "Webhook not found" });
+        return;
+    }
+
+    // Verify HMAC signature
+    const signature = req.headers[config.signatureHeader.toLowerCase()] as string | undefined;
+    if (!signature || !req.rawBody) {
+        res.status(401).json({ error: "Missing signature" });
+        return;
+    }
+
+    const computed = config.signaturePrefix +
+        crypto.createHmac(config.hmacAlgorithm, config.secret).update(req.rawBody).digest("hex");
+
+    if (signature.length !== computed.length ||
+        !crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(computed))) {
+        res.status(401).json({ error: "Invalid signature" });
+        return;
+    }
+
+    // Handle GitHub ping event
+    const githubEvent = req.headers["x-github-event"] as string | undefined;
+    if (githubEvent === "ping") {
+        res.status(200).json({ pong: true });
+        return;
+    }
+
+    // Event filtering
+    if (config.eventFilter && config.eventFilter.length > 0 && githubEvent) {
+        if (!config.eventFilter.includes(githubEvent)) {
+            res.status(200).json({ filtered: true });
+            return;
+        }
+    }
+
+    // Format payload
+    const formatter = formatters[config.formatter];
+    if (!formatter) {
+        res.status(500).json({ error: `Unknown formatter: ${config.formatter}` });
+        return;
+    }
+
+    const headers = req.headers as Record<string, string>;
+    const formatted = formatter(headers, req.body);
+    if (!formatted) {
+        res.status(200).json({ skipped: true });
+        return;
+    }
+
+    // Enqueue message if threadId is configured
+    let messageId: string | undefined;
+    if (config.threadId) {
+        try {
+            const result = enqueueWebhookMessage({
+                threadId: config.threadId,
+                sender: config.name,
+                message: formatted,
+            });
+            messageId = result.messageId;
+        } catch (err) {
+            res.status(500).json({ error: toErrorMessage(err) });
+            return;
+        }
+    }
+
+    // TODO: Phase 3d — ntfy debounce integration
+
+    // Log delivery
+    try {
+        const deliveryEntry = JSON.stringify({
+            webhookId: req.params.id,
+            ts: Date.now(),
+            event: githubEvent ? `${githubEvent}${req.body?.action ? `.${req.body.action}` : ""}` : "unknown",
+            status: "ok",
+            ...(config.threadId ? { threadId: config.threadId } : {}),
+            ...(config.ntfy ? { ntfy: false } : {}), // TODO: set true when ntfy is implemented
+        });
+        fs.appendFileSync(DELIVERIES_FILE, deliveryEntry + "\n");
+    } catch {
+        // Best-effort logging — don't fail the webhook delivery
+    }
+
+    res.status(200).json({ delivered: true, ...(messageId ? { messageId } : {}) });
 });
 
 // ─── Auth Endpoints ───
