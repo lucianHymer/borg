@@ -28,7 +28,6 @@ export interface IncomingMessage {
     imagePaths?: string[];      // multiple image paths (media group / album)
     telegramMessageId?: number; // Telegram message_id (for voice transcript cache)
     oneshotModel?: string;      // model override for /do one-shot queries
-    dmChatId?: number;           // Telegram chat ID for DM responses (set by telegram-client for DM messages)
 }
 
 export interface OutgoingMessage {
@@ -47,7 +46,6 @@ export interface OutgoingMessage {
     replyToVoice?: boolean;    // true if replying to a voice message
     crossThread?: boolean;       // true if this outgoing message needs cross-thread routing by infra
     scheduledTaskName?: string;  // present for scheduled task outputs — used for Telegram framing
-    dmChatId?: number;           // If set, send to this private chat ID instead of forum thread
 }
 
 // ─── Cross-Zone Pending Approval ───

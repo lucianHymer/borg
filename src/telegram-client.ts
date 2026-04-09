@@ -280,8 +280,6 @@ interface PendingMessage {
     lastStatusLabel?: string;   // base label for change detection
     lastPreview?: string;       // last preview text shown
     lastEditTs?: number;        // last Telegram edit timestamp for throttling
-    isDm?: boolean;             // true if this message came from a DM
-    dmChatId?: number;          // Telegram chat ID for DM responses
 }
 
 const pendingMessages = new Map<string, PendingMessage>();
@@ -567,7 +565,7 @@ async function sendInThread(
 
 /** Resolve the Telegram message_thread_id for a pending message */
 function getThreadOpt(pending: PendingMessage): number | undefined {
-    if (pending.isDm) return undefined; // DMs don't have forum topics
+    if (dmChatIds.has(pending.threadId)) return undefined; // DMs don't have forum topics
     return pending.ctx?.msg?.message_thread_id
         ?? (pending.threadId !== 1 ? pending.threadId : undefined);
 }
@@ -603,7 +601,7 @@ for (const cmd of ["clear", "compact"] as const) {
     bot.command(cmd, async (ctx) => {
         if (!isAllowedChat(ctx, settings)) return;
         const threadId = resolveThreadId(ctx, settings);
-    if (!threadId) return;
+        if (!threadId) return;
         resetThread(threadId);
         await ctx.reply("Session reset. Recent message history will be available on next message.", {
             message_thread_id: getCtxThreadOpt(ctx),
@@ -875,12 +873,6 @@ function queueIncomingMessage(
     ctx: any,
     telegramMessageId: number,
 ): void {
-    const isDm = ctx.chat?.type === "private";
-    // For DMs, include the chat ID so queue-processor can propagate it to outgoing messages
-    if (isDm && ctx.chat?.id) {
-        queueData.dmChatId = ctx.chat.id;
-    }
-
     const incomingDir = resolveIncomingForThread(threadId);
     fs.mkdirSync(incomingDir, { recursive: true });
     const queueFile = path.join(incomingDir, `telegram_${messageId}.json`);
@@ -893,8 +885,6 @@ function queueIncomingMessage(
         chatId: ctx.chat.id,
         threadId,
         telegramMessageId,
-        isDm,
-        dmChatId: isDm ? ctx.chat.id : undefined,
     });
     telegramToQueueId.set(telegramMessageId, messageId);
 }
@@ -1114,9 +1104,9 @@ bot.on("message:text").filter(
 bot.on("message:voice").filter(
     (ctx) => ctx.from.id !== bot.botInfo.id,
     async (ctx) => {
-        const threadId = resolveThreadId(ctx, settings);
-    if (!threadId) return;
         if (!isAllowedChat(ctx, settings)) return;
+        const threadId = resolveThreadId(ctx, settings);
+        if (!threadId) return;
 
         const duration = ctx.msg.voice.duration;
 
@@ -1255,9 +1245,9 @@ function flushMediaGroup(groupId: string): void {
 bot.on("message:photo").filter(
     (ctx) => ctx.from.id !== bot.botInfo.id,
     async (ctx) => {
-        const threadId = resolveThreadId(ctx, settings);
-    if (!threadId) return;
         if (!isAllowedChat(ctx, settings)) return;
+        const threadId = resolveThreadId(ctx, settings);
+        if (!threadId) return;
 
         // Get the largest photo (last in array)
         const photo = ctx.msg.photo[ctx.msg.photo.length - 1];
@@ -1373,9 +1363,9 @@ bot.on("message:photo").filter(
 bot.on("message:document").filter(
     (ctx) => ctx.from.id !== bot.botInfo.id,
     async (ctx) => {
-        const threadId = resolveThreadId(ctx, settings);
-    if (!threadId) return;
         if (!isAllowedChat(ctx, settings)) return;
+        const threadId = resolveThreadId(ctx, settings);
+        if (!threadId) return;
 
         const doc = ctx.msg.document;
 
@@ -1726,15 +1716,16 @@ async function pollOutgoingQueue(): Promise<void> {
                             `No pending message found for messageId ${data.messageId}, sending to chat directly`,
                         );
 
-                        // Fallback: send to DM chat if dmChatId set, otherwise to forum thread
-                        const chatId = data.dmChatId ? String(data.dmChatId) : settings.telegram_chat_id;
+                        // Fallback: send to DM chat or forum thread
+                        const fallbackDmChat = dmChatIds.get(data.threadId);
+                        const chatId = fallbackDmChat ? String(fallbackDmChat) : settings.telegram_chat_id;
                         // Frame scheduled task output for human readability
                         const messageToSend = data.scheduledTaskName
                             ? `**Scheduled task "${data.scheduledTaskName}"**\n\n${data.message}`
                             : data.message;
                         const markdownV2Fallback = toTelegramMarkdownV2(messageToSend);
                         const chunks = splitMessage(markdownV2Fallback);
-                        const threadOpt = data.dmChatId ? {} : (data.threadId && data.threadId !== 1
+                        const threadOpt = fallbackDmChat ? {} : (data.threadId && data.threadId !== 1
                             ? { message_thread_id: data.threadId }
                             : {});
 
@@ -1801,11 +1792,11 @@ async function pollOutgoingQueue(): Promise<void> {
                             threadId: data.targetThreadId,
                             source: "response", // could be "response", "transcript", "summary"
                         });
-                        const targetDmChat = data.dmChatId || (data.targetThreadId && dmChatIds.get(data.targetThreadId)) || dmChatIds.get(data.threadId);
+                        const resolvedThreadId = data.targetThreadId || data.threadId;
+                        const targetDmChat = dmChatIds.get(resolvedThreadId);
                         const chatId = targetDmChat ? String(targetDmChat) : settings.telegram_chat_id;
-                        const threadId = data.targetThreadId || data.threadId;
-                        const threadOpt = targetDmChat ? {} : (threadId && threadId !== 1
-                            ? { message_thread_id: threadId }
+                        const threadOpt = targetDmChat ? {} : (resolvedThreadId && resolvedThreadId !== 1
+                            ? { message_thread_id: resolvedThreadId }
                             : {});
 
                         let messageText = data.message;
@@ -2122,11 +2113,11 @@ bot.on("message_reaction", async (ctx) => {
 // ─── On-Demand TTS via Inline Keyboard ───
 
 bot.on("callback_query:data", async (ctx) => {
+    if (!isAllowedChat(ctx, settings)) return;
     const data = ctx.callbackQuery.data;
 
     // ─── Keyboard Config Button (queue message from button press) ───
     if (data.startsWith("kb:")) {
-        if (!isAllowedChat(ctx, settings)) return;
         await ctx.answerCallbackQuery();
         const buttonAction = data.slice(3); // strip "kb:" prefix
         const threadId = resolveThreadId(ctx, settings);

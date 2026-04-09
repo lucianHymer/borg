@@ -84,7 +84,6 @@ const IncomingMessageSchema = z.object({
     imagePaths: z.array(z.string()).optional(),
     telegramMessageId: z.number().optional(),
     oneshotModel: z.string().optional(),
-    dmChatId: z.number().optional(),
 });
 
 const CommandMessageSchema = z.object({
@@ -1974,7 +1973,6 @@ async function processMessage(messageFile: string): Promise<void> {
         messageId,
         model: effectiveModel,
         ...(scheduledTaskName ? { scheduledTaskName } : {}),
-        ...(msg.dmChatId ? { dmChatId: msg.dmChatId } : {}),
     };
 
     const outFile = path.join(QUEUE_OUTGOING, `${messageId}.json`);
@@ -2163,7 +2161,7 @@ async function processQueue(): Promise<void> {
             }
 
             // Webhooks to threads with sessionTimeout use the regular session path, not one-shot
-            const isWebhookToSession = msg.source === "webhook" && loadThreads()[String(msg.threadId)]?.sessionTimeout;
+            const isWebhookToSession = msg.source === "webhook" && !!loadThreads()[String(msg.threadId)]?.sessionTimeout;
             const isOneShot = (msg.source === "heartbeat" || msg.source === "scheduled-task" || msg.source === "one-shot" || (msg.source === "webhook" && !isWebhookToSession));
 
             // Skip threads that are already processing a message (one-shots bypass this)
