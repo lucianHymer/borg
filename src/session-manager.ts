@@ -19,6 +19,7 @@ export interface ThreadConfig {
     team?: string;          // Team identifier (e.g., "auth-feature")
     role?: string;          // Agent role (e.g., "planner", "reviewer")
     mainThread?: boolean;   // Receives broadcast fan-outs (only long-lived threads)
+    heartbeat?: boolean;    // Receives periodic heartbeat checks (default: false)
     workflow?: string;      // Path to workflow skill file (e.g., ".claude/skills/workflows/dev-team.md")
     sessionTimeout?: number; // Minutes of inactivity before session auto-clears (overrides global setting)
     prompt?: string;         // Path to prompt file (relative to cwd) appended to system prompt
