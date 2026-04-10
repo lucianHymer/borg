@@ -99,7 +99,12 @@ function readNewBytes(filePath: string, state: TailState): string | null {
 
 const app = express();
 
-app.use(express.json());
+app.use(express.json({
+    verify: (req: express.Request & { rawBody?: Buffer }, _res, buf) => {
+        // Preserve raw body for webhook delivery proxy (HMAC signature verification)
+        req.rawBody = buf;
+    },
+}));
 
 // Serve static files
 app.use("/static", express.static(STATIC_DIR));
@@ -1724,6 +1729,24 @@ app.post("/api/webhooks/create", proxyToInfra("POST", () => "/api/webhooks/creat
 app.put("/api/webhooks/:id/update", proxyToInfra("PUT", r => `/api/webhooks/${r.params.id}/update`, true));
 app.delete("/api/webhooks/:id/delete", proxyToInfra("DELETE", r => `/api/webhooks/${r.params.id}/delete`));
 app.post("/api/webhooks/:id/rotate", proxyToInfra("POST", r => `/api/webhooks/${r.params.id}/rotate`));
+
+// Webhook delivery proxy — forwards raw body + headers for HMAC verification
+app.post("/api/webhooks/:id", async (req: express.Request<{ id: string }> & { rawBody?: Buffer }, res) => {
+    try {
+        const headers: Record<string, string> = { "Content-Type": req.headers["content-type"] || "application/json" };
+        // Forward GitHub-specific headers needed by infra's webhook server
+        for (const h of ["x-hub-signature-256", "x-hub-signature", "x-github-event", "x-github-delivery"]) {
+            if (req.headers[h]) headers[h] = req.headers[h] as string;
+        }
+        const response = await fetch(`http://infra:3001/api/webhooks/${req.params.id}`, {
+            method: "POST",
+            headers,
+            body: req.rawBody || JSON.stringify(req.body),
+        });
+        const data = await response.json();
+        res.status(response.status).json(data);
+    } catch { res.status(502).json({ error: "Infra unreachable" }); }
+});
 
 app.get("/api/webhooks/deliveries", (_req, res) => {
     const deliveryFile = path.join(BORG_INFRA_DIR, "webhook-deliveries.jsonl");
