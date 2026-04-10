@@ -6,6 +6,7 @@
 
 import fs from "fs";
 import { z } from "zod/v4";
+import { writeJsonFileSafe } from "./types.js";
 
 // ─── Schema ───
 
@@ -130,12 +131,10 @@ export function removeThreadFromZones(config: ZoneConfig, threadId: number): Zon
 }
 
 /**
- * Save zone-config.json atomically (tmp + rename).
+ * Save zone-config.json (bind-mounted single file — must preserve inode).
  */
 export function saveZoneConfig(configPath: string, config: ZoneConfig): void {
-    // Write directly instead of tmp+rename — zone-config.json is bind-mounted as a
-    // single file in Docker, and rename() replaces the inode which causes EBUSY.
-    fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");
+    writeJsonFileSafe(configPath, config);
     // Invalidate cache so next load picks up the new file
     cachedConfig = null;
     cachedMtime = 0;

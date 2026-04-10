@@ -20,14 +20,14 @@ import {
 import type { ThreadConfig, ThreadsMap, Settings } from "./session-manager.js";
 import { resolveSecurePath } from "./session-manager.js";
 import type { OutgoingMessage, TaskListMapping, MessageModelEntry, PendingApproval } from "./types.js";
-import { toErrorMessage, TASK_LISTS_FILENAME } from "./types.js";
+import { toErrorMessage, TASK_LISTS_FILENAME, writeJsonFileSafe } from "./types.js";
 import { RoutingMetadataSchema } from "./types.js";
 import { logDecision, logCorrection, ROUTING_LOG } from "./routing-logger.js";
 import { cleanupAudioFile, startPeriodicCleanup, ensureModels, distillForSpeech, synthesize, isAvailable, transcribe } from "./audio.js";
 import { storeVoiceTranscript } from "./voice-cache.js";
 import { startPeriodicCleanup as startImageCleanup } from "./images.js";
 import { toTelegramMarkdownV2, escapeMarkdownV2 } from "./markdown-v2.js";
-import { loadZoneConfig, getThreadZone, isSameZone } from "./zone-config.js";
+import { loadZoneConfig, getThreadZone, isSameZone, addThreadToZone, saveZoneConfig } from "./zone-config.js";
 import { startWebhookServer, stopWebhookServer } from "./webhook-server.js";
 import { generateAuthCode } from "./auth.js";
 
@@ -324,17 +324,32 @@ const dmChatIds = new Map<number, number>(); // threadId → Telegram chat ID
 }
 
 /**
- * Check if a message context is from an allowed source (forum chat or whitelisted DM user).
- * Returns true if the message should be processed.
+ * Check if a message context is from an allowed source (forum chat or authorized DM user).
+ * DM authorization: user must be a member of the forum chat (checked via getChatMember API).
  */
-function isAllowedChat(ctx: Context, settings: Settings): boolean {
+// Cache of authorized DM user IDs (verified forum members) — avoids repeated API calls
+const authorizedDmUsers = new Set<string>();
+
+async function isAllowedChat(ctx: Context, settings: Settings): Promise<boolean> {
     if (!ctx.chat) return false;
     // Forum chat (existing behavior)
     if (String(ctx.chat.id) === settings.telegram_chat_id) return true;
-    // DM from whitelisted user
+    // DM: check if user is a forum group member
     if (ctx.chat.type === "private" && ctx.from) {
         const userId = String(ctx.from.id);
-        return !!settings.dm_allowed_user_ids?.includes(userId);
+        // Check cache first
+        if (authorizedDmUsers.has(userId)) return true;
+        // Check forum group membership via Telegram API
+        try {
+            const member = await ctx.api.getChatMember(settings.telegram_chat_id, ctx.from.id);
+            if (["member", "administrator", "creator"].includes(member.status)) {
+                authorizedDmUsers.add(userId);
+                return true;
+            }
+        } catch (err) {
+            log("WARN", `getChatMember check failed for user ${userId}: ${toErrorMessage(err)}`);
+        }
+        return false;
     }
     return false;
 }
@@ -342,21 +357,88 @@ function isAllowedChat(ctx: Context, settings: Settings): boolean {
 /**
  * Resolve the Borg thread ID for a message context.
  * For forum messages: uses message_thread_id (or 1 for main topic).
- * For DM messages: looks up the user's configured thread ID from settings.
- * Returns undefined if the DM user has no configured thread.
+ * For DM messages: looks up or auto-registers the user's thread from settings.
+ * Auto-registration creates a new thread with dm_defaults and persists to settings.json + threads.json.
  */
 function resolveThreadId(ctx: Context, settings: Settings): number | undefined {
     if (!ctx.chat) return undefined;
     if (ctx.chat.type === "private" && ctx.from) {
         const userId = String(ctx.from.id);
         const dmConfig = settings.dm_threads?.[userId];
-        if (!dmConfig) return undefined;
-        // Cache the chat ID for outgoing message routing
-        dmChatIds.set(dmConfig.threadId, ctx.chat.id);
-        return dmConfig.threadId;
+        if (dmConfig) {
+            // Existing DM user — cache and return
+            dmChatIds.set(dmConfig.threadId, ctx.chat.id);
+            return dmConfig.threadId;
+        }
+        // Auto-register: generate a unique DM thread ID and persist
+        return autoRegisterDmThread(ctx, settings);
     }
     // Forum: use message_thread_id or default to 1
     return ctx.msg?.message_thread_id ?? 1;
+}
+
+/**
+ * Auto-register a new DM user: generate a thread ID, create thread config,
+ * update settings.json with dm_threads mapping, and cache the chat ID.
+ * Uses dm_defaults from settings for thread configuration.
+ * Thread IDs for DM threads use a high range (100000+) to avoid collision with Telegram forum topic IDs.
+ */
+function autoRegisterDmThread(ctx: Context, settings: Settings): number {
+    const userId = String(ctx.from!.id);
+    const userName = ctx.from!.first_name || `User ${userId}`;
+    const defaults = settings.dm_defaults ?? {};
+
+    // Generate a unique thread ID in the DM range (100000+)
+    const existingDmThreadIds = Object.values(settings.dm_threads ?? {}).map(d => d.threadId);
+    const existingThreads = loadThreads();
+    const allThreadIds = [
+        ...Object.keys(existingThreads).map(Number),
+        ...existingDmThreadIds,
+    ];
+    const maxId = allThreadIds.length > 0 ? Math.max(...allThreadIds) : 0;
+    const threadId = Math.max(maxId + 1, 100000);
+
+    // Register in threads.json
+    configureThread(threadId, {
+        name: `${userName} DM`,
+        cwd: defaults.cwd || (process.env.DEFAULT_CWD || process.cwd()),
+        model: defaults.model || "sonnet",
+        isMaster: false,
+        lastActive: Date.now(),
+        ...(defaults.sessionTimeout !== undefined ? { sessionTimeout: defaults.sessionTimeout } : { sessionTimeout: 20 }),
+        ...(defaults.prompt ? { prompt: defaults.prompt } : {}),
+        ...(defaults.keyboards ? { keyboards: defaults.keyboards } : {}),
+    });
+
+    // Update settings.json with the new dm_threads mapping
+    const currentSettings = loadSettings();
+    if (!currentSettings.dm_threads) currentSettings.dm_threads = {};
+    currentSettings.dm_threads[userId] = { threadId, name: userName };
+    try {
+        writeJsonFileSafe(SHARED_SETTINGS_FILE, currentSettings);
+    } catch (err) {
+        log("ERROR", `Failed to save DM thread settings for user ${userId}: ${toErrorMessage(err)}`);
+    }
+
+    // Update in-memory settings so subsequent calls in same tick see the new mapping
+    settings.dm_threads = currentSettings.dm_threads;
+
+    // Register in zone-config — DM threads go to the default zone
+    try {
+        const zoneConfig = loadZoneConfig(ZONE_CONFIG_PATH);
+        if (zoneConfig) {
+            const updated = structuredClone(zoneConfig);
+            const defaultZone = updated.defaults?.newThread || "perimeter";
+            addThreadToZone(updated, threadId, defaultZone as "core" | "perimeter");
+            saveZoneConfig(ZONE_CONFIG_PATH, updated);
+        }
+    } catch { /* zone config may not exist — non-fatal */ }
+
+    // Cache chat ID for outgoing routing
+    dmChatIds.set(threadId, ctx.chat!.id);
+
+    log("INFO", `Auto-registered DM thread ${threadId} for ${userName} (user ${userId})`);
+    return threadId;
 }
 
 /**
@@ -607,7 +689,7 @@ bot.on("message:forum_topic_edited", (ctx) => {
 // Currently an alias for /clear — may add summarization in the future.
 for (const cmd of ["clear", "compact"] as const) {
     bot.command(cmd, async (ctx) => {
-        if (!isAllowedChat(ctx, settings)) return;
+        if (!(await isAllowedChat(ctx, settings))) return;
         const threadId = resolveThreadId(ctx, settings);
         if (!threadId) return;
         resetThread(threadId);
@@ -619,7 +701,7 @@ for (const cmd of ["clear", "compact"] as const) {
 }
 
 bot.command("setdir", async (ctx) => {
-    if (!isAllowedChat(ctx, settings)) return;
+    if (!(await isAllowedChat(ctx, settings))) return;
     const threadId = resolveThreadId(ctx, settings);
     if (!threadId) return;
     const dir = ctx.match?.trim();
@@ -645,7 +727,7 @@ const VALID_MODEL_ARGS: Record<string, string> = {
     opus: "opus[1m]",
 };
 bot.command("model", async (ctx) => {
-    if (!isAllowedChat(ctx, settings)) return;
+    if (!(await isAllowedChat(ctx, settings))) return;
     const threadId = resolveThreadId(ctx, settings);
     if (!threadId) return;
     const arg = ctx.match?.trim().toLowerCase();
@@ -671,7 +753,7 @@ bot.command("model", async (ctx) => {
 
 // /do <haiku|sonnet|opus> <message> — one-shot query, no session context
 bot.command("do", async (ctx) => {
-    if (!isAllowedChat(ctx, settings)) return;
+    if (!(await isAllowedChat(ctx, settings))) return;
     const threadId = resolveThreadId(ctx, settings);
     if (!threadId) return;
     const args = ctx.match?.trim();
@@ -740,13 +822,13 @@ bot.command("do", async (ctx) => {
 // Writes to shared settings.json at project root - accessible by all zone containers
 for (const cmd of ["budget_on", "budget_off"] as const) {
     bot.command(cmd, async (ctx) => {
-        if (!isAllowedChat(ctx, settings)) return;
+        if (!(await isAllowedChat(ctx, settings))) return;
         const isOn = cmd === "budget_on";
         const currentSettings = loadSettings();
         currentSettings.budgetMode = isOn;
         // Write to shared settings.json at project root (accessible by all zones)
         try {
-            fs.writeFileSync(SHARED_SETTINGS_FILE, JSON.stringify(currentSettings, null, 2));
+            writeJsonFileSafe(SHARED_SETTINGS_FILE, currentSettings);
         } catch (err) {
             log("ERROR", `Failed to write shared settings.json: ${toErrorMessage(err)}`);
             await ctx.reply(`❌ Failed to save budget mode setting: ${toErrorMessage(err)}`, {
@@ -764,7 +846,7 @@ for (const cmd of ["budget_on", "budget_off"] as const) {
 // /compact_team resets all team sessions; an alias for /clear_team.
 for (const cmd of ["clear_team", "compact_team"] as const) {
     bot.command(cmd, async (ctx) => {
-        if (!isAllowedChat(ctx, settings)) return;
+        if (!(await isAllowedChat(ctx, settings))) return;
         const threadId = resolveThreadId(ctx, settings);
         if (!threadId) return;
         const threads = loadThreads();
@@ -796,7 +878,7 @@ for (const cmd of ["clear_team", "compact_team"] as const) {
 
 // /clear_all resets all thread sessions.
 bot.command("clear_all", async (ctx) => {
-    if (!isAllowedChat(ctx, settings)) return;
+    if (!(await isAllowedChat(ctx, settings))) return;
     const invokerThreadId = resolveThreadId(ctx, settings) ?? 1;
     const threads = loadThreads();
     const allThreadIds = Object.keys(threads).map(Number);
@@ -816,7 +898,7 @@ bot.command("clear_all", async (ctx) => {
 });
 
 bot.command("status", async (ctx) => {
-    if (!isAllowedChat(ctx, settings)) return;
+    if (!(await isAllowedChat(ctx, settings))) return;
     const threads = loadThreads();
     const lines: string[] = ["Active threads:"];
 
@@ -901,7 +983,7 @@ function queueIncomingMessage(
 // Reply to any message with /retry to reprocess it (voice: re-download + STT, photo: re-download, text: re-queue)
 
 bot.command("retry", async (ctx) => {
-    if (!isAllowedChat(ctx, settings)) return;
+    if (!(await isAllowedChat(ctx, settings))) return;
     const threadId = resolveThreadId(ctx, settings);
     if (!threadId) return;
 
@@ -977,7 +1059,7 @@ bot.command("retry", async (ctx) => {
 });
 
 bot.command("authcode", async (ctx) => {
-    if (!isAllowedChat(ctx, settings)) return;
+    if (!(await isAllowedChat(ctx, settings))) return;
     if (!ctx.from) return;
     const code = generateAuthCode(ctx.from.id, ctx.from.first_name);
     await ctx.reply(`Your auth code: \`${code}\`\nExpires in 10 minutes\\.`, {
@@ -1007,12 +1089,12 @@ async function reactAcknowledge(chatId: number, telegramMsgId: number, threadId:
 bot.on("message:text").filter(
     (ctx) => ctx.from.id !== bot.botInfo.id,
     async (ctx) => {
+        // Auth check MUST come before resolveThreadId — resolveThreadId auto-registers DM users
+        if (!(await isAllowedChat(ctx, settings))) return;
+
         const threadId = resolveThreadId(ctx, settings);
         if (!threadId) return;
         const { isReplyToBot, replyToModel, replyToText } = extractReplyContext(ctx);
-
-        // Restrict to configured chat ID
-        if (!isAllowedChat(ctx, settings)) return;
 
         // Show welcome keyboard for DM threads on first interaction (or after session reset)
         // Check if session was cleared (timeout or /clear) — re-show welcome
@@ -1122,7 +1204,7 @@ bot.on("message:text").filter(
 bot.on("message:voice").filter(
     (ctx) => ctx.from.id !== bot.botInfo.id,
     async (ctx) => {
-        if (!isAllowedChat(ctx, settings)) return;
+        if (!(await isAllowedChat(ctx, settings))) return;
         const threadId = resolveThreadId(ctx, settings);
         if (!threadId) return;
 
@@ -1263,7 +1345,7 @@ function flushMediaGroup(groupId: string): void {
 bot.on("message:photo").filter(
     (ctx) => ctx.from.id !== bot.botInfo.id,
     async (ctx) => {
-        if (!isAllowedChat(ctx, settings)) return;
+        if (!(await isAllowedChat(ctx, settings))) return;
         const threadId = resolveThreadId(ctx, settings);
         if (!threadId) return;
 
@@ -1381,7 +1463,7 @@ bot.on("message:photo").filter(
 bot.on("message:document").filter(
     (ctx) => ctx.from.id !== bot.botInfo.id,
     async (ctx) => {
-        if (!isAllowedChat(ctx, settings)) return;
+        if (!(await isAllowedChat(ctx, settings))) return;
         const threadId = resolveThreadId(ctx, settings);
         if (!threadId) return;
 
@@ -2085,7 +2167,7 @@ async function sendTypingForPending(): Promise<void> {
 
 bot.on("message_reaction", async (ctx) => {
     // Filter: correct chat
-    if (!isAllowedChat(ctx, settings)) return;
+    if (!(await isAllowedChat(ctx, settings))) return;
 
     // Note: bot self-reactions do NOT trigger this handler (Telegram API guarantee)
 
@@ -2131,7 +2213,7 @@ bot.on("message_reaction", async (ctx) => {
 // ─── On-Demand TTS via Inline Keyboard ───
 
 bot.on("callback_query:data", async (ctx) => {
-    if (!isAllowedChat(ctx, settings)) return;
+    if (!(await isAllowedChat(ctx, settings))) return;
     const data = ctx.callbackQuery.data;
 
     // ─── Keyboard Config Button (queue message from button press) ───

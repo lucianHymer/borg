@@ -5,6 +5,7 @@
 
 import fs from "fs";
 import path from "path";
+import { writeJsonFileSafe } from "./types.js";
 
 // ─── Types ───
 
@@ -55,8 +56,14 @@ export interface Settings {
     dashboard_url?: string;      // Public base URL for dashboard (e.g. https://borg.example.com)
     cost_alert_threshold?: number; // USD threshold per query — alert in thread when exceeded (default: 5)
     webhook_secret?: string;         // Bearer token for POST /api/incoming webhook endpoint
-    dm_allowed_user_ids?: string[];       // Telegram user IDs allowed to DM the bot
     dm_threads?: Record<string, { threadId: number; name: string }>; // Telegram user ID → thread config for DMs
+    dm_defaults?: {                      // Defaults for auto-registered DM threads
+        cwd?: string;                    // Working directory (default: DEFAULT_CWD)
+        model?: string;                  // Model (default: "sonnet")
+        sessionTimeout?: number;         // Minutes of inactivity before session auto-clears (default: 20)
+        prompt?: string;                 // Path to prompt file (relative to cwd)
+        keyboards?: string;             // Path to keyboard config JSON (relative to cwd)
+    };
 }
 
 // ─── Constants ───
@@ -182,13 +189,7 @@ export function loadThreads(): ThreadsMap {
 }
 
 export function saveThreads(threads: ThreadsMap): void {
-    const dir = path.dirname(THREADS_FILE);
-    if (!fs.existsSync(dir)) {
-        fs.mkdirSync(dir, { recursive: true });
-    }
-    // Write directly — threads.json is a Docker bind-mounted file,
-    // so atomic tmp+rename fails with EBUSY on the mount point.
-    fs.writeFileSync(THREADS_FILE, JSON.stringify(threads, null, 2));
+    writeJsonFileSafe(THREADS_FILE, threads);
     threadsCache = threads;
     threadsMtime = fs.statSync(THREADS_FILE).mtimeMs;
 }
@@ -213,7 +214,7 @@ export function updateThread(threadId: number, updates: Partial<ThreadConfig>): 
     ) as Partial<ThreadConfig>;
     Object.assign(threads[key], filtered);
 
-    fs.writeFileSync(THREADS_FILE, JSON.stringify(threads, null, 2));
+    writeJsonFileSafe(THREADS_FILE, threads);
     threadsCache = threads;
     threadsMtime = fs.statSync(THREADS_FILE).mtimeMs;
 }
@@ -234,7 +235,7 @@ export function deleteThreadField(threadId: number, field: keyof ThreadConfig): 
 
     delete threads[key][field];
 
-    fs.writeFileSync(THREADS_FILE, JSON.stringify(threads, null, 2));
+    writeJsonFileSafe(THREADS_FILE, threads);
     threadsCache = threads;
     threadsMtime = fs.statSync(THREADS_FILE).mtimeMs;
 }

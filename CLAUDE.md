@@ -35,6 +35,14 @@ Unified auth system: Telegram `/authcode` generates a 6-digit code → user ente
 
 These are deliberate security boundaries, not missing features.
 
+## DM (Direct Message) Support
+
+Users can DM the bot directly instead of posting in forum topics. Authorization is automatic: on first DM, the bot checks if the user is a member of the configured forum group via `getChatMember` API. If they are, a DM thread is auto-registered with defaults from `dm_defaults` in settings.json. No manual allowlist management needed — forum group membership IS the trust boundary.
+
+**Auto-registration flow:** DM received → `isAllowedChat` verifies group membership (cached) → `resolveThreadId` calls `autoRegisterDmThread` → generates thread ID (100000+ range), creates thread in `threads.json`, maps user in `settings.json` `dm_threads`, registers in zone-config → message processed normally.
+
+**Settings:** `dm_defaults` in settings.json controls cwd, model, sessionTimeout, prompt, keyboards for auto-registered threads.
+
 ## Key Files
 
 - `.borg/threads.json` — thread configurations (threadId → session mapping)
