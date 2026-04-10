@@ -443,6 +443,27 @@ app.post("/api/webhooks/:id", (req: express.Request<{ id: string }> & { rawBody?
                 message: formatted,
             });
             messageId = result.messageId;
+
+            // Send processing status to Telegram thread (fire-and-forget)
+            const settings = readSettings();
+            const botToken = settings.telegram_bot_token as string | undefined;
+            const chatId = settings.telegram_chat_id as number | undefined;
+            if (botToken && chatId) {
+                const payload = req.body as { action?: string; issue?: { number?: number; title?: string }; pull_request?: { number?: number; title?: string } };
+                const entity = payload.pull_request || payload.issue;
+                const kind = payload.pull_request ? "PR" : "Issue";
+                const label = entity ? `${kind} #${entity.number}: ${entity.title}` : githubEvent || "event";
+                const action = payload.action ? ` (${payload.action})` : "";
+                fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        chat_id: chatId,
+                        message_thread_id: config.threadId,
+                        text: `⏳ Processing ${label}${action}...`,
+                    }),
+                }).catch(() => {}); // best-effort
+            }
         } catch (err) {
             res.status(500).json({ error: toErrorMessage(err) });
             return;
