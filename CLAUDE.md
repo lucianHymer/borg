@@ -41,7 +41,7 @@ Users can DM the bot directly instead of posting in forum topics. Authorization 
 
 **Auto-registration flow:** DM received → `isAllowedChat` verifies group membership (cached) → `resolveThreadId` calls `autoRegisterDmThread` → generates thread ID (100000+ range), creates thread in `threads.json`, maps user in `settings.json` `dm_threads`, registers in zone-config → message processed normally.
 
-**Settings:** `dm_defaults` in settings.json controls cwd, model, sessionTimeout, prompt, keyboards for auto-registered threads. `dm_allowed_user_ids` still works as a legacy allowlist bypass.
+**Settings:** `dm_defaults` in settings.json controls cwd, model, sessionTimeout, prompt, keyboards for auto-registered threads.
 
 ## Key Files
 

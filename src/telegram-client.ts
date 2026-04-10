@@ -326,7 +326,6 @@ const dmChatIds = new Map<number, number>(); // threadId → Telegram chat ID
 /**
  * Check if a message context is from an allowed source (forum chat or authorized DM user).
  * DM authorization: user must be a member of the forum chat (checked via getChatMember API).
- * Falls back to dm_allowed_user_ids allowlist if getChatMember fails.
  */
 // Cache of authorized DM user IDs (verified forum members) — avoids repeated API calls
 const authorizedDmUsers = new Set<string>();
@@ -340,11 +339,6 @@ async function isAllowedChat(ctx: Context, settings: Settings): Promise<boolean>
         const userId = String(ctx.from.id);
         // Check cache first
         if (authorizedDmUsers.has(userId)) return true;
-        // Legacy allowlist
-        if (settings.dm_allowed_user_ids?.includes(userId)) {
-            authorizedDmUsers.add(userId);
-            return true;
-        }
         // Check forum group membership via Telegram API
         try {
             const member = await ctx.api.getChatMember(settings.telegram_chat_id, ctx.from.id);
