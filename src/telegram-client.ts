@@ -464,10 +464,7 @@ interface KeyboardButton {
 }
 
 interface KeyboardConfig {
-    welcome?: {
-        text?: string;
-        buttons: KeyboardButton[][];
-    };
+    buttons: KeyboardButton[][];
 }
 
 /**
@@ -495,22 +492,6 @@ function loadKeyboardConfig(config: ThreadConfig): KeyboardConfig | null {
     }
 }
 
-/**
- * Build an InlineKeyboard from a keyboard config button layout.
- */
-function buildConfigKeyboard(buttons: KeyboardButton[][]): InlineKeyboard {
-    const kb = new InlineKeyboard();
-    for (const row of buttons) {
-        for (const btn of row) {
-            kb.text(btn.label, btn.data);
-        }
-        kb.row();
-    }
-    return kb;
-}
-
-// Track which threads have had their welcome keyboard shown (reset on session clear)
-const welcomeKeyboardShown = new Set<number>();
 
 // ─── Message Splitting ───
 
@@ -540,7 +521,7 @@ function splitMessage(text: string, maxLength = 4096): string[] {
 
 // ─── Reply Keyboard Builder ───
 
-function buildReplyKeyboard(botMessageId: number, replyToMessageId?: number, replyToVoice?: boolean, queueMessageId?: string): InlineKeyboard {
+function buildReplyKeyboard(botMessageId: number, replyToMessageId?: number, replyToVoice?: boolean, queueMessageId?: string, threadId?: number): InlineKeyboard {
     const keyboard = new InlineKeyboard();
 
     // Add voice transcript buttons if replying to a voice message
@@ -556,6 +537,23 @@ function buildReplyKeyboard(botMessageId: number, replyToMessageId?: number, rep
     if (settings.dashboard_url && queueMessageId) {
         const url = `${settings.dashboard_url.replace(/\/$/, '')}/response/${queueMessageId}`;
         keyboard.url("📊 Dashboard", url);
+    }
+
+    // Append thread-specific keyboard config buttons
+    if (threadId) {
+        const threads = loadThreads();
+        const threadConfig = threads[String(threadId)];
+        if (threadConfig) {
+            const kbConfig = loadKeyboardConfig(threadConfig);
+            if (kbConfig?.buttons) {
+                for (const row of kbConfig.buttons) {
+                    keyboard.row();
+                    for (const btn of row) {
+                        keyboard.text(btn.label, btn.data);
+                    }
+                }
+            }
+        }
     }
 
     return keyboard;
@@ -1095,28 +1093,6 @@ bot.on("message:text").filter(
         const threadId = resolveThreadId(ctx, settings);
         if (!threadId) return;
         const { isReplyToBot, replyToModel, replyToText } = extractReplyContext(ctx);
-
-        // Show welcome keyboard for DM threads on first interaction (or after session reset)
-        // Check if session was cleared (timeout or /clear) — re-show welcome
-        const threads0 = loadThreads();
-        if (!threads0[String(threadId)]?.sessionId && welcomeKeyboardShown.has(threadId)) {
-            welcomeKeyboardShown.delete(threadId);
-        }
-        if (isDmChat(ctx) && !welcomeKeyboardShown.has(threadId)) {
-            const threads = loadThreads();
-            const threadConfig = threads[String(threadId)];
-            if (threadConfig) {
-                const kbConfig = loadKeyboardConfig(threadConfig);
-                if (kbConfig?.welcome?.buttons) {
-                    const keyboard = buildConfigKeyboard(kbConfig.welcome.buttons);
-                    const welcomeText = kbConfig.welcome.text || "How can I help?";
-                    try {
-                        await ctx.reply(welcomeText, { reply_markup: keyboard });
-                    } catch { /* best effort */ }
-                }
-            }
-            welcomeKeyboardShown.add(threadId);
-        }
 
         // Deduplicate: skip if same sender + thread + text within window
         if (isDuplicate(threadId, String(ctx.from.id), ctx.message.text)) {
@@ -1797,7 +1773,7 @@ async function pollOutgoingQueue(): Promise<void> {
                         // Add buttons to the first response message (user-facing only)
                         if (firstSentId) {
                             try {
-                                const keyboard = buildReplyKeyboard(firstSentId, data.replyToMessageId, data.replyToVoice, data.messageId);
+                                const keyboard = buildReplyKeyboard(firstSentId, data.replyToMessageId, data.replyToVoice, data.messageId, data.threadId);
                                 await bot.api.editMessageReplyMarkup(pending.chatId, firstSentId, {
                                     reply_markup: keyboard,
                                 });
@@ -1852,7 +1828,7 @@ async function pollOutgoingQueue(): Promise<void> {
 
                         if (firstSentId && !isSilent) {
                             try {
-                                const keyboard = buildReplyKeyboard(firstSentId, data.replyToMessageId, data.replyToVoice, data.messageId);
+                                const keyboard = buildReplyKeyboard(firstSentId, data.replyToMessageId, data.replyToVoice, data.messageId, data.threadId);
                                 await bot.api.editMessageReplyMarkup(chatId, firstSentId, {
                                     reply_markup: keyboard,
                                 });
@@ -2229,8 +2205,8 @@ bot.on("callback_query:data", async (ctx) => {
 
         // Find the button label to use as the message text
         let buttonLabel = buttonAction;
-        if (kbConfig?.welcome?.buttons) {
-            for (const row of kbConfig.welcome.buttons) {
+        if (kbConfig?.buttons) {
+            for (const row of kbConfig.buttons) {
                 for (const btn of row) {
                     if (btn.data === data) {
                         buttonLabel = btn.label;
@@ -2244,6 +2220,12 @@ bot.on("callback_query:data", async (ctx) => {
         const chatId = ctx.callbackQuery.message?.chat.id;
         if (!chatId) return;
         const telegramMessageId = ctx.callbackQuery.message?.message_id ?? 0;
+
+        // Send immediate ack so user knows the button registered
+        const threadOpt = dmChatIds.has(threadId) ? {} : (threadId !== 1 ? { message_thread_id: threadId } : {});
+        try {
+            await bot.api.sendMessage(chatId, `⏳ ${buttonLabel}...`, { ...threadOpt, disable_notification: true });
+        } catch { /* best effort */ }
 
         queueIncomingMessage({
             channel: "telegram", source: "user", threadId,
