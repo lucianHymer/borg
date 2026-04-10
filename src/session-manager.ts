@@ -611,8 +611,8 @@ function buildMcpToolsBlock(isMaster: boolean): string {
         "- `delete_scheduled_task` — Delete a task by ID",
         "",
         "Team management tools:",
-        "- `create_thread` — Create a new Telegram forum topic and register it as a Borg thread (with optional team/role)",
-        "- `configure_thread` — Update team metadata (team, role) for an existing thread",
+        "- `create_thread` — Create a new Telegram forum topic and register it as a Borg thread (with optional team/role, sessionTimeout, prompt, keyboards)",
+        "- `configure_thread` — Update thread config (team, role, sessionTimeout, prompt, keyboards) for an existing thread",
         "- `disband_team` — Remove team association from all threads in a team",
     ];
     if (isMaster) {
@@ -707,12 +707,19 @@ Your runtime context:
 
 // ─── System Prompts ───
 
+/** Resolve a relative path under cwd, returning null if it escapes cwd (path traversal protection). */
+export function resolveSecurePath(cwd: string, relativePath: string): string | null {
+    const resolved = path.resolve(cwd, relativePath);
+    const base = path.resolve(cwd);
+    if (!resolved.startsWith(base + path.sep) && resolved !== base) return null;
+    return resolved;
+}
+
 function loadCustomPrompt(config: ThreadConfig): string {
     if (!config.prompt) return "";
-    const resolved = path.resolve(config.cwd, config.prompt);
-    // Path traversal protection: resolved path must be under cwd
-    if (!resolved.startsWith(path.resolve(config.cwd) + path.sep) && resolved !== path.resolve(config.cwd)) {
-        console.warn(`[session-manager] Custom prompt path escapes cwd: ${config.prompt} → ${resolved}`);
+    const resolved = resolveSecurePath(config.cwd, config.prompt);
+    if (!resolved) {
+        console.warn(`[session-manager] Custom prompt path escapes cwd: ${config.prompt}`);
         return "";
     }
     try {

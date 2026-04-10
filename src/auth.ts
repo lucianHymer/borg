@@ -19,7 +19,6 @@ export interface TokenInfo {
     telegramUserId: number;
     userName: string;
     orgs: string[];
-    scopes: string[];
     createdAt: number;
     expiresAt: number;
 }
@@ -127,21 +126,34 @@ export function stopAuthSweep(): void {
     }
 }
 
-// ─── Tokens (file-based) ───
+// ─── Tokens (file-based, mtime-cached) ───
+
+let cachedTokens: TokenInfo[] | null = null;
+let cachedTokensMtime: number = 0;
 
 function readTokens(): TokenInfo[] {
     try {
-        return JSON.parse(fs.readFileSync(TOKENS_FILE, "utf8"));
+        const stat = fs.statSync(TOKENS_FILE);
+        if (cachedTokens && stat.mtimeMs === cachedTokensMtime) return cachedTokens;
+        cachedTokens = JSON.parse(fs.readFileSync(TOKENS_FILE, "utf8"));
+        cachedTokensMtime = stat.mtimeMs;
+        return cachedTokens!;
     } catch {
         return [];
     }
 }
 
 function writeTokens(tokens: TokenInfo[]): void {
+    // Prune expired tokens before writing
+    const now = Date.now();
+    const active = tokens.filter(t => now <= t.expiresAt);
     fs.mkdirSync(path.dirname(TOKENS_FILE), { recursive: true });
     const tmpFile = TOKENS_FILE + ".tmp";
-    fs.writeFileSync(tmpFile, JSON.stringify(tokens, null, 2));
+    fs.writeFileSync(tmpFile, JSON.stringify(active, null, 2), { mode: 0o600 });
     fs.renameSync(tmpFile, TOKENS_FILE);
+    // Invalidate cache
+    cachedTokens = null;
+    cachedTokensMtime = 0;
 }
 
 function readGitHubInstallations(): Record<string, string> {
@@ -152,7 +164,7 @@ function readGitHubInstallations(): Record<string, string> {
     }
 }
 
-export async function createToken(telegramUserId: number, userName: string): Promise<TokenInfo> {
+export function createToken(telegramUserId: number, userName: string): TokenInfo {
     const installations = readGitHubInstallations();
     const orgs = Object.keys(installations);
 
@@ -165,7 +177,6 @@ export async function createToken(telegramUserId: number, userName: string): Pro
         telegramUserId,
         userName,
         orgs,
-        scopes: [],
         createdAt: now,
         expiresAt: now + THIRTY_DAYS_MS,
     };
@@ -177,7 +188,7 @@ export async function createToken(telegramUserId: number, userName: string): Pro
     return tokenInfo;
 }
 
-export async function validateToken(token: string): Promise<TokenInfo | null> {
+export function validateToken(token: string): TokenInfo | null {
     const tokens = readTokens();
     const tokenBuf = Buffer.from(token);
     let entry: TokenInfo | undefined;
@@ -197,7 +208,7 @@ export async function getGitHubToken(
     borgToken: string,
     org?: string,
 ): Promise<{ token: string; expiresAt: number } | null> {
-    const tokenInfo = await validateToken(borgToken);
+    const tokenInfo = validateToken(borgToken);
     if (!tokenInfo) return null;
 
     const targetOrg = org || tokenInfo.orgs[0];

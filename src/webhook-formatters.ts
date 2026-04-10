@@ -4,60 +4,79 @@
 
 export type Formatter = (headers: Record<string, string>, body: unknown) => string | null;
 
+// ─── GitHub Event Interfaces ───
+
+interface GitHubEntity {
+    title?: string;
+    number?: number;
+    html_url?: string;
+    user?: { login?: string };
+    labels?: Array<{ name?: string }>;
+    body?: string;
+}
+
+interface GitHubCommit {
+    id?: string;
+    message?: string;
+    author?: { name?: string };
+}
+
+interface GitHubPayload {
+    action?: string;
+    repository?: { full_name?: string };
+    issue?: GitHubEntity;
+    pull_request?: GitHubEntity;
+    comment?: GitHubEntity & { user?: { login?: string } };
+    ref?: string;
+    commits?: GitHubCommit[];
+    compare?: string;
+}
+
+function formatEntity(type: string, entity: GitHubEntity, repo: string, action: string): string {
+    const title = entity.title || "";
+    const number = entity.number ?? 0;
+    const url = entity.html_url || "";
+    const author = entity.user?.login || "";
+    const labels = (entity.labels || []).map(l => l.name || "").filter(Boolean).join(", ");
+    const bodyText = (entity.body || "").slice(0, 500);
+    return `[GitHub] ${type} #${number} ${action}: ${title}\nRepo: ${repo}\nAuthor: ${author}${labels ? `\nLabels: ${labels}` : ""}${bodyText ? `\n${bodyText}` : ""}\n${url}`;
+}
+
 function formatGitHub(headers: Record<string, string>, body: unknown): string | null {
     const event = headers["x-github-event"];
-    const payload = body as Record<string, unknown>;
-    const action = (payload.action as string) || "";
-    const repo = (payload.repository as Record<string, unknown>)?.full_name as string || "unknown";
+    const payload = body as GitHubPayload;
+    const action = payload.action || "";
+    const repo = payload.repository?.full_name || "unknown";
 
-    if (event === "issues") {
-        const issue = payload.issue as Record<string, unknown>;
-        if (!issue) return null;
-        const title = issue.title as string || "";
-        const number = issue.number as number;
-        const url = issue.html_url as string || "";
-        const author = (issue.user as Record<string, unknown>)?.login as string || "";
-        const labels = ((issue.labels as Array<Record<string, unknown>>) || [])
-            .map(l => l.name as string).join(", ");
-        const bodyText = ((issue.body as string) || "").slice(0, 500);
-        return `[GitHub] Issue #${number} ${action}: ${title}\nRepo: ${repo}\nAuthor: ${author}${labels ? `\nLabels: ${labels}` : ""}\n${bodyText ? `\n${bodyText}` : ""}\n${url}`;
+    if (event === "issues" && payload.issue) {
+        return formatEntity("Issue", payload.issue, repo, action);
     }
 
-    if (event === "pull_request") {
-        const pr = payload.pull_request as Record<string, unknown>;
-        if (!pr) return null;
-        const title = pr.title as string || "";
-        const number = pr.number as number;
-        const url = pr.html_url as string || "";
-        const author = (pr.user as Record<string, unknown>)?.login as string || "";
-        const labels = ((pr.labels as Array<Record<string, unknown>>) || [])
-            .map(l => l.name as string).join(", ");
-        const bodyText = ((pr.body as string) || "").slice(0, 500);
-        return `[GitHub] PR #${number} ${action}: ${title}\nRepo: ${repo}\nAuthor: ${author}${labels ? `\nLabels: ${labels}` : ""}\n${bodyText ? `\n${bodyText}` : ""}\n${url}`;
+    if (event === "pull_request" && payload.pull_request) {
+        return formatEntity("PR", payload.pull_request, repo, action);
     }
 
     if (event === "issue_comment") {
-        const issue = payload.issue as Record<string, unknown>;
-        const comment = payload.comment as Record<string, unknown>;
+        const issue = payload.issue;
+        const comment = payload.comment;
         if (!issue || !comment) return null;
-        const title = issue.title as string || "";
-        const number = issue.number as number;
-        const url = comment.html_url as string || "";
-        const author = (comment.user as Record<string, unknown>)?.login as string || "";
-        const bodyText = ((comment.body as string) || "").slice(0, 500);
+        const title = issue.title || "";
+        const number = issue.number ?? 0;
+        const url = comment.html_url || "";
+        const author = comment.user?.login || "";
+        const bodyText = (comment.body || "").slice(0, 500);
         return `[GitHub] Comment on #${number} (${title})\nRepo: ${repo}\nAuthor: ${author}\n${bodyText}\n${url}`;
     }
 
     if (event === "push") {
-        const ref = (payload.ref as string) || "unknown";
-        const commits = (payload.commits as Array<Record<string, unknown>>) || [];
-        const compare = (payload.compare as string) || "";
+        const ref = payload.ref || "unknown";
+        const commits = payload.commits || [];
+        const compare = payload.compare || "";
         const lines: string[] = [`[GitHub] Push to ${ref} in ${repo}: ${commits.length} commit(s)`];
-        const shown = commits.slice(0, 5);
-        for (const c of shown) {
-            const sha = ((c.id as string) || "").slice(0, 7);
-            const message = ((c.message as string) || "").split("\n")[0];
-            const authorName = (c.author as Record<string, unknown>)?.name as string || "unknown";
+        for (const c of commits.slice(0, 5)) {
+            const sha = (c.id || "").slice(0, 7);
+            const message = (c.message || "").split("\n")[0];
+            const authorName = c.author?.name || "unknown";
             lines.push(`• ${sha} ${message} (${authorName})`);
         }
         if (commits.length > 5) {

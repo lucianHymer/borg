@@ -122,8 +122,17 @@ app.post("/auth/claim", async (req, res) => {
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(req.body),
         });
-        const data = await response.json();
-        res.status(response.status).json(data);
+        const data = await response.json() as Record<string, unknown>;
+        if (response.ok && typeof data.token === "string") {
+            // Set cookie server-side with HttpOnly + Secure + SameSite
+            const maxAge = 30 * 24 * 60 * 60; // 30 days
+            res.setHeader("Set-Cookie",
+                `borg_token=${data.token}; Path=/; Max-Age=${maxAge}; HttpOnly; Secure; SameSite=Strict`);
+            // Don't expose the raw token to JS — just confirm success
+            res.json({ ok: true, userName: data.userName });
+        } else {
+            res.status(response.status).json(data);
+        }
     } catch (err) {
         res.status(502).json({ error: "Auth service unreachable" });
     }
@@ -178,8 +187,11 @@ async function requireAuth(req: express.Request, res: express.Response, next: ex
         }
         next();
     } catch {
-        // If infra is unreachable, let requests through (graceful degradation during startup)
-        next();
+        // Fail closed — don't bypass auth when infra is unreachable
+        if (req.path.startsWith("/api/")) {
+            return res.status(503).json({ error: "Auth service unavailable" });
+        }
+        return res.status(503).send("Authentication service temporarily unavailable. Please retry.");
     }
 }
 
@@ -1683,67 +1695,35 @@ app.get("/api/response/:messageId/feed", (req, res) => {
 
 // ─── Webhook CRUD Proxy to Infra ───
 
-app.get("/api/webhooks/list", async (req, res) => {
-    try {
-        const response = await fetch("http://infra:3001/api/webhooks/list", {
-            headers: { Authorization: req.headers.authorization || "" },
-        });
-        const data = await response.json();
-        res.status(response.status).json(data);
-    } catch { res.status(502).json({ error: "Infra unreachable" }); }
-});
+/** Extract auth token from Authorization header or cookie, forward as Bearer */
+function getProxyAuth(req: express.Request): string {
+    if (req.headers.authorization) return req.headers.authorization;
+    const cookieToken = getCookieValue(req, "borg_token");
+    return cookieToken ? `Bearer ${cookieToken}` : "";
+}
 
-app.post("/api/webhooks/create", async (req, res) => {
-    try {
-        const response = await fetch("http://infra:3001/api/webhooks/create", {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-                Authorization: req.headers.authorization || "",
-            },
-            body: JSON.stringify(req.body),
-        });
-        const data = await response.json();
-        res.status(response.status).json(data);
-    } catch { res.status(502).json({ error: "Infra unreachable" }); }
-});
+function proxyToInfra(method: string, pathFn: (req: express.Request) => string, hasBody = false) {
+    return async (req: express.Request, res: express.Response) => {
+        try {
+            const response = await fetch(`http://infra:3001${pathFn(req)}`, {
+                method,
+                headers: {
+                    ...(hasBody ? { "Content-Type": "application/json" } : {}),
+                    Authorization: getProxyAuth(req),
+                },
+                ...(hasBody ? { body: JSON.stringify(req.body) } : {}),
+            });
+            const data = await response.json();
+            res.status(response.status).json(data);
+        } catch { res.status(502).json({ error: "Infra unreachable" }); }
+    };
+}
 
-app.put("/api/webhooks/:id/update", async (req, res) => {
-    try {
-        const response = await fetch(`http://infra:3001/api/webhooks/${req.params.id}/update`, {
-            method: "PUT",
-            headers: {
-                "Content-Type": "application/json",
-                Authorization: req.headers.authorization || "",
-            },
-            body: JSON.stringify(req.body),
-        });
-        const data = await response.json();
-        res.status(response.status).json(data);
-    } catch { res.status(502).json({ error: "Infra unreachable" }); }
-});
-
-app.delete("/api/webhooks/:id/delete", async (req, res) => {
-    try {
-        const response = await fetch(`http://infra:3001/api/webhooks/${req.params.id}/delete`, {
-            method: "DELETE",
-            headers: { Authorization: req.headers.authorization || "" },
-        });
-        const data = await response.json();
-        res.status(response.status).json(data);
-    } catch { res.status(502).json({ error: "Infra unreachable" }); }
-});
-
-app.post("/api/webhooks/:id/rotate", async (req, res) => {
-    try {
-        const response = await fetch(`http://infra:3001/api/webhooks/${req.params.id}/rotate`, {
-            method: "POST",
-            headers: { Authorization: req.headers.authorization || "" },
-        });
-        const data = await response.json();
-        res.status(response.status).json(data);
-    } catch { res.status(502).json({ error: "Infra unreachable" }); }
-});
+app.get("/api/webhooks/list", proxyToInfra("GET", () => "/api/webhooks/list"));
+app.post("/api/webhooks/create", proxyToInfra("POST", () => "/api/webhooks/create", true));
+app.put("/api/webhooks/:id/update", proxyToInfra("PUT", r => `/api/webhooks/${r.params.id}/update`, true));
+app.delete("/api/webhooks/:id/delete", proxyToInfra("DELETE", r => `/api/webhooks/${r.params.id}/delete`));
+app.post("/api/webhooks/:id/rotate", proxyToInfra("POST", r => `/api/webhooks/${r.params.id}/rotate`));
 
 app.get("/api/webhooks/deliveries", (_req, res) => {
     const deliveryFile = path.join(BORG_INFRA_DIR, "webhook-deliveries.jsonl");

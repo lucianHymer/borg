@@ -25,6 +25,16 @@ Container-level isolation. Agents are separated into **Core** (trusted) and **Pe
 - Per-zone storage: `.borg-core/`, `.borg-perimeter/`, `.borg-infra/`
 - Broadcast filtered to core-zone `mainThread` threads
 
+## Authentication & Dashboard
+
+Unified auth system: Telegram `/authcode` generates a 6-digit code → user enters on dashboard login page → server exchanges for a 30-day bearer token stored in `.borg/auth-tokens.json`. Dashboard cookie is HttpOnly + Secure + SameSite=Strict.
+
+**Intentional MCP gaps (human-only operations):**
+- `/authcode` — Not exposed as an MCP tool. Auth codes are identity-bound to the requesting Telegram user. Agents generating codes would bypass the human identity verification that the auth system is built on.
+- Webhook CRUD (create/list/update/delete/rotate) — HTTP API only, requires bearer token. Not exposed as MCP tools. Webhooks grant external systems the ability to trigger agent sessions; creating them should require explicit human authorization, not agent self-service.
+
+These are deliberate security boundaries, not missing features.
+
 ## Key Files
 
 - `.borg/threads.json` — thread configurations (threadId → session mapping)
@@ -32,6 +42,8 @@ Container-level isolation. Agents are separated into **Core** (trusted) and **Pe
 - `.borg/message-models.json` — Telegram messageId → model mapping
 - `.borg/scheduled-tasks.json` — durable cron-based scheduled tasks
 - `.borg/settings.json` — bot token, chat ID, timezone, intervals
+- `.borg/auth-tokens.json` — bearer tokens (file mode 0600, pruned on write)
+- `.borg/webhooks.json` — webhook configs (HMAC secrets, formatters, ntfy settings)
 - `zone-config.json` — thread-to-zone mapping (see Security Zones)
 - `HEARTBEAT.md` — living task list for heartbeat checks (per-repo)
 

@@ -74,9 +74,16 @@ function loadWebhooks(): WebhooksFile {
     }
 }
 
+let cachedSettings: Record<string, unknown> | null = null;
+let cachedSettingsMtime: number = 0;
+
 function readSettings(): Record<string, unknown> {
     try {
-        return JSON.parse(fs.readFileSync(SETTINGS_FILE, "utf8"));
+        const stat = fs.statSync(SETTINGS_FILE);
+        if (cachedSettings && stat.mtimeMs === cachedSettingsMtime) return cachedSettings;
+        cachedSettings = JSON.parse(fs.readFileSync(SETTINGS_FILE, "utf8"));
+        cachedSettingsMtime = stat.mtimeMs;
+        return cachedSettings!;
     } catch {
         return {};
     }
@@ -134,12 +141,12 @@ function debounceNtfy(topic: string, debounceMs: number, message: string): void 
         return; // timer already running
     }
 
-    const batch = { timer: null as any, messages: [message] };
-    batch.timer = setTimeout(async () => {
+    const messages = [message];
+    const timer = setTimeout(async () => {
         ntfyBatches.delete(topic);
-        const summary = batch.messages.length === 1
-            ? batch.messages[0]
-            : `${batch.messages.length} events:\n\n${batch.messages.join("\n\n---\n\n")}`;
+        const summary = messages.length === 1
+            ? messages[0]
+            : `${messages.length} events:\n\n${messages.join("\n\n---\n\n")}`;
         try {
             await fetch(`http://ntfy:80/${topic}`, {
                 method: "POST",
@@ -149,8 +156,8 @@ function debounceNtfy(topic: string, debounceMs: number, message: string): void 
             console.error("ntfy send failed:", err);
         }
     }, debounceMs);
-    batch.timer.unref(); // don't keep process alive
-    ntfyBatches.set(topic, batch);
+    timer.unref(); // don't keep process alive
+    ntfyBatches.set(topic, { timer, messages });
 }
 
 // ─── Express App ───
@@ -248,9 +255,27 @@ app.get("/api/webhooks/list", requireToken, (_req, res) => {
 });
 
 app.post("/api/webhooks/create", requireToken, (req, res) => {
+    const ALLOWED_HMAC_ALGORITHMS = ["sha256", "sha1", "sha512"];
+    const ALLOWED_FORMATTERS = Object.keys(formatters);
     const { name, signatureHeader, hmacAlgorithm, threadId, formatter, eventFilter, ntfy } = req.body || {};
     if (!name || typeof name !== "string") {
         res.status(400).json({ error: "name is required" });
+        return;
+    }
+    if (hmacAlgorithm && !ALLOWED_HMAC_ALGORITHMS.includes(hmacAlgorithm)) {
+        res.status(400).json({ error: `Invalid hmacAlgorithm. Allowed: ${ALLOWED_HMAC_ALGORITHMS.join(", ")}` });
+        return;
+    }
+    if (formatter && !ALLOWED_FORMATTERS.includes(formatter)) {
+        res.status(400).json({ error: `Invalid formatter. Allowed: ${ALLOWED_FORMATTERS.join(", ")}` });
+        return;
+    }
+    if (threadId != null && (typeof threadId !== "number" || !Number.isInteger(threadId) || threadId <= 0)) {
+        res.status(400).json({ error: "threadId must be a positive integer" });
+        return;
+    }
+    if (eventFilter && (!Array.isArray(eventFilter) || !eventFilter.every((e: unknown) => typeof e === "string"))) {
+        res.status(400).json({ error: "eventFilter must be an array of strings" });
         return;
     }
 
@@ -477,7 +502,7 @@ app.post("/auth/validate", async (req, res) => {
         return;
     }
 
-    res.json({ valid: true, userName: tokenInfo.userName, scopes: tokenInfo.scopes });
+    res.json({ valid: true, userName: tokenInfo.userName });
 });
 
 // ─── Start/Stop ───

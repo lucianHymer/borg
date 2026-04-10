@@ -18,6 +18,7 @@ import {
     SHARED_SETTINGS_FILE,
 } from "./session-manager.js";
 import type { ThreadConfig, ThreadsMap, Settings } from "./session-manager.js";
+import { resolveSecurePath } from "./session-manager.js";
 import type { OutgoingMessage, TaskListMapping, MessageModelEntry, PendingApproval } from "./types.js";
 import { toErrorMessage, TASK_LISTS_FILENAME } from "./types.js";
 import { RoutingMetadataSchema } from "./types.js";
@@ -389,18 +390,24 @@ interface KeyboardConfig {
 
 /**
  * Load keyboard config from a JSON file specified in ThreadConfig.keyboards.
- * Returns null if not configured or file missing.
+ * Mtime-cached to avoid re-reading on every message.
  */
+const keyboardCache = new Map<string, { mtime: number; config: KeyboardConfig }>();
+
 function loadKeyboardConfig(config: ThreadConfig): KeyboardConfig | null {
     if (!config.keyboards) return null;
-    const resolved = path.resolve(config.cwd, config.keyboards);
-    // Path traversal protection
-    if (!resolved.startsWith(path.resolve(config.cwd) + path.sep) && resolved !== path.resolve(config.cwd)) {
+    const resolved = resolveSecurePath(config.cwd, config.keyboards);
+    if (!resolved) {
         log("WARN", `Keyboard config path escapes cwd: ${config.keyboards}`);
         return null;
     }
     try {
-        return JSON.parse(fs.readFileSync(resolved, "utf8")) as KeyboardConfig;
+        const stat = fs.statSync(resolved);
+        const cached = keyboardCache.get(resolved);
+        if (cached && cached.mtime === stat.mtimeMs) return cached.config;
+        const parsed = JSON.parse(fs.readFileSync(resolved, "utf8")) as KeyboardConfig;
+        keyboardCache.set(resolved, { mtime: stat.mtimeMs, config: parsed });
+        return parsed;
     } catch {
         return null;
     }

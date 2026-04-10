@@ -2141,6 +2141,9 @@ async function processQueue(): Promise<void> {
             );
         }
 
+        // Load threads once per scan cycle (mtime-cached, but avoid per-file statSync)
+        const threadsSnapshot = loadThreads();
+
         for (const file of files) {
             if (activeCount >= maxConcurrent) break;
 
@@ -2161,7 +2164,7 @@ async function processQueue(): Promise<void> {
             }
 
             // Webhooks to threads with sessionTimeout use the regular session path, not one-shot
-            const isWebhookToSession = msg.source === "webhook" && !!loadThreads()[String(msg.threadId)]?.sessionTimeout;
+            const isWebhookToSession = msg.source === "webhook" && !!threadsSnapshot[String(msg.threadId)]?.sessionTimeout;
             const isOneShot = (msg.source === "heartbeat" || msg.source === "scheduled-task" || msg.source === "one-shot" || (msg.source === "webhook" && !isWebhookToSession));
 
             // Skip threads that are already processing a message (one-shots bypass this)

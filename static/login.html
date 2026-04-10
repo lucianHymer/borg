@@ -150,9 +150,7 @@ form.addEventListener('submit', async (e) => {
     });
 
     if (res.ok) {
-      const data = await res.json();
-      const maxAge = 30 * 24 * 60 * 60;
-      document.cookie = `borg_token=${data.token}; path=/; max-age=${maxAge}; SameSite=Strict`;
+      // Cookie set server-side via Set-Cookie header (HttpOnly, not accessible to JS)
       window.location.href = '/';
     } else if (res.status === 429) {
       showError('Too many attempts');
