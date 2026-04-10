@@ -2,6 +2,8 @@
  * Shared types and utilities used across Borg modules.
  */
 
+import fs from "fs";
+import path from "path";
 import { z } from "zod/v4";
 import type { MessageSource } from "./message-history.js";
 import type { Tier } from "./router/types.js";
@@ -116,6 +118,30 @@ export class ValidationError extends Error {
         super(message);
         this.name = "ValidationError";
     }
+}
+
+// ─── File Write Utilities ───
+
+/**
+ * Write JSON to a file that may be Docker bind-mounted as a single file.
+ *
+ * IMPORTANT: Docker bind-mounts track files by inode. The common "atomic write"
+ * pattern (write to .tmp, rename over original) replaces the inode, causing the
+ * container to lose the mount — the host file updates but the container still
+ * sees the old inode. This function writes directly to the file (preserving the
+ * inode) which is correct for bind-mounted files like settings.json, threads.json,
+ * and zone-config.json.
+ *
+ * For files inside directories (queue files, JSONL logs, audio files), use the
+ * atomic tmp+rename pattern instead — those are directory-mounted, not file-mounted,
+ * so inode replacement is safe.
+ */
+export function writeJsonFileSafe(filePath: string, data: unknown): void {
+    const dir = path.dirname(filePath);
+    if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+    }
+    fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
 }
 
 /**

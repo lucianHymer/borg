@@ -20,7 +20,7 @@ import {
 import type { ThreadConfig, ThreadsMap, Settings } from "./session-manager.js";
 import { resolveSecurePath } from "./session-manager.js";
 import type { OutgoingMessage, TaskListMapping, MessageModelEntry, PendingApproval } from "./types.js";
-import { toErrorMessage, TASK_LISTS_FILENAME } from "./types.js";
+import { toErrorMessage, TASK_LISTS_FILENAME, writeJsonFileSafe } from "./types.js";
 import { RoutingMetadataSchema } from "./types.js";
 import { logDecision, logCorrection, ROUTING_LOG } from "./routing-logger.js";
 import { cleanupAudioFile, startPeriodicCleanup, ensureModels, distillForSpeech, synthesize, isAvailable, transcribe } from "./audio.js";
@@ -415,7 +415,7 @@ function autoRegisterDmThread(ctx: Context, settings: Settings): number {
     if (!currentSettings.dm_threads) currentSettings.dm_threads = {};
     currentSettings.dm_threads[userId] = { threadId, name: userName };
     try {
-        fs.writeFileSync(SHARED_SETTINGS_FILE, JSON.stringify(currentSettings, null, 2));
+        writeJsonFileSafe(SHARED_SETTINGS_FILE, currentSettings);
     } catch (err) {
         log("ERROR", `Failed to save DM thread settings for user ${userId}: ${toErrorMessage(err)}`);
     }
@@ -828,7 +828,7 @@ for (const cmd of ["budget_on", "budget_off"] as const) {
         currentSettings.budgetMode = isOn;
         // Write to shared settings.json at project root (accessible by all zones)
         try {
-            fs.writeFileSync(SHARED_SETTINGS_FILE, JSON.stringify(currentSettings, null, 2));
+            writeJsonFileSafe(SHARED_SETTINGS_FILE, currentSettings);
         } catch (err) {
             log("ERROR", `Failed to write shared settings.json: ${toErrorMessage(err)}`);
             await ctx.reply(`❌ Failed to save budget mode setting: ${toErrorMessage(err)}`, {

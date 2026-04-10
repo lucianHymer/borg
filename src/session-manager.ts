@@ -5,6 +5,7 @@
 
 import fs from "fs";
 import path from "path";
+import { writeJsonFileSafe } from "./types.js";
 
 // ─── Types ───
 
@@ -188,13 +189,7 @@ export function loadThreads(): ThreadsMap {
 }
 
 export function saveThreads(threads: ThreadsMap): void {
-    const dir = path.dirname(THREADS_FILE);
-    if (!fs.existsSync(dir)) {
-        fs.mkdirSync(dir, { recursive: true });
-    }
-    // Write directly — threads.json is a Docker bind-mounted file,
-    // so atomic tmp+rename fails with EBUSY on the mount point.
-    fs.writeFileSync(THREADS_FILE, JSON.stringify(threads, null, 2));
+    writeJsonFileSafe(THREADS_FILE, threads);
     threadsCache = threads;
     threadsMtime = fs.statSync(THREADS_FILE).mtimeMs;
 }
@@ -219,7 +214,7 @@ export function updateThread(threadId: number, updates: Partial<ThreadConfig>): 
     ) as Partial<ThreadConfig>;
     Object.assign(threads[key], filtered);
 
-    fs.writeFileSync(THREADS_FILE, JSON.stringify(threads, null, 2));
+    writeJsonFileSafe(THREADS_FILE, threads);
     threadsCache = threads;
     threadsMtime = fs.statSync(THREADS_FILE).mtimeMs;
 }
@@ -240,7 +235,7 @@ export function deleteThreadField(threadId: number, field: keyof ThreadConfig): 
 
     delete threads[key][field];
 
-    fs.writeFileSync(THREADS_FILE, JSON.stringify(threads, null, 2));
+    writeJsonFileSafe(THREADS_FILE, threads);
     threadsCache = threads;
     threadsMtime = fs.statSync(THREADS_FILE).mtimeMs;
 }
