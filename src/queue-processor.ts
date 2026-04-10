@@ -1679,11 +1679,11 @@ async function processMessage(messageFile: string): Promise<void> {
             clearStatus(threadId);
         // ─── Heartbeat: one-shot, skip router and session ───
         } else if (source === "heartbeat") {
-            // Defense-in-depth: skip heartbeat for team threads
-            const teamCheckThreads = loadThreads();
-            const teamCheckConfig = teamCheckThreads[String(threadId)];
-            if (teamCheckConfig?.team) {
-                log("INFO", `Skipping heartbeat for team thread ${threadId} (team: ${teamCheckConfig.team})`);
+            // Defense-in-depth: skip heartbeat for threads without heartbeat flag
+            const hbCheckThreads = loadThreads();
+            const hbCheckConfig = hbCheckThreads[String(threadId)];
+            if (!hbCheckConfig?.heartbeat) {
+                log("INFO", `Skipping heartbeat for thread ${threadId} (heartbeat not enabled)`);
                 clearStatus(threadId);
                 if (fs.existsSync(processingFile)) {
                     fs.unlinkSync(processingFile);
@@ -2358,10 +2358,10 @@ function runHeartbeatCycle(): void {
             ? getThreadsInZone(zoneConfig, BORG_ZONE)
             : Object.keys(threads).map(Number);
 
-        // Filter to non-team threads in this zone
+        // Filter to threads with heartbeat enabled
         const eligibleThreads = zoneThreadIds.filter((id) => {
             const config = threads[String(id)];
-            return config && !config.team;
+            return config?.heartbeat;
         });
 
         if (eligibleThreads.length === 0) {
