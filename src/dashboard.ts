@@ -159,6 +159,25 @@ app.post("/auth/validate", async (req, res) => {
     }
 });
 
+// Webhook delivery proxy (unauthenticated — uses HMAC signature verification on infra side)
+app.post("/api/webhooks/:id", async (req: express.Request<{ id: string }> & { rawBody?: Buffer }, res, next) => {
+    // Only match webhook IDs (wh_*), not CRUD sub-paths handled by authenticated routes
+    if (!req.params.id.startsWith("wh_")) return next();
+    try {
+        const headers: Record<string, string> = { "Content-Type": req.headers["content-type"] || "application/json" };
+        for (const h of ["x-hub-signature-256", "x-hub-signature", "x-github-event", "x-github-delivery"]) {
+            if (req.headers[h]) headers[h] = req.headers[h] as string;
+        }
+        const response = await fetch(`http://infra:3001/api/webhooks/${req.params.id}`, {
+            method: "POST",
+            headers,
+            body: req.rawBody || JSON.stringify(req.body),
+        });
+        const data = await response.json();
+        res.status(response.status).json(data);
+    } catch { res.status(502).json({ error: "Infra unreachable" }); }
+});
+
 // ─── Auth Middleware ───
 
 function getCookieValue(req: express.Request, name: string): string | undefined {
@@ -1729,24 +1748,6 @@ app.post("/api/webhooks/create", proxyToInfra("POST", () => "/api/webhooks/creat
 app.put("/api/webhooks/:id/update", proxyToInfra("PUT", r => `/api/webhooks/${r.params.id}/update`, true));
 app.delete("/api/webhooks/:id/delete", proxyToInfra("DELETE", r => `/api/webhooks/${r.params.id}/delete`));
 app.post("/api/webhooks/:id/rotate", proxyToInfra("POST", r => `/api/webhooks/${r.params.id}/rotate`));
-
-// Webhook delivery proxy — forwards raw body + headers for HMAC verification
-app.post("/api/webhooks/:id", async (req: express.Request<{ id: string }> & { rawBody?: Buffer }, res) => {
-    try {
-        const headers: Record<string, string> = { "Content-Type": req.headers["content-type"] || "application/json" };
-        // Forward GitHub-specific headers needed by infra's webhook server
-        for (const h of ["x-hub-signature-256", "x-hub-signature", "x-github-event", "x-github-delivery"]) {
-            if (req.headers[h]) headers[h] = req.headers[h] as string;
-        }
-        const response = await fetch(`http://infra:3001/api/webhooks/${req.params.id}`, {
-            method: "POST",
-            headers,
-            body: req.rawBody || JSON.stringify(req.body),
-        });
-        const data = await response.json();
-        res.status(response.status).json(data);
-    } catch { res.status(502).json({ error: "Infra unreachable" }); }
-});
 
 app.get("/api/webhooks/deliveries", (_req, res) => {
     const deliveryFile = path.join(BORG_INFRA_DIR, "webhook-deliveries.jsonl");
