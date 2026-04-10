@@ -51,6 +51,7 @@ services:
       - ./threads.json:/app/threads.json
       - ./zone-config.json:/app/zone-config.json
       - ./settings.json:/app/settings.json
+      - ${WORKSPACE_ROOT}:${WORKSPACE_ROOT}:ro
       - ${CLAUDE_CREDENTIALS}:/home/node/.claude/.credentials.json:ro
     environment:
       - NODE_ENV=production
