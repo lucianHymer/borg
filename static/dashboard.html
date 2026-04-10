@@ -1046,6 +1046,11 @@ tr.clickable { cursor: pointer; }
             <label style="display:block;font-size:11px;color:var(--text-secondary);margin-bottom:4px;text-transform:uppercase;letter-spacing:0.5px;">Event Filter (comma-separated)</label>
             <input id="wh-events" type="text" placeholder="issues,pull_request,issue_comment,push" style="width:100%;background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-primary);padding:6px 10px;border-radius:4px;font-size:12px;font-family:inherit;">
           </div>
+          <div id="wh-label-filter-row" style="margin-bottom:12px;display:none;">
+            <label style="display:block;font-size:11px;color:var(--text-secondary);margin-bottom:4px;text-transform:uppercase;letter-spacing:0.5px;">Label Filter (comma-separated)</label>
+            <input id="wh-labels" type="text" placeholder="agent:triage, bug" style="width:100%;background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-primary);padding:6px 10px;border-radius:4px;font-size:12px;font-family:inherit;">
+            <div style="font-size:10px;color:var(--text-secondary);margin-top:2px;">Only deliver if issue/PR has one of these labels. Leave empty for all.</div>
+          </div>
           <div style="margin-bottom:12px;">
             <label style="display:block;font-size:11px;color:var(--text-secondary);margin-bottom:4px;text-transform:uppercase;letter-spacing:0.5px;">ntfy Topic (optional)</label>
             <input id="wh-ntfy-topic" type="text" placeholder="" style="width:100%;background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-primary);padding:6px 10px;border-radius:4px;font-size:12px;font-family:inherit;">
@@ -2787,11 +2792,12 @@ tr.clickable { cursor: pointer; }
     }
     webhooksCache = data.webhooks;
     var origin = window.location.origin;
-    var html = '<table><thead><tr><th>Name</th><th>URL</th><th>Thread</th><th>Formatter</th><th>Events</th><th>ntfy</th><th>Created</th><th>Actions</th></tr></thead><tbody>';
+    var html = '<table><thead><tr><th>Name</th><th>URL</th><th>Thread</th><th>Formatter</th><th>Events</th><th>Labels</th><th>ntfy</th><th>Created</th><th>Actions</th></tr></thead><tbody>';
     for (var i = 0; i < data.webhooks.length; i++) {
       var wh = data.webhooks[i];
       var url = origin + '/api/webhooks/' + escapeHtml(wh.id);
       var events = wh.eventFilter && wh.eventFilter.length ? escapeHtml(wh.eventFilter.join(', ')) : '<span style="color:var(--text-secondary)">all</span>';
+      var labels = wh.labelFilter && wh.labelFilter.length ? escapeHtml(wh.labelFilter.join(', ')) : '<span style="color:var(--text-secondary)">-</span>';
       var ntfy = wh.ntfyTopic ? escapeHtml(wh.ntfyTopic) : '<span style="color:var(--text-secondary)">-</span>';
       var created = wh.createdAt ? relativeTime(wh.createdAt) : '-';
       html += '<tr>' +
@@ -2801,6 +2807,7 @@ tr.clickable { cursor: pointer; }
         '<td>' + escapeHtml(String(wh.threadId)) + '</td>' +
         '<td><span class="badge badge-blue">' + escapeHtml(wh.formatter || 'raw') + '</span></td>' +
         '<td style="font-size:11px;">' + events + '</td>' +
+        '<td style="font-size:11px;">' + labels + '</td>' +
         '<td style="font-size:11px;">' + ntfy + '</td>' +
         '<td style="font-size:11px;color:var(--text-secondary);">' + created + '</td>' +
         '<td style="white-space:nowrap;">' +
@@ -2860,17 +2867,25 @@ tr.clickable { cursor: pointer; }
     }
   }
 
+  function toggleLabelFilterRow() {
+    var isGithub = document.getElementById('wh-formatter').value === 'github';
+    document.getElementById('wh-label-filter-row').style.display = isGithub ? 'block' : 'none';
+  }
+  document.getElementById('wh-formatter').addEventListener('change', toggleLabelFilterRow);
+
   window._showCreateWebhook = function() {
     document.getElementById('wh-edit-id').value = '';
     document.getElementById('wh-name').value = '';
     document.getElementById('wh-formatter').value = 'github';
     document.getElementById('wh-events').value = '';
+    document.getElementById('wh-labels').value = '';
     document.getElementById('wh-ntfy-topic').value = '';
     document.getElementById('wh-ntfy-debounce').value = '';
     document.getElementById('wh-require-sig').checked = true;
     document.getElementById('webhook-modal-title').textContent = 'Create Webhook';
     document.getElementById('wh-submit-btn').textContent = 'Create';
     populateThreadDropdown();
+    toggleLabelFilterRow();
     document.getElementById('webhook-modal').style.display = 'flex';
   };
 
@@ -2881,6 +2896,7 @@ tr.clickable { cursor: pointer; }
     document.getElementById('wh-name').value = wh.name || '';
     document.getElementById('wh-formatter').value = wh.formatter || 'raw';
     document.getElementById('wh-events').value = (wh.eventFilter || []).join(', ');
+    document.getElementById('wh-labels').value = (wh.labelFilter || []).join(', ');
     document.getElementById('wh-ntfy-topic').value = wh.ntfyTopic || '';
     document.getElementById('wh-ntfy-debounce').value = wh.ntfyDebounceMs || '';
     document.getElementById('wh-require-sig').checked = wh.requireSignature !== false;
@@ -2889,6 +2905,7 @@ tr.clickable { cursor: pointer; }
     populateThreadDropdown().then(function() {
       document.getElementById('wh-thread').value = String(wh.threadId);
     });
+    toggleLabelFilterRow();
     document.getElementById('webhook-modal').style.display = 'flex';
   };
 
@@ -2917,6 +2934,8 @@ tr.clickable { cursor: pointer; }
     var formatter = document.getElementById('wh-formatter').value;
     var eventsRaw = document.getElementById('wh-events').value.trim();
     var eventFilter = eventsRaw ? eventsRaw.split(',').map(function(s) { return s.trim(); }).filter(Boolean) : [];
+    var labelsRaw = document.getElementById('wh-labels').value.trim();
+    var labelFilter = labelsRaw ? labelsRaw.split(',').map(function(s) { return s.trim(); }).filter(Boolean) : [];
     var ntfyTopic = document.getElementById('wh-ntfy-topic').value.trim() || undefined;
     var ntfyDebounceRaw = document.getElementById('wh-ntfy-debounce').value.trim();
     var ntfyDebounceMs = ntfyDebounceRaw ? parseInt(ntfyDebounceRaw, 10) : undefined;
@@ -2924,7 +2943,7 @@ tr.clickable { cursor: pointer; }
     if (!name) { alert('Name is required'); return; }
 
     var requireSignature = document.getElementById('wh-require-sig').checked;
-    var body = { name: name, formatter: formatter, eventFilter: eventFilter, requireSignature: requireSignature };
+    var body = { name: name, formatter: formatter, eventFilter: eventFilter, labelFilter: labelFilter, requireSignature: requireSignature };
     if (threadId) body.threadId = threadId;
     if (ntfyTopic) body.ntfyTopic = ntfyTopic;
     if (ntfyDebounceMs) body.ntfyDebounceMs = ntfyDebounceMs;

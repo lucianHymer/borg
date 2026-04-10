@@ -43,6 +43,7 @@ interface WebhookConfig {
     threadId?: number;
     formatter: string;         // "github" | "raw"
     eventFilter?: string[];    // e.g. ["issues", "pull_request"]
+    labelFilter?: string[];    // e.g. ["agent:triage"] — only deliver if issue/PR has a matching label
     ntfy?: { topic: string; debounceMs?: number };
     createdAt: number;
 }
@@ -259,7 +260,7 @@ app.get("/api/webhooks/list", requireToken, (_req, res) => {
 app.post("/api/webhooks/create", requireToken, (req, res) => {
     const ALLOWED_HMAC_ALGORITHMS = ["sha256", "sha1", "sha512"];
     const ALLOWED_FORMATTERS = Object.keys(formatters);
-    const { name, signatureHeader, hmacAlgorithm, threadId, formatter, eventFilter, ntfy, ntfyTopic, ntfyDebounceMs, requireSignature: reqSig } = req.body || {};
+    const { name, signatureHeader, hmacAlgorithm, threadId, formatter, eventFilter, labelFilter, ntfy, ntfyTopic, ntfyDebounceMs, requireSignature: reqSig } = req.body || {};
     const requireSig = reqSig !== false; // default true
     if (!name || typeof name !== "string") {
         res.status(400).json({ error: "name is required" });
@@ -281,6 +282,10 @@ app.post("/api/webhooks/create", requireToken, (req, res) => {
         res.status(400).json({ error: "eventFilter must be an array of strings" });
         return;
     }
+    if (labelFilter && (!Array.isArray(labelFilter) || !labelFilter.every((e: unknown) => typeof e === "string"))) {
+        res.status(400).json({ error: "labelFilter must be an array of strings" });
+        return;
+    }
 
     const id = "wh_" + crypto.randomBytes(4).toString("hex");
     const secret = requireSig ? crypto.randomBytes(32).toString("hex") : "";
@@ -296,6 +301,7 @@ app.post("/api/webhooks/create", requireToken, (req, res) => {
         createdAt: Date.now(),
         ...(threadId != null ? { threadId } : {}),
         ...(eventFilter ? { eventFilter } : {}),
+        ...(labelFilter ? { labelFilter } : {}),
         ...(ntfy ? { ntfy } : ntfyTopic ? { ntfy: { topic: ntfyTopic, ...(ntfyDebounceMs ? { debounceMs: ntfyDebounceMs } : {}) } } : {}),
     };
 
@@ -316,13 +322,14 @@ app.put("/api/webhooks/:id/update", requireToken, (req: express.Request<{ id: st
         return;
     }
 
-    const { name, threadId, ntfy, ntfyTopic, ntfyDebounceMs, formatter, eventFilter } = req.body || {};
+    const { name, threadId, ntfy, ntfyTopic, ntfyDebounceMs, formatter, eventFilter, labelFilter } = req.body || {};
     if (name !== undefined) existing.name = name;
     if (threadId !== undefined) existing.threadId = threadId;
     if (ntfy !== undefined) existing.ntfy = ntfy;
     else if (ntfyTopic !== undefined) existing.ntfy = { topic: ntfyTopic, ...(ntfyDebounceMs ? { debounceMs: ntfyDebounceMs } : {}) };
     if (formatter !== undefined) existing.formatter = formatter;
     if (eventFilter !== undefined) existing.eventFilter = eventFilter;
+    if (labelFilter !== undefined) existing.labelFilter = labelFilter;
 
     webhooks[req.params.id] = existing;
     writeWebhooks(webhooks);
@@ -400,6 +407,18 @@ app.post("/api/webhooks/:id", (req: express.Request<{ id: string }> & { rawBody?
         }
     }
 
+    // Label filtering — check if issue/PR has a matching label
+    if (config.labelFilter && config.labelFilter.length > 0) {
+        const payload = req.body as { issue?: { labels?: Array<{ name?: string }> }; pull_request?: { labels?: Array<{ name?: string }> } };
+        const entity = payload.pull_request || payload.issue;
+        const labels = (entity?.labels || []).map(l => l.name || "").filter(Boolean);
+        const hasMatch = config.labelFilter.some(f => labels.includes(f));
+        if (!hasMatch) {
+            res.status(200).json({ filtered: true, reason: "label" });
+            return;
+        }
+    }
+
     // Format payload
     const formatter = formatters[config.formatter];
     if (!formatter) {
@@ -424,6 +443,27 @@ app.post("/api/webhooks/:id", (req: express.Request<{ id: string }> & { rawBody?
                 message: formatted,
             });
             messageId = result.messageId;
+
+            // Send processing status to Telegram thread (fire-and-forget)
+            const settings = readSettings();
+            const botToken = settings.telegram_bot_token as string | undefined;
+            const chatId = settings.telegram_chat_id as number | undefined;
+            if (botToken && chatId) {
+                const payload = req.body as { action?: string; issue?: { number?: number; title?: string }; pull_request?: { number?: number; title?: string } };
+                const entity = payload.pull_request || payload.issue;
+                const kind = payload.pull_request ? "PR" : "Issue";
+                const label = entity ? `${kind} #${entity.number}: ${entity.title}` : githubEvent || "event";
+                const action = payload.action ? ` (${payload.action})` : "";
+                fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        chat_id: chatId,
+                        message_thread_id: config.threadId,
+                        text: `⏳ Processing ${label}${action}...`,
+                    }),
+                }).catch(() => {}); // best-effort
+            }
         } catch (err) {
             res.status(500).json({ error: toErrorMessage(err) });
             return;
