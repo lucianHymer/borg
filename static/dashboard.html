@@ -1036,6 +1036,13 @@ tr.clickable { cursor: pointer; }
             </select>
           </div>
           <div style="margin-bottom:12px;">
+            <label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--text-primary);cursor:pointer;">
+              <input id="wh-require-sig" type="checkbox" checked style="accent-color:var(--accent-green);">
+              Require HMAC signature
+            </label>
+            <div style="font-size:10px;color:var(--text-secondary);margin-top:2px;margin-left:24px;">Enable for GitHub webhooks. Disable for simple POST sources.</div>
+          </div>
+          <div style="margin-bottom:12px;">
             <label style="display:block;font-size:11px;color:var(--text-secondary);margin-bottom:4px;text-transform:uppercase;letter-spacing:0.5px;">Event Filter (comma-separated)</label>
             <input id="wh-events" type="text" placeholder="issues,pull_request,issue_comment,push" style="width:100%;background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-primary);padding:6px 10px;border-radius:4px;font-size:12px;font-family:inherit;">
           </div>
@@ -2838,6 +2845,10 @@ tr.clickable { cursor: pointer; }
   async function populateThreadDropdown() {
     var sel = document.getElementById('wh-thread');
     sel.innerHTML = '';
+    var none = document.createElement('option');
+    none.value = '';
+    none.textContent = 'None (ntfy only)';
+    sel.appendChild(none);
     var threads = await api('/api/threads');
     if (!threads) return;
     var ids = Object.keys(threads).sort(function(a, b) { return Number(a) - Number(b); });
@@ -2856,6 +2867,7 @@ tr.clickable { cursor: pointer; }
     document.getElementById('wh-events').value = '';
     document.getElementById('wh-ntfy-topic').value = '';
     document.getElementById('wh-ntfy-debounce').value = '';
+    document.getElementById('wh-require-sig').checked = true;
     document.getElementById('webhook-modal-title').textContent = 'Create Webhook';
     document.getElementById('wh-submit-btn').textContent = 'Create';
     populateThreadDropdown();
@@ -2871,6 +2883,7 @@ tr.clickable { cursor: pointer; }
     document.getElementById('wh-events').value = (wh.eventFilter || []).join(', ');
     document.getElementById('wh-ntfy-topic').value = wh.ntfyTopic || '';
     document.getElementById('wh-ntfy-debounce').value = wh.ntfyDebounceMs || '';
+    document.getElementById('wh-require-sig').checked = wh.requireSignature !== false;
     document.getElementById('webhook-modal-title').textContent = 'Edit Webhook';
     document.getElementById('wh-submit-btn').textContent = 'Save';
     populateThreadDropdown().then(function() {
@@ -2909,9 +2922,10 @@ tr.clickable { cursor: pointer; }
     var ntfyDebounceMs = ntfyDebounceRaw ? parseInt(ntfyDebounceRaw, 10) : undefined;
 
     if (!name) { alert('Name is required'); return; }
-    if (!threadId) { alert('Thread is required'); return; }
 
-    var body = { name: name, threadId: threadId, formatter: formatter, eventFilter: eventFilter };
+    var requireSignature = document.getElementById('wh-require-sig').checked;
+    var body = { name: name, formatter: formatter, eventFilter: eventFilter, requireSignature: requireSignature };
+    if (threadId) body.threadId = threadId;
     if (ntfyTopic) body.ntfyTopic = ntfyTopic;
     if (ntfyDebounceMs) body.ntfyDebounceMs = ntfyDebounceMs;
 
