@@ -42,7 +42,7 @@ interface WebhookConfig {
     threadId?: number;
     formatter: string;         // "github" | "raw"
     eventFilter?: string[];    // e.g. ["issues", "pull_request"]
-    ntfy?: { topic: string; debounceMs: number };
+    ntfy?: { topic: string; debounceMs?: number };
     createdAt: number;
 }
 
@@ -247,17 +247,18 @@ function redactSecret(config: WebhookConfig): WebhookConfig & { secret: string }
 
 app.get("/api/webhooks/list", requireToken, (_req, res) => {
     const webhooks = loadWebhooks();
-    const redacted: Record<string, WebhookConfig> = {};
-    for (const [id, config] of Object.entries(webhooks)) {
-        redacted[id] = redactSecret(config);
-    }
-    res.json(redacted);
+    const list = Object.entries(webhooks).map(([id, config]) => ({
+        id,
+        ...redactSecret(config),
+        ...(config.ntfy ? { ntfyTopic: config.ntfy.topic, ntfyDebounceMs: config.ntfy.debounceMs } : {}),
+    }));
+    res.json({ webhooks: list });
 });
 
 app.post("/api/webhooks/create", requireToken, (req, res) => {
     const ALLOWED_HMAC_ALGORITHMS = ["sha256", "sha1", "sha512"];
     const ALLOWED_FORMATTERS = Object.keys(formatters);
-    const { name, signatureHeader, hmacAlgorithm, threadId, formatter, eventFilter, ntfy } = req.body || {};
+    const { name, signatureHeader, hmacAlgorithm, threadId, formatter, eventFilter, ntfy, ntfyTopic, ntfyDebounceMs } = req.body || {};
     if (!name || typeof name !== "string") {
         res.status(400).json({ error: "name is required" });
         return;
@@ -292,7 +293,7 @@ app.post("/api/webhooks/create", requireToken, (req, res) => {
         createdAt: Date.now(),
         ...(threadId != null ? { threadId } : {}),
         ...(eventFilter ? { eventFilter } : {}),
-        ...(ntfy ? { ntfy } : {}),
+        ...(ntfy ? { ntfy } : ntfyTopic ? { ntfy: { topic: ntfyTopic, ...(ntfyDebounceMs ? { debounceMs: ntfyDebounceMs } : {}) } } : {}),
     };
 
     const webhooks = loadWebhooks();
@@ -310,10 +311,11 @@ app.put("/api/webhooks/:id/update", requireToken, (req: express.Request<{ id: st
         return;
     }
 
-    const { name, threadId, ntfy, formatter, eventFilter } = req.body || {};
+    const { name, threadId, ntfy, ntfyTopic, ntfyDebounceMs, formatter, eventFilter } = req.body || {};
     if (name !== undefined) existing.name = name;
     if (threadId !== undefined) existing.threadId = threadId;
     if (ntfy !== undefined) existing.ntfy = ntfy;
+    else if (ntfyTopic !== undefined) existing.ntfy = { topic: ntfyTopic, ...(ntfyDebounceMs ? { debounceMs: ntfyDebounceMs } : {}) };
     if (formatter !== undefined) existing.formatter = formatter;
     if (eventFilter !== undefined) existing.eventFilter = eventFilter;
 
@@ -423,7 +425,7 @@ app.post("/api/webhooks/:id", (req: express.Request<{ id: string }> & { rawBody?
 
     // Ntfy debounce — batch notifications for the same topic
     if (config.ntfy && formatted) {
-        debounceNtfy(config.ntfy.topic, config.ntfy.debounceMs, formatted);
+        debounceNtfy(config.ntfy.topic, config.ntfy.debounceMs ?? 0, formatted);
     }
 
     // Log delivery

@@ -2838,6 +2838,10 @@ tr.clickable { cursor: pointer; }
   async function populateThreadDropdown() {
     var sel = document.getElementById('wh-thread');
     sel.innerHTML = '';
+    var none = document.createElement('option');
+    none.value = '';
+    none.textContent = 'None (ntfy only)';
+    sel.appendChild(none);
     var threads = await api('/api/threads');
     if (!threads) return;
     var ids = Object.keys(threads).sort(function(a, b) { return Number(a) - Number(b); });
@@ -2909,9 +2913,9 @@ tr.clickable { cursor: pointer; }
     var ntfyDebounceMs = ntfyDebounceRaw ? parseInt(ntfyDebounceRaw, 10) : undefined;
 
     if (!name) { alert('Name is required'); return; }
-    if (!threadId) { alert('Thread is required'); return; }
 
-    var body = { name: name, threadId: threadId, formatter: formatter, eventFilter: eventFilter };
+    var body = { name: name, formatter: formatter, eventFilter: eventFilter };
+    if (threadId) body.threadId = threadId;
     if (ntfyTopic) body.ntfyTopic = ntfyTopic;
     if (ntfyDebounceMs) body.ntfyDebounceMs = ntfyDebounceMs;
 
