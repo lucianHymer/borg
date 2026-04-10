@@ -926,14 +926,12 @@ export function configureThread(threadId: number, updates: Partial<ThreadConfig>
         threads[key] = { ...threads[key], ...filtered };
     } else {
         threads[key] = {
+            ...filtered,
             name: filtered.name ?? `Thread ${threadId}`,
             cwd: filtered.cwd ?? DEFAULT_CWD,
             model: filtered.model ?? "sonnet",
             isMaster: filtered.isMaster ?? false,
             lastActive: filtered.lastActive ?? Date.now(),
-            ...(filtered.team ? { team: filtered.team } : {}),
-            ...(filtered.role ? { role: filtered.role } : {}),
-            ...(filtered.workflow ? { workflow: filtered.workflow } : {}),
         };
     }
     saveThreads(threads);

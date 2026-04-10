@@ -1777,7 +1777,7 @@ async function pollOutgoingQueue(): Promise<void> {
                                 await bot.api.editMessageReplyMarkup(pending.chatId, firstSentId, {
                                     reply_markup: keyboard,
                                 });
-                            } catch { /* Buttons are best-effort */ }
+                            } catch (err) { log("WARN", `Keyboard attach failed: ${err}`); }
                         }
 
                         telegramToQueueId.delete(pending.telegramMessageId);
@@ -1832,7 +1832,7 @@ async function pollOutgoingQueue(): Promise<void> {
                                 await bot.api.editMessageReplyMarkup(chatId, firstSentId, {
                                     reply_markup: keyboard,
                                 });
-                            } catch { /* Buttons are best-effort */ }
+                            } catch (err) { log("WARN", `Keyboard attach failed: ${err}`); }
                         }
                     }
                 }
