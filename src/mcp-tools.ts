@@ -792,10 +792,16 @@ export function createBorgMcpServer(sourceThreadId: number) {
                 .describe("Model for this thread (default: sonnet). Use haiku for simple tasks, sonnet for most work, opus for complex reasoning/planning."),
             mainThread: z.boolean().optional()
                 .describe("Mark as a main thread that receives broadcast fan-outs (only for long-lived threads, NOT team workers)"),
+            sessionTimeout: z.number().min(0).optional()
+                .describe("Minutes of inactivity before session auto-clears (0 = disabled). Use ~20 for DM/triage threads, ~45 for normal threads."),
+            prompt: z.string().optional()
+                .describe("Path to prompt file (relative to cwd) appended to system prompt. E.g., '.claude/skills/triage.md'"),
+            keyboards: z.string().optional()
+                .describe("Path to keyboard config JSON (relative to cwd) for inline button layouts"),
             initialMessage: z.string().optional()
                 .describe("First message to send to the new thread"),
         },
-        async ({ name, team, role, workflow, cwd, model, mainThread, initialMessage }) => {
+        async ({ name, team, role, workflow, cwd, model, mainThread, sessionTimeout, prompt, keyboards, initialMessage }) => {
             try {
                 const settings = loadSettings();
                 const threads = loadThreads();
@@ -869,6 +875,9 @@ export function createBorgMcpServer(sourceThreadId: number) {
                     ...(role ? { role } : {}),
                     ...(workflow ? { workflow } : {}),
                     ...(mainThread ? { mainThread } : {}),
+                    ...(sessionTimeout !== undefined ? { sessionTimeout } : {}),
+                    ...(prompt ? { prompt } : {}),
+                    ...(keyboards ? { keyboards } : {}),
                 });
 
                 // Register in zone-config.json — new thread goes into creator's zone
@@ -940,7 +949,7 @@ export function createBorgMcpServer(sourceThreadId: number) {
 
     const configureThreadTool = tool(
         "configure_thread",
-        "Update team metadata for an existing thread.",
+        "Update metadata for an existing thread. Supports team config, session behavior, custom prompts, and keyboard layouts.",
         {
             threadId: z.number().describe("Thread ID to configure"),
             team: z.string().min(1).max(64).regex(/^[a-z][a-z0-9-]*$/).optional()
@@ -951,8 +960,14 @@ export function createBorgMcpServer(sourceThreadId: number) {
                 .describe("Path to workflow skill file (e.g., '.claude/skills/workflows/dev-team.md')"),
             mainThread: z.boolean().optional()
                 .describe("Mark as a main thread that receives broadcast fan-outs"),
+            sessionTimeout: z.number().min(0).optional()
+                .describe("Minutes of inactivity before session auto-clears (0 = disabled)"),
+            prompt: z.string().optional()
+                .describe("Path to prompt file (relative to cwd) appended to system prompt"),
+            keyboards: z.string().optional()
+                .describe("Path to keyboard config JSON (relative to cwd) for inline button layouts"),
         },
-        async ({ threadId, team, role, workflow, mainThread }) => {
+        async ({ threadId, team, role, workflow, mainThread, sessionTimeout, prompt, keyboards }) => {
             try {
                 const threads = loadThreads();
                 if (!threads[String(threadId)]) {
@@ -963,8 +978,11 @@ export function createBorgMcpServer(sourceThreadId: number) {
                     ...(role !== undefined ? { role } : {}),
                     ...(workflow !== undefined ? { workflow } : {}),
                     ...(mainThread !== undefined ? { mainThread } : {}),
+                    ...(sessionTimeout !== undefined ? { sessionTimeout } : {}),
+                    ...(prompt !== undefined ? { prompt } : {}),
+                    ...(keyboards !== undefined ? { keyboards } : {}),
                 });
-                return { content: [textContent(`Updated thread ${threadId}: team=${team ?? "(unchanged)"}, role=${role ?? "(unchanged)"}, workflow=${workflow ?? "(unchanged)"}, mainThread=${mainThread ?? "(unchanged)"}`)] };
+                return { content: [textContent(`Updated thread ${threadId}: team=${team ?? "(unchanged)"}, role=${role ?? "(unchanged)"}, workflow=${workflow ?? "(unchanged)"}, mainThread=${mainThread ?? "(unchanged)"}, sessionTimeout=${sessionTimeout ?? "(unchanged)"}, prompt=${prompt ?? "(unchanged)"}, keyboards=${keyboards ?? "(unchanged)"}`)] };
             } catch (err) {
                 return { content: [textContent(`Failed: ${toErrorMessage(err)}`)], isError: true };
             }

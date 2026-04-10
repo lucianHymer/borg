@@ -19,6 +19,9 @@ export interface ThreadConfig {
     role?: string;          // Agent role (e.g., "planner", "reviewer")
     mainThread?: boolean;   // Receives broadcast fan-outs (only long-lived threads)
     workflow?: string;      // Path to workflow skill file (e.g., ".claude/skills/workflows/dev-team.md")
+    sessionTimeout?: number; // Minutes of inactivity before session auto-clears (overrides global setting)
+    prompt?: string;         // Path to prompt file (relative to cwd) appended to system prompt
+    keyboards?: string;      // Path to keyboard config JSON (relative to cwd) for inline button layouts
 }
 
 export type ThreadsMap = Record<string, ThreadConfig>;
@@ -52,8 +55,8 @@ export interface Settings {
     dashboard_url?: string;      // Public base URL for dashboard (e.g. https://borg.example.com)
     cost_alert_threshold?: number; // USD threshold per query — alert in thread when exceeded (default: 5)
     webhook_secret?: string;         // Bearer token for POST /api/incoming webhook endpoint
-    clairvoyant_webhook_secret?: string; // HMAC secret from Clairvoyant's register_webhook response
-    clairvoyant_thread_id?: number;      // Thread ID to route Clairvoyant events to
+    dm_allowed_user_ids?: string[];       // Telegram user IDs allowed to DM the bot
+    dm_threads?: Record<string, { threadId: number; name: string }>; // Telegram user ID → thread config for DMs
 }
 
 // ─── Constants ───
@@ -608,8 +611,8 @@ function buildMcpToolsBlock(isMaster: boolean): string {
         "- `delete_scheduled_task` — Delete a task by ID",
         "",
         "Team management tools:",
-        "- `create_thread` — Create a new Telegram forum topic and register it as a Borg thread (with optional team/role)",
-        "- `configure_thread` — Update team metadata (team, role) for an existing thread",
+        "- `create_thread` — Create a new Telegram forum topic and register it as a Borg thread (with optional team/role, sessionTimeout, prompt, keyboards)",
+        "- `configure_thread` — Update thread config (team, role, sessionTimeout, prompt, keyboards) for an existing thread",
         "- `disband_team` — Remove team association from all threads in a team",
     ];
     if (isMaster) {
@@ -704,8 +707,32 @@ Your runtime context:
 
 // ─── System Prompts ───
 
+/** Resolve a relative path under cwd, returning null if it escapes cwd (path traversal protection). */
+export function resolveSecurePath(cwd: string, relativePath: string): string | null {
+    const resolved = path.resolve(cwd, relativePath);
+    const base = path.resolve(cwd);
+    if (!resolved.startsWith(base + path.sep) && resolved !== base) return null;
+    return resolved;
+}
+
+function loadCustomPrompt(config: ThreadConfig): string {
+    if (!config.prompt) return "";
+    const resolved = resolveSecurePath(config.cwd, config.prompt);
+    if (!resolved) {
+        console.warn(`[session-manager] Custom prompt path escapes cwd: ${config.prompt}`);
+        return "";
+    }
+    try {
+        return fs.readFileSync(resolved, "utf8");
+    } catch {
+        console.warn(`[session-manager] Custom prompt file not found: ${resolved}`);
+        return "";
+    }
+}
+
 export function buildThreadPrompt(config: ThreadConfig, runtime: { threadId: number; model: string }): string {
     const runtimeBlock = buildRuntimeBlock(config, runtime);
+    const customPrompt = loadCustomPrompt(config);
 
     if (config.isMaster) {
         const parts = [
@@ -723,6 +750,7 @@ export function buildThreadPrompt(config: ThreadConfig, runtime: { threadId: num
             parts.push(buildHeartbeatBlock());
         }
         parts.push(`Keep responses concise — Telegram messages over 4000 characters get split.${runtimeBlock}`);
+        if (customPrompt) parts.push(customPrompt);
         return parts.join("\n\n");
     }
 
@@ -739,6 +767,7 @@ export function buildThreadPrompt(config: ThreadConfig, runtime: { threadId: num
         parts.push(buildHeartbeatBlock());
     }
     parts.push(`Keep responses concise — Telegram messages over 4000 characters get split.${runtimeBlock}`);
+    if (customPrompt) parts.push(customPrompt);
     return parts.join("\n\n");
 }
 

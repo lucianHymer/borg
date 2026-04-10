@@ -104,6 +104,99 @@ app.use(express.json());
 // Serve static files
 app.use("/static", express.static(STATIC_DIR));
 
+// GET /health (unauthenticated)
+app.get("/health", (_req, res) => {
+    res.json({ status: "ok", uptime: process.uptime() });
+});
+
+// GET /login (unauthenticated)
+app.get("/login", (_req, res) => {
+    res.sendFile(path.join(STATIC_DIR, "login.html"));
+});
+
+// Auth proxy routes (unauthenticated — these ARE the login flow)
+app.post("/auth/claim", async (req, res) => {
+    try {
+        const response = await fetch("http://infra:3001/auth/claim", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(req.body),
+        });
+        const data = await response.json() as Record<string, unknown>;
+        if (response.ok && typeof data.token === "string") {
+            // Set cookie server-side with HttpOnly + Secure + SameSite
+            const maxAge = 30 * 24 * 60 * 60; // 30 days
+            res.setHeader("Set-Cookie",
+                `borg_token=${data.token}; Path=/; Max-Age=${maxAge}; HttpOnly; Secure; SameSite=Strict`);
+            // Don't expose the raw token to JS — just confirm success
+            res.json({ ok: true, userName: data.userName });
+        } else {
+            res.status(response.status).json(data);
+        }
+    } catch (err) {
+        res.status(502).json({ error: "Auth service unreachable" });
+    }
+});
+
+app.post("/auth/validate", async (req, res) => {
+    try {
+        const response = await fetch("http://infra:3001/auth/validate", {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                ...(req.headers.authorization ? { Authorization: req.headers.authorization } : {}),
+            },
+        });
+        const data = await response.json();
+        res.status(response.status).json(data);
+    } catch (err) {
+        res.status(502).json({ error: "Auth service unreachable" });
+    }
+});
+
+// ─── Auth Middleware ───
+
+function getCookieValue(req: express.Request, name: string): string | undefined {
+    const cookie = req.headers.cookie;
+    if (!cookie) return undefined;
+    const match = cookie.split(";").map(s => s.trim()).find(s => s.startsWith(`${name}=`));
+    return match ? match.slice(name.length + 1) : undefined;
+}
+
+async function requireAuth(req: express.Request, res: express.Response, next: express.NextFunction) {
+    const authHeader = req.headers.authorization;
+    const token = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : getCookieValue(req, "borg_token");
+
+    if (!token) {
+        if (req.path.startsWith("/api/")) {
+            return res.status(401).json({ error: "Unauthorized" });
+        }
+        return res.redirect("/login");
+    }
+
+    try {
+        const response = await fetch("http://infra:3001/auth/validate", {
+            method: "POST",
+            headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+        });
+        if (!response.ok) {
+            if (req.path.startsWith("/api/")) {
+                return res.status(401).json({ error: "Unauthorized" });
+            }
+            return res.redirect("/login");
+        }
+        next();
+    } catch {
+        // Fail closed — don't bypass auth when infra is unreachable
+        if (req.path.startsWith("/api/")) {
+            return res.status(503).json({ error: "Auth service unavailable" });
+        }
+        return res.status(503).send("Authentication service temporarily unavailable. Please retry.");
+    }
+}
+
+app.use(requireAuth);
+
 // GET / — serves the dashboard HTML
 app.get("/", (_req, res) => {
     const htmlPath = path.join(STATIC_DIR, "dashboard.html");
@@ -112,11 +205,6 @@ app.get("/", (_req, res) => {
     } else {
         res.status(404).send("Dashboard HTML not found. Place static/dashboard.html.");
     }
-});
-
-// GET /health
-app.get("/health", (_req, res) => {
-    res.json({ status: "ok", uptime: process.uptime() });
 });
 
 // GET /api/status — service health, queue depth, thread summary, host metrics
@@ -1603,6 +1691,44 @@ app.get("/api/response/:messageId/feed", (req, res) => {
     req.on("close", () => {
         clearInterval(interval);
     });
+});
+
+// ─── Webhook CRUD Proxy to Infra ───
+
+/** Extract auth token from Authorization header or cookie, forward as Bearer */
+function getProxyAuth(req: express.Request): string {
+    if (req.headers.authorization) return req.headers.authorization;
+    const cookieToken = getCookieValue(req, "borg_token");
+    return cookieToken ? `Bearer ${cookieToken}` : "";
+}
+
+function proxyToInfra(method: string, pathFn: (req: express.Request) => string, hasBody = false) {
+    return async (req: express.Request, res: express.Response) => {
+        try {
+            const response = await fetch(`http://infra:3001${pathFn(req)}`, {
+                method,
+                headers: {
+                    ...(hasBody ? { "Content-Type": "application/json" } : {}),
+                    Authorization: getProxyAuth(req),
+                },
+                ...(hasBody ? { body: JSON.stringify(req.body) } : {}),
+            });
+            const data = await response.json();
+            res.status(response.status).json(data);
+        } catch { res.status(502).json({ error: "Infra unreachable" }); }
+    };
+}
+
+app.get("/api/webhooks/list", proxyToInfra("GET", () => "/api/webhooks/list"));
+app.post("/api/webhooks/create", proxyToInfra("POST", () => "/api/webhooks/create", true));
+app.put("/api/webhooks/:id/update", proxyToInfra("PUT", r => `/api/webhooks/${r.params.id}/update`, true));
+app.delete("/api/webhooks/:id/delete", proxyToInfra("DELETE", r => `/api/webhooks/${r.params.id}/delete`));
+app.post("/api/webhooks/:id/rotate", proxyToInfra("POST", r => `/api/webhooks/${r.params.id}/rotate`));
+
+app.get("/api/webhooks/deliveries", (_req, res) => {
+    const deliveryFile = path.join(BORG_INFRA_DIR, "webhook-deliveries.jsonl");
+    const entries = readRecentJsonl<Record<string, unknown>>(deliveryFile, 100);
+    res.json(entries);
 });
 
 // ─── Start Server ───

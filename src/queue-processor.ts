@@ -1626,9 +1626,12 @@ async function processMessage(messageFile: string): Promise<void> {
     let scheduledTaskName: string | undefined;
     let resolvedSessionId: string | undefined;
 
+    // Webhooks to threads with sessionTimeout use the regular session path (not one-shot)
+    const webhookToSession = source === "webhook" && !!loadThreads()[String(threadId)]?.sessionTimeout;
+
     try {
-        // ─── One-Shot (/do) or Webhook: no session context ───
-        if (source === "one-shot" || source === "webhook") {
+        // ─── One-Shot (/do) or Webhook (without sessionTimeout): no session context ───
+        if ((source === "one-shot" || source === "webhook") && !webhookToSession) {
             const oneshotResult = await processOneShot(msg);
             effectiveModel = oneshotResult.model;
             responseText = oneshotResult.text;
@@ -1749,6 +1752,18 @@ async function processMessage(messageFile: string): Promise<void> {
                 threadConfig.name = msg.topicName;
                 saveThreads(threads);
             }
+            // Session timeout check: clear stale session before resume (must check BEFORE updating lastActive)
+            // Only per-thread sessionTimeout is enforced here (0 = disabled, the default)
+            const timeout = threadConfig.sessionTimeout;
+            if (timeout && threadConfig.sessionId && threadConfig.lastActive) {
+                const idleMs = Date.now() - threadConfig.lastActive;
+                if (idleMs > timeout * 60_000) {
+                    log("INFO", `Session timeout for thread ${threadId}: idle ${Math.round(idleMs / 60_000)}m > ${timeout}m — clearing session`);
+                    deleteThreadField(threadId, "sessionId");
+                    delete threadConfig.sessionId;
+                }
+            }
+
             threads[key].lastActive = Date.now();
 
             // Determine model
@@ -1921,7 +1936,9 @@ async function processMessage(messageFile: string): Promise<void> {
         return;
     }
 
-    // ─── Write response to outgoing queue (one-shot paths: scheduled-task, heartbeat, one-shot) ───
+    // ─── Write response to outgoing queue ───
+    // Webhooks processed through the session path use "user" source so one-shot hints don't fire
+    const historySource = webhookToSession ? "user" : (source ?? "user");
     appendHistory({
         ts: Date.now(),
         threadId,
@@ -1930,7 +1947,7 @@ async function processMessage(messageFile: string): Promise<void> {
         direction: "out",
         message: responseText,
         model: effectiveModel,
-        source: source ?? "user",
+        source: historySource,
         messageId,
         ...(scheduledTaskName ? { scheduledTaskName } : {}),
         ...(usageData ? {
@@ -2124,6 +2141,9 @@ async function processQueue(): Promise<void> {
             );
         }
 
+        // Load threads once per scan cycle (mtime-cached, but avoid per-file statSync)
+        const threadsSnapshot = loadThreads();
+
         for (const file of files) {
             if (activeCount >= maxConcurrent) break;
 
@@ -2143,8 +2163,12 @@ async function processQueue(): Promise<void> {
                 continue; // File may have been picked up by a concurrent scan
             }
 
-            // Skip threads that are already processing a message
-            if (busyThreads.has(msg.threadId) && msg.source !== "heartbeat" && msg.source !== "scheduled-task" && msg.source !== "webhook") {
+            // Webhooks to threads with sessionTimeout use the regular session path, not one-shot
+            const isWebhookToSession = msg.source === "webhook" && !!threadsSnapshot[String(msg.threadId)]?.sessionTimeout;
+            const isOneShot = (msg.source === "heartbeat" || msg.source === "scheduled-task" || msg.source === "one-shot" || (msg.source === "webhook" && !isWebhookToSession));
+
+            // Skip threads that are already processing a message (one-shots bypass this)
+            if (busyThreads.has(msg.threadId) && !isOneShot) {
                 continue;
             }
 
@@ -2154,7 +2178,7 @@ async function processQueue(): Promise<void> {
             if (msg.source === 'scheduled-task' && activeScheduledTaskCount >= 1) continue;
 
             // ─── One-shot paths: dispatch to existing handlers (unchanged) ───
-            if (msg.source === "heartbeat" || msg.source === "scheduled-task" || msg.source === "one-shot" || msg.source === "webhook") {
+            if (isOneShot) {
                 // These use their own one-shot query() calls, not the streaming channel
                 activeCount++;
                 if (msg.source === 'heartbeat') activeHeartbeatCount++;

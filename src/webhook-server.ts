@@ -11,39 +11,81 @@ import express from "express";
 import { z } from "zod";
 import { loadZoneConfig, getThreadZone } from "./zone-config.js";
 import { toErrorMessage } from "./types.js";
+import {
+    claimAuthCode,
+    checkRateLimit,
+    recordFailedAttempt,
+    createToken,
+    validateToken,
+    getGitHubToken,
+    startAuthSweep,
+    stopAuthSweep,
+} from "./auth.js";
+import { formatters } from "./webhook-formatters.js";
 
 const SCRIPT_DIR = path.resolve(__dirname, "..");
 const ZONE_CONFIG_PATH = process.env.ZONE_CONFIG_PATH || path.join(SCRIPT_DIR, "zone-config.json");
 const SETTINGS_FILE = process.env.SETTINGS_FILE || path.join(SCRIPT_DIR, "settings.json");
+const BORG_DIR = path.join(SCRIPT_DIR, ".borg");
+const WEBHOOKS_FILE = path.join(BORG_DIR, "webhooks.json");
+const DELIVERIES_FILE = path.join(BORG_DIR, "webhook-deliveries.jsonl");
 const PORT = parseInt(process.env.WEBHOOK_PORT || "3001", 10);
 
-function readSettings(): Record<string, unknown> {
+// ─── Webhook Config Types ───
+
+interface WebhookConfig {
+    name: string;
+    secret: string;
+    signatureHeader: string;   // e.g. "x-hub-signature-256"
+    signaturePrefix: string;   // e.g. "sha256="
+    hmacAlgorithm: string;     // e.g. "sha256"
+    threadId?: number;
+    formatter: string;         // "github" | "raw"
+    eventFilter?: string[];    // e.g. ["issues", "pull_request"]
+    ntfy?: { topic: string; debounceMs: number };
+    createdAt: number;
+}
+
+interface WebhooksFile {
+    [id: string]: WebhookConfig;
+}
+
+// ─── Mtime-Cached Webhooks Loader ───
+
+let cachedWebhooks: WebhooksFile | null = null;
+let cachedWebhooksMtime: number = 0;
+
+function loadWebhooks(): WebhooksFile {
     try {
-        return JSON.parse(fs.readFileSync(SETTINGS_FILE, "utf8"));
-    } catch {
-        return {};
+        const stat = fs.statSync(WEBHOOKS_FILE);
+        if (cachedWebhooks && stat.mtimeMs === cachedWebhooksMtime) {
+            return cachedWebhooks;
+        }
+        const raw = fs.readFileSync(WEBHOOKS_FILE, "utf-8");
+        const parsed = JSON.parse(raw) as WebhooksFile;
+        cachedWebhooks = parsed;
+        cachedWebhooksMtime = stat.mtimeMs;
+        return parsed;
+    } catch (err: unknown) {
+        if (err instanceof Error && "code" in err && (err as NodeJS.ErrnoException).code === "ENOENT") {
+            return {};
+        }
+        throw err;
     }
 }
 
-/** Send a message directly to a Telegram thread via HTTP API (fire-and-forget). */
-async function sendTelegramMessage(threadId: number, text: string): Promise<void> {
-    const settings = readSettings();
-    const token = settings.telegram_bot_token as string | undefined;
-    const chatId = settings.telegram_chat_id as string | undefined;
-    if (!token || !chatId) return;
+let cachedSettings: Record<string, unknown> | null = null;
+let cachedSettingsMtime: number = 0;
 
+function readSettings(): Record<string, unknown> {
     try {
-        await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-                chat_id: chatId,
-                message_thread_id: threadId,
-                text,
-            }),
-        });
+        const stat = fs.statSync(SETTINGS_FILE);
+        if (cachedSettings && stat.mtimeMs === cachedSettingsMtime) return cachedSettings;
+        cachedSettings = JSON.parse(fs.readFileSync(SETTINGS_FILE, "utf8"));
+        cachedSettingsMtime = stat.mtimeMs;
+        return cachedSettings!;
     } catch {
-        // Best-effort — don't fail the webhook response
+        return {};
     }
 }
 
@@ -86,6 +128,36 @@ function enqueueWebhookMessage(opts: {
     fs.renameSync(tmpFile, finalFile);
 
     return { messageId, zone };
+}
+
+// ─── Ntfy Debounce State ───
+
+const ntfyBatches = new Map<string, { timer: NodeJS.Timeout; messages: string[] }>();
+
+function debounceNtfy(topic: string, debounceMs: number, message: string): void {
+    const existing = ntfyBatches.get(topic);
+    if (existing) {
+        existing.messages.push(message);
+        return; // timer already running
+    }
+
+    const messages = [message];
+    const timer = setTimeout(async () => {
+        ntfyBatches.delete(topic);
+        const summary = messages.length === 1
+            ? messages[0]
+            : `${messages.length} events:\n\n${messages.join("\n\n---\n\n")}`;
+        try {
+            await fetch(`http://ntfy:80/${topic}`, {
+                method: "POST",
+                body: summary.slice(0, 4000), // ntfy has message size limits
+            });
+        } catch (err) {
+            console.error("ntfy send failed:", err);
+        }
+    }, debounceMs);
+    timer.unref(); // don't keep process alive
+    ntfyBatches.set(topic, { timer, messages });
 }
 
 // ─── Express App ───
@@ -141,111 +213,296 @@ app.post("/api/incoming", (req, res) => {
     }
 });
 
-// ─── Clairvoyant Webhook Endpoint (HMAC-SHA256 auth) ───
+// ─── Webhook Helpers ───
 
-const CvEventSchema = z.object({
-    id: z.string(),
-    task_id: z.string(),
-    event_type: z.string(),
-    actor_id: z.string(),
-    body: z.string().optional().nullable(),
-    metadata: z.record(z.string(), z.unknown()).optional(),
-    idempotency_key: z.string(),
-    created_at: z.string(),
+function extractToken(req: express.Request): string | null {
+    const auth = req.headers.authorization;
+    if (!auth?.startsWith("Bearer ")) return null;
+    return auth.slice(7);
+}
+
+async function requireToken(req: express.Request, res: express.Response, next: express.NextFunction) {
+    const token = extractToken(req);
+    if (!token) { res.status(401).json({ error: "Missing token" }); return; }
+    const valid = await validateToken(token);
+    if (!valid) { res.status(401).json({ error: "Invalid token" }); return; }
+    next();
+}
+
+function writeWebhooks(webhooks: WebhooksFile): void {
+    fs.mkdirSync(path.dirname(WEBHOOKS_FILE), { recursive: true });
+    const tmpFile = WEBHOOKS_FILE + ".tmp";
+    fs.writeFileSync(tmpFile, JSON.stringify(webhooks, null, 2));
+    fs.renameSync(tmpFile, WEBHOOKS_FILE);
+    // Invalidate mtime cache so next loadWebhooks() re-reads
+    cachedWebhooks = null;
+    cachedWebhooksMtime = 0;
+}
+
+function redactSecret(config: WebhookConfig): WebhookConfig & { secret: string } {
+    return { ...config, secret: "***" };
+}
+
+// ─── Webhook CRUD Routes (Bearer token auth) ───
+
+app.get("/api/webhooks/list", requireToken, (_req, res) => {
+    const webhooks = loadWebhooks();
+    const redacted: Record<string, WebhookConfig> = {};
+    for (const [id, config] of Object.entries(webhooks)) {
+        redacted[id] = redactSecret(config);
+    }
+    res.json(redacted);
 });
 
-const CvTaskSchema = z.object({
-    id: z.string(),
-    title: z.string(),
-    status: z.string(),
-    owner_id: z.string().optional().nullable(),
-    creator_id: z.string(),
-    parent_task_id: z.string().optional().nullable(),
-    priority: z.number().optional().nullable(),
-    due_date: z.string().optional().nullable(),
-    tags: z.array(z.string()).optional(),
-    version: z.number(),
-    created_at: z.string(),
-    updated_at: z.string(),
-});
-
-const CvWebhookPayloadSchema = z.object({
-    event: CvEventSchema,
-    task: CvTaskSchema,
-});
-
-app.post("/api/webhooks/clairvoyant", (req: express.Request & { rawBody?: Buffer }, res) => {
-    const settings = readSettings();
-    const secret = settings.clairvoyant_webhook_secret as string | undefined;
-    if (!secret) {
-        res.status(503).json({ error: "Clairvoyant webhook not configured — set clairvoyant_webhook_secret in settings.json" });
+app.post("/api/webhooks/create", requireToken, (req, res) => {
+    const ALLOWED_HMAC_ALGORITHMS = ["sha256", "sha1", "sha512"];
+    const ALLOWED_FORMATTERS = Object.keys(formatters);
+    const { name, signatureHeader, hmacAlgorithm, threadId, formatter, eventFilter, ntfy } = req.body || {};
+    if (!name || typeof name !== "string") {
+        res.status(400).json({ error: "name is required" });
+        return;
+    }
+    if (hmacAlgorithm && !ALLOWED_HMAC_ALGORITHMS.includes(hmacAlgorithm)) {
+        res.status(400).json({ error: `Invalid hmacAlgorithm. Allowed: ${ALLOWED_HMAC_ALGORITHMS.join(", ")}` });
+        return;
+    }
+    if (formatter && !ALLOWED_FORMATTERS.includes(formatter)) {
+        res.status(400).json({ error: `Invalid formatter. Allowed: ${ALLOWED_FORMATTERS.join(", ")}` });
+        return;
+    }
+    if (threadId != null && (typeof threadId !== "number" || !Number.isInteger(threadId) || threadId <= 0)) {
+        res.status(400).json({ error: "threadId must be a positive integer" });
+        return;
+    }
+    if (eventFilter && (!Array.isArray(eventFilter) || !eventFilter.every((e: unknown) => typeof e === "string"))) {
+        res.status(400).json({ error: "eventFilter must be an array of strings" });
         return;
     }
 
-    // Verify HMAC-SHA256 signature
-    const signature = req.headers["x-ql-signature"] as string | undefined;
+    const id = "wh_" + crypto.randomBytes(4).toString("hex");
+    const secret = crypto.randomBytes(32).toString("hex");
+
+    const config: WebhookConfig = {
+        name,
+        secret,
+        signatureHeader: signatureHeader || "x-hub-signature-256",
+        signaturePrefix: "sha256=",
+        hmacAlgorithm: hmacAlgorithm || "sha256",
+        formatter: formatter || "github",
+        createdAt: Date.now(),
+        ...(threadId != null ? { threadId } : {}),
+        ...(eventFilter ? { eventFilter } : {}),
+        ...(ntfy ? { ntfy } : {}),
+    };
+
+    const webhooks = loadWebhooks();
+    webhooks[id] = config;
+    writeWebhooks(webhooks);
+
+    res.status(201).json({ id, ...config });
+});
+
+app.put("/api/webhooks/:id/update", requireToken, (req: express.Request<{ id: string }>, res) => {
+    const webhooks = loadWebhooks();
+    const existing = webhooks[req.params.id];
+    if (!existing) {
+        res.status(404).json({ error: "Webhook not found" });
+        return;
+    }
+
+    const { name, threadId, ntfy, formatter, eventFilter } = req.body || {};
+    if (name !== undefined) existing.name = name;
+    if (threadId !== undefined) existing.threadId = threadId;
+    if (ntfy !== undefined) existing.ntfy = ntfy;
+    if (formatter !== undefined) existing.formatter = formatter;
+    if (eventFilter !== undefined) existing.eventFilter = eventFilter;
+
+    webhooks[req.params.id] = existing;
+    writeWebhooks(webhooks);
+
+    res.json({ id: req.params.id, ...redactSecret(existing) });
+});
+
+app.delete("/api/webhooks/:id/delete", requireToken, (req: express.Request<{ id: string }>, res) => {
+    const webhooks = loadWebhooks();
+    if (!webhooks[req.params.id]) {
+        res.status(404).json({ error: "Webhook not found" });
+        return;
+    }
+
+    delete webhooks[req.params.id];
+    writeWebhooks(webhooks);
+
+    res.json({ deleted: true });
+});
+
+app.post("/api/webhooks/:id/rotate", requireToken, (req: express.Request<{ id: string }>, res) => {
+    const webhooks = loadWebhooks();
+    if (!webhooks[req.params.id]) {
+        res.status(404).json({ error: "Webhook not found" });
+        return;
+    }
+
+    const newSecret = crypto.randomBytes(32).toString("hex");
+    webhooks[req.params.id].secret = newSecret;
+    writeWebhooks(webhooks);
+
+    res.json({ id: req.params.id, secret: newSecret });
+});
+
+// ─── Generic Webhook Handler (HMAC signature auth) ───
+
+app.post("/api/webhooks/:id", (req: express.Request<{ id: string }> & { rawBody?: Buffer }, res) => {
+    const webhooks = loadWebhooks();
+    const config = webhooks[req.params.id];
+    if (!config) {
+        res.status(404).json({ error: "Webhook not found" });
+        return;
+    }
+
+    // Verify HMAC signature
+    const signature = req.headers[config.signatureHeader.toLowerCase()] as string | undefined;
     if (!signature || !req.rawBody) {
-        res.status(401).json({ error: "Missing X-QL-Signature header" });
+        res.status(401).json({ error: "Missing signature" });
         return;
     }
 
-    const expected = crypto.createHmac("sha256", secret).update(req.rawBody).digest("hex");
-    if (signature.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) {
+    const computed = config.signaturePrefix +
+        crypto.createHmac(config.hmacAlgorithm, config.secret).update(req.rawBody).digest("hex");
+
+    if (signature.length !== computed.length ||
+        !crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(computed))) {
         res.status(401).json({ error: "Invalid signature" });
         return;
     }
 
-    // Validate payload
-    const parsed = CvWebhookPayloadSchema.safeParse(req.body);
-    if (!parsed.success) {
-        res.status(400).json({ error: "Invalid payload", details: parsed.error.issues });
+    // Handle GitHub ping event
+    const githubEvent = req.headers["x-github-event"] as string | undefined;
+    if (githubEvent === "ping") {
+        res.status(200).json({ pong: true });
         return;
     }
 
-    const { event, task } = parsed.data;
+    // Event filtering
+    if (config.eventFilter && config.eventFilter.length > 0 && githubEvent) {
+        if (!config.eventFilter.includes(githubEvent)) {
+            res.status(200).json({ filtered: true });
+            return;
+        }
+    }
 
-    // Only triage unowned tasks — owned tasks already have someone responsible
-    if (task.owner_id) {
-        res.status(200).json({ filtered: true, reason: "has_owner", owner_id: task.owner_id });
+    // Format payload
+    const formatter = formatters[config.formatter];
+    if (!formatter) {
+        res.status(500).json({ error: `Unknown formatter: ${config.formatter}` });
         return;
     }
 
-    // Resolve target thread
-    const threadId = settings.clairvoyant_thread_id as number | undefined;
-    if (!threadId) {
-        res.status(503).json({ error: "No target thread — set clairvoyant_thread_id in settings.json" });
+    const headers = req.headers as Record<string, string>;
+    const formatted = formatter(headers, req.body);
+    if (!formatted) {
+        res.status(200).json({ skipped: true });
         return;
     }
 
-    // Format a human-readable message for the thread agent
-    const tags = task.tags?.length ? ` [${task.tags.join(", ")}]` : "";
-    const body = event.body ? `\n\n${event.body}` : "";
-    const message = [
-        `Clairvoyant event: **${event.event_type}**`,
-        `Task: "${task.title}" (${task.id})${tags}`,
-        `Status: ${task.status} | Priority: ${task.priority ?? "none"}`,
-        `Created by: ${task.creator_id} | Owner: ${task.owner_id ?? "unassigned"}`,
-        body,
-        `\nCheck your triage instructions in \`.claude/skills/triage.md\` and handle this event accordingly.`,
-    ].join("\n");
+    // Enqueue message if threadId is configured
+    let messageId: string | undefined;
+    if (config.threadId) {
+        try {
+            const result = enqueueWebhookMessage({
+                threadId: config.threadId,
+                sender: config.name,
+                message: formatted,
+            });
+            messageId = result.messageId;
+        } catch (err) {
+            res.status(500).json({ error: toErrorMessage(err) });
+            return;
+        }
+    }
 
+    // Ntfy debounce — batch notifications for the same topic
+    if (config.ntfy && formatted) {
+        debounceNtfy(config.ntfy.topic, config.ntfy.debounceMs, formatted);
+    }
+
+    // Log delivery
     try {
-        const result = enqueueWebhookMessage({
-            threadId,
-            sender: "clairvoyant",
-            message,
-            model: "opus",
-            idempotencyKey: event.idempotency_key,
+        const deliveryEntry = JSON.stringify({
+            webhookId: req.params.id,
+            ts: Date.now(),
+            event: githubEvent ? `${githubEvent}${req.body?.action ? `.${req.body.action}` : ""}` : "unknown",
+            status: "ok",
+            ...(config.threadId ? { threadId: config.threadId } : {}),
+            ...(config.ntfy ? { ntfy: true } : {}),
         });
-
-        // Immediate feedback in the triage thread
-        const statusLine = `⏳ Processing: "${task.title}" (${task.id})`;
-        sendTelegramMessage(threadId, statusLine);
-
-        res.status(202).json(result);
-    } catch (err) {
-        res.status(500).json({ error: toErrorMessage(err) });
+        fs.appendFileSync(DELIVERIES_FILE, deliveryEntry + "\n");
+    } catch {
+        // Best-effort logging — don't fail the webhook delivery
     }
+
+    res.status(200).json({ delivered: true, ...(messageId ? { messageId } : {}) });
+});
+
+// ─── Auth Endpoints ───
+
+app.post("/auth/claim", async (req, res) => {
+    const ip = req.ip || req.socket.remoteAddress || "unknown";
+    if (!checkRateLimit(ip)) {
+        res.status(429).json({ error: "Too many attempts" });
+        return;
+    }
+
+    const code = req.body?.code;
+    if (!code || typeof code !== "string") {
+        res.status(400).json({ error: "Missing code" });
+        return;
+    }
+
+    const result = claimAuthCode(code);
+    if (!result) {
+        recordFailedAttempt(ip);
+        res.status(401).json({ error: "Invalid or expired code" });
+        return;
+    }
+
+    const tokenInfo = await createToken(result.telegramUserId, result.userName);
+    res.json({ token: tokenInfo.token, expires_at: tokenInfo.expiresAt, userName: tokenInfo.userName });
+});
+
+app.post("/auth/gh-token", async (req, res) => {
+    const auth = req.headers.authorization;
+    const token = auth?.startsWith("Bearer ") ? auth.slice(7) : null;
+    if (!token) {
+        res.status(401).json({ error: "Missing or invalid Authorization header" });
+        return;
+    }
+
+    const org = req.body?.org as string | undefined;
+    const result = await getGitHubToken(token, org);
+    if (!result) {
+        res.status(401).json({ error: "Invalid token or no access" });
+        return;
+    }
+
+    res.json(result);
+});
+
+app.post("/auth/validate", async (req, res) => {
+    const auth = req.headers.authorization;
+    const token = auth?.startsWith("Bearer ") ? auth.slice(7) : null;
+    if (!token) {
+        res.status(401).json({ error: "Missing or invalid Authorization header" });
+        return;
+    }
+
+    const tokenInfo = await validateToken(token);
+    if (!tokenInfo) {
+        res.status(401).json({ error: "Invalid or expired token" });
+        return;
+    }
+
+    res.json({ valid: true, userName: tokenInfo.userName });
 });
 
 // ─── Start/Stop ───
@@ -253,6 +510,7 @@ app.post("/api/webhooks/clairvoyant", (req: express.Request & { rawBody?: Buffer
 let server: http.Server | null = null;
 
 export function startWebhookServer(): http.Server {
+    startAuthSweep();
     server = http.createServer(app);
     server.listen(PORT, "0.0.0.0", () => {
         console.log(`Webhook server listening on http://0.0.0.0:${PORT}`);
@@ -261,6 +519,7 @@ export function startWebhookServer(): http.Server {
 }
 
 export function stopWebhookServer(): Promise<void> {
+    stopAuthSweep();
     return new Promise((resolve) => {
         if (server) {
             server.close(() => resolve());

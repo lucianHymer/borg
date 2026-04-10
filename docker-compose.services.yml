@@ -8,65 +8,34 @@
 # - Set memory limits (deploy.resources.limits.memory)
 # - Use named volumes for persistent data
 # - Add healthchecks so dependents can use condition: service_healthy
-# - Prefix service names with the project name (e.g. clairvoyant-db, not just db)
+# - Prefix service names with the project name to avoid conflicts
 
 services:
-  # ── Quest Log: event-sourced task management MCP server ──
-  clairvoyant-db:
-    image: postgres:16
+  # ── ntfy: push notification server ──
+  ntfy:
+    image: binwiederhier/ntfy
     restart: unless-stopped
+    command: serve
     environment:
-      - POSTGRES_DB=clairvoyant
-      - POSTGRES_USER=clairvoyant
-      - POSTGRES_PASSWORD=${CLAIRVOYANT_DB_PASSWORD:?CLAIRVOYANT_DB_PASSWORD must be set in .env}
+      - NTFY_BASE_URL=${NTFY_BASE_URL:-http://ntfy:80}
+      - NTFY_CACHE_FILE=/var/cache/ntfy/cache.db
+      - NTFY_BEHIND_PROXY=true
     volumes:
-      - clairvoyant-pgdata:/var/lib/postgresql/data
+      - ntfy-cache:/var/cache/ntfy
     networks:
       - internal
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U clairvoyant"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    deploy:
-      resources:
-        limits:
-          memory: 256M
-
-  clairvoyant:
-    image: ghcr.io/passportxyz/questlog:latest
-    restart: unless-stopped
-    depends_on:
-      clairvoyant-db:
-        condition: service_healthy
-      broker:
-        condition: service_healthy
-    environment:
-      - NODE_ENV=production
-      - DATABASE_URL=postgresql://clairvoyant:${CLAIRVOYANT_DB_PASSWORD:?CLAIRVOYANT_DB_PASSWORD must be set in .env}@clairvoyant-db:5432/clairvoyant
-      - PORT=3000
-      - QL_JWT_SECRET=${QL_JWT_SECRET:?QL_JWT_SECRET must be set in .env}
-      - CREDENTIAL_BROKER_URL=http://broker:3000
-      - BROKER_SECRET=${BROKER_SECRET}
-      - ATTACHMENTS_DIR=/data/attachments
-      - PUBLIC_URL=${CLAIRVOYANT_PUBLIC_URL:-}
-    volumes:
-      - clairvoyant-attachments:/data/attachments
-    networks:
-      - internal
-    healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      test: ["CMD", "wget", "-q", "--tries=1", "http://localhost:80/v1/health", "-O", "/dev/null"]
       interval: 10s
       timeout: 5s
       retries: 3
     deploy:
       resources:
         limits:
-          memory: 256M
+          memory: 64M
 
 volumes:
-  clairvoyant-pgdata:
-  clairvoyant-attachments:
+  ntfy-cache:
 
 networks:
   internal: {}
