@@ -1761,6 +1761,22 @@ async function processMessage(messageFile: string): Promise<void> {
                     log("INFO", `Session timeout for thread ${threadId}: idle ${Math.round(idleMs / 60_000)}m > ${timeout}m — clearing session`);
                     deleteThreadField(threadId, "sessionId");
                     delete threadConfig.sessionId;
+
+                    // Send a silent notification to the thread
+                    const idleMins = Math.round(idleMs / 60_000);
+                    const notifyMsg: OutgoingMessage = {
+                        channel, threadId,
+                        sender: "system",
+                        message: `🔄 Session cleared after ${idleMins}m of inactivity.`,
+                        originalMessage: `Session cleared after ${idleMins}m of inactivity.`,
+                        timestamp: Date.now(),
+                        messageId: `session_timeout_${threadId}_${Date.now()}`,
+                        model: "system",
+                    };
+                    const notifyFile = path.join(QUEUE_OUTGOING, `session_timeout_${threadId}_${Date.now()}.json`);
+                    const notifyTmp = notifyFile + ".tmp";
+                    fs.writeFileSync(notifyTmp, JSON.stringify(notifyMsg, null, 2));
+                    fs.renameSync(notifyTmp, notifyFile);
                 }
             }
 
