@@ -132,6 +132,116 @@ function enqueueWebhookMessage(opts: {
     return { messageId, zone };
 }
 
+// ─── Webhook Event Coalescing ───
+// When GitHub fires multiple events for the same issue/PR in rapid succession
+// (e.g. created + labeled + assigned), coalesce them into one delivery.
+
+const COALESCE_WINDOW_MS = 3000; // 3 seconds
+
+interface CoalescedEvent {
+    formatted: string;
+    event: string;
+    action: string;
+}
+
+interface CoalesceEntry {
+    timer: NodeJS.Timeout;
+    events: CoalescedEvent[];
+    webhookId: string;
+    config: WebhookConfig;
+    subject: string; // e.g. "Issue #61: title"
+}
+
+const coalesceBatches = new Map<string, CoalesceEntry>();
+
+/** Extract a coalescing key from a GitHub webhook payload. Returns null if not coalesceable. */
+function getCoalesceKey(webhookId: string, headers: Record<string, string>, body: unknown): { key: string; subject: string } | null {
+    const event = headers["x-github-event"];
+    if (!event) return null;
+
+    const payload = body as {
+        issue?: { number?: number; title?: string };
+        pull_request?: { number?: number; title?: string };
+        repository?: { full_name?: string };
+    };
+
+    const entity = payload.pull_request || payload.issue;
+    if (!entity?.number) return null; // push events, etc. — deliver immediately
+
+    const repo = payload.repository?.full_name || "unknown";
+    const kind = payload.pull_request ? "PR" : "Issue";
+    const key = `${webhookId}:${repo}#${entity.number}`;
+    const subject = `${kind} #${entity.number}: ${entity.title || ""}`;
+    return { key, subject };
+}
+
+/** Deliver a coalesced batch: enqueue one combined message + one Telegram status. */
+function deliverCoalescedBatch(entry: CoalesceEntry): void {
+    const { events, config, webhookId, subject } = entry;
+    const actions = events.map(e => e.action || e.event).join(", ");
+
+    // Combine formatted messages — if only one event, use it directly
+    const combined = events.length === 1
+        ? events[0].formatted
+        : events.map(e => e.formatted).join("\n\n---\n\n");
+
+    let messageId: string | undefined;
+    if (config.threadId) {
+        try {
+            const result = enqueueWebhookMessage({
+                threadId: config.threadId,
+                sender: config.name,
+                message: combined,
+            });
+            messageId = result.messageId;
+
+            // Send one processing status to Telegram
+            const settings = readSettings();
+            const botToken = settings.telegram_bot_token as string | undefined;
+            const chatId = settings.telegram_chat_id as number | undefined;
+            if (botToken && chatId) {
+                const statusText = events.length === 1
+                    ? `⏳ Processing ${subject} (${actions})...`
+                    : `⏳ Processing ${subject} — ${events.length} events (${actions})...`;
+                fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        chat_id: chatId,
+                        message_thread_id: config.threadId,
+                        text: statusText,
+                    }),
+                }).catch(() => {});
+            }
+        } catch (err) {
+            console.error("Failed to deliver coalesced webhook:", err);
+        }
+    }
+
+    // Ntfy for all events in batch
+    if (config.ntfy) {
+        debounceNtfy(config.ntfy.topic, config.ntfy.debounceMs ?? 0, combined);
+    }
+
+    // Log each event in the batch
+    for (const e of events) {
+        try {
+            const deliveryEntry = JSON.stringify({
+                webhookId,
+                ts: Date.now(),
+                event: e.event,
+                status: "ok",
+                coalesced: events.length > 1,
+                ...(config.threadId ? { threadId: config.threadId } : {}),
+                ...(config.ntfy ? { ntfy: true } : {}),
+            });
+            fs.appendFileSync(DELIVERIES_FILE, deliveryEntry + "\n");
+        } catch {
+            // Best-effort logging
+        }
+    }
+}
+
 // ─── Ntfy Debounce State ───
 
 const ntfyBatches = new Map<string, { timer: NodeJS.Timeout; messages: string[] }>();
@@ -433,7 +543,41 @@ app.post("/api/webhooks/:id", (req: express.Request<{ id: string }> & { rawBody?
         return;
     }
 
-    // Enqueue message if threadId is configured
+    // Coalesce events for the same issue/PR within a short window
+    const eventStr = githubEvent ? `${githubEvent}${req.body?.action ? `.${req.body.action}` : ""}` : "unknown";
+    const action = (req.body as { action?: string })?.action || "";
+    const coalesceInfo = getCoalesceKey(req.params.id, req.headers as Record<string, string>, req.body);
+
+    if (coalesceInfo) {
+        const { key, subject } = coalesceInfo;
+        const existing = coalesceBatches.get(key);
+
+        if (existing) {
+            // Append to existing batch, keep timer running
+            existing.events.push({ formatted, event: eventStr, action });
+            res.status(200).json({ coalesced: true, key });
+            return;
+        }
+
+        // Start new coalesce window
+        const entry: CoalesceEntry = {
+            timer: setTimeout(() => {
+                coalesceBatches.delete(key);
+                deliverCoalescedBatch(entry);
+            }, COALESCE_WINDOW_MS),
+            events: [{ formatted, event: eventStr, action }],
+            webhookId: req.params.id,
+            config,
+            subject,
+        };
+        entry.timer.unref();
+        coalesceBatches.set(key, entry);
+
+        res.status(200).json({ coalesced: true, key });
+        return;
+    }
+
+    // Non-coalesceable event (push, etc.) — deliver immediately
     let messageId: string | undefined;
     if (config.threadId) {
         try {
@@ -443,51 +587,28 @@ app.post("/api/webhooks/:id", (req: express.Request<{ id: string }> & { rawBody?
                 message: formatted,
             });
             messageId = result.messageId;
-
-            // Send processing status to Telegram thread (fire-and-forget)
-            const settings = readSettings();
-            const botToken = settings.telegram_bot_token as string | undefined;
-            const chatId = settings.telegram_chat_id as number | undefined;
-            if (botToken && chatId) {
-                const payload = req.body as { action?: string; issue?: { number?: number; title?: string }; pull_request?: { number?: number; title?: string } };
-                const entity = payload.pull_request || payload.issue;
-                const kind = payload.pull_request ? "PR" : "Issue";
-                const label = entity ? `${kind} #${entity.number}: ${entity.title}` : githubEvent || "event";
-                const action = payload.action ? ` (${payload.action})` : "";
-                fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({
-                        chat_id: chatId,
-                        message_thread_id: config.threadId,
-                        text: `⏳ Processing ${label}${action}...`,
-                    }),
-                }).catch(() => {}); // best-effort
-            }
         } catch (err) {
             res.status(500).json({ error: toErrorMessage(err) });
             return;
         }
     }
 
-    // Ntfy debounce — batch notifications for the same topic
     if (config.ntfy && formatted) {
         debounceNtfy(config.ntfy.topic, config.ntfy.debounceMs ?? 0, formatted);
     }
 
-    // Log delivery
     try {
         const deliveryEntry = JSON.stringify({
             webhookId: req.params.id,
             ts: Date.now(),
-            event: githubEvent ? `${githubEvent}${req.body?.action ? `.${req.body.action}` : ""}` : "unknown",
+            event: eventStr,
             status: "ok",
             ...(config.threadId ? { threadId: config.threadId } : {}),
             ...(config.ntfy ? { ntfy: true } : {}),
         });
         fs.appendFileSync(DELIVERIES_FILE, deliveryEntry + "\n");
     } catch {
-        // Best-effort logging — don't fail the webhook delivery
+        // Best-effort logging
     }
 
     res.status(200).json({ delivered: true, ...(messageId ? { messageId } : {}) });
