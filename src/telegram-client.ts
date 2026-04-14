@@ -723,6 +723,7 @@ const VALID_MODEL_ARGS: Record<string, string> = {
     haiku: "haiku",
     sonnet: "sonnet",
     opus: "opus[1m]",
+    opus200: "opus",
 };
 bot.command("model", async (ctx) => {
     if (!(await isAllowedChat(ctx, settings))) return;
@@ -733,7 +734,7 @@ bot.command("model", async (ctx) => {
     if (!arg || !VALID_MODEL_ARGS[arg]) {
         const current = loadThreads()[String(threadId)]?.model ?? "sonnet";
         await ctx.reply(
-            `Current model: ${current}\nUsage: /model <haiku|sonnet|opus>`,
+            `Current model: ${current}\nUsage: /model <haiku|sonnet|opus|opus200>`,
             { message_thread_id: getCtxThreadOpt(ctx) },
         );
         return;
@@ -2781,7 +2782,7 @@ bot.start({
         await bot.api.setMyCommands([
             { command: "clear", description: "Reset session (recent history preserved)" },
             { command: "compact", description: "Reset session (recent history preserved)" },
-            { command: "model", description: "Set thread model: /model <haiku|sonnet|opus>" },
+            { command: "model", description: "Set thread model: /model <haiku|sonnet|opus|opus200>" },
             { command: "setdir", description: "Set working directory for this thread" },
             { command: "budget_on", description: "Enable budget mode (cheap model)" },
             { command: "budget_off", description: "Disable budget mode" },
