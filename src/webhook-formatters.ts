@@ -21,7 +21,7 @@ interface GitHubCommit {
     author?: { name?: string };
 }
 
-interface GitHubPayload {
+export interface GitHubPayload {
     action?: string;
     repository?: { full_name?: string };
     issue?: GitHubEntity;

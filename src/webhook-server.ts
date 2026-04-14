@@ -21,7 +21,7 @@ import {
     startAuthSweep,
     stopAuthSweep,
 } from "./auth.js";
-import { formatters } from "./webhook-formatters.js";
+import { formatters, type GitHubPayload } from "./webhook-formatters.js";
 
 const SCRIPT_DIR = path.resolve(__dirname, "..");
 const ZONE_CONFIG_PATH = process.env.ZONE_CONFIG_PATH || path.join(SCRIPT_DIR, "zone-config.json");
@@ -130,6 +130,101 @@ function enqueueWebhookMessage(opts: {
     fs.renameSync(tmpFile, finalFile);
 
     return { messageId, zone };
+}
+
+// ─── Webhook Event Coalescing ───
+// When GitHub fires multiple events for the same issue/PR in rapid succession
+// (e.g. created + labeled + assigned), coalesce them into one delivery.
+
+const COALESCE_WINDOW_MS = 3000;
+
+interface CoalescedEvent {
+    formatted: string;
+    event: string; // e.g. "issues.opened"
+}
+
+interface CoalesceEntry {
+    timer: NodeJS.Timeout;
+    events: CoalescedEvent[];
+    webhookId: string;
+    subject: string; // e.g. "Issue #61: title" — snapshot from first event
+}
+
+const coalesceBatches = new Map<string, CoalesceEntry>();
+
+/** Extract a coalescing key from a GitHub webhook payload. Returns null for non-issue/PR events. */
+function getCoalesceKey(webhookId: string, headers: Record<string, string>, body: unknown): { key: string; subject: string } | null {
+    const event = headers["x-github-event"];
+    if (!event) return null;
+
+    const payload = body as GitHubPayload;
+    const entity = payload.pull_request || payload.issue;
+    if (!entity?.number) return null;
+
+    const repo = payload.repository?.full_name || "unknown";
+    const kind = payload.pull_request ? "PR" : "Issue";
+    return {
+        key: `${webhookId}:${repo}#${entity.number}`,
+        subject: `${kind} #${entity.number}: ${entity.title || ""}`,
+    };
+}
+
+function logDelivery(webhookId: string, events: string[], config: WebhookConfig, coalesced: boolean): void {
+    try {
+        const ts = Date.now();
+        const lines = events.map(event => JSON.stringify({
+            webhookId, ts, event, status: "ok",
+            ...(coalesced ? { coalesced: true } : {}),
+            ...(config.threadId ? { threadId: config.threadId } : {}),
+            ...(config.ntfy ? { ntfy: true } : {}),
+        })).join("\n") + "\n";
+        fs.appendFileSync(DELIVERIES_FILE, lines);
+    } catch {
+        // Best-effort logging
+    }
+}
+
+function sendTelegramStatus(threadId: number, text: string): void {
+    const settings = readSettings();
+    const botToken = settings.telegram_bot_token as string | undefined;
+    const chatId = settings.telegram_chat_id as number | undefined;
+    if (!botToken || !chatId) return;
+    fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chat_id: chatId, message_thread_id: threadId, text }),
+    }).catch(() => {});
+}
+
+/** Deliver a coalesced batch: re-reads config, enqueues one combined message + one Telegram status. */
+function deliverCoalescedBatch(entry: CoalesceEntry): void {
+    const { events, webhookId, subject } = entry;
+    // Re-read config at delivery time in case it changed during the coalesce window
+    const config = loadWebhooks()[webhookId];
+    if (!config) return;
+
+    const actions = events.map(e => e.event.split(".")[1] || e.event).join(", ");
+    const combined = events.length === 1
+        ? events[0].formatted
+        : events.map(e => e.formatted).join("\n\n---\n\n");
+
+    if (config.threadId) {
+        try {
+            enqueueWebhookMessage({ threadId: config.threadId, sender: config.name, message: combined });
+            const statusText = events.length === 1
+                ? `⏳ Processing ${subject} (${actions})...`
+                : `⏳ Processing ${subject} — ${events.length} events (${actions})...`;
+            sendTelegramStatus(config.threadId, statusText);
+        } catch (err) {
+            console.error("Failed to deliver coalesced webhook:", err);
+        }
+    }
+
+    if (config.ntfy) {
+        debounceNtfy(config.ntfy.topic, config.ntfy.debounceMs ?? 0, combined);
+    }
+
+    logDelivery(webhookId, events.map(e => e.event), config, events.length > 1);
 }
 
 // ─── Ntfy Debounce State ───
@@ -433,7 +528,36 @@ app.post("/api/webhooks/:id", (req: express.Request<{ id: string }> & { rawBody?
         return;
     }
 
-    // Enqueue message if threadId is configured
+    const eventStr = githubEvent ? `${githubEvent}${req.body?.action ? `.${req.body.action}` : ""}` : "unknown";
+    const coalesceInfo = getCoalesceKey(req.params.id, req.headers as Record<string, string>, req.body);
+
+    if (coalesceInfo) {
+        const { key, subject } = coalesceInfo;
+        const existing = coalesceBatches.get(key);
+
+        if (existing) {
+            existing.events.push({ formatted, event: eventStr });
+            res.status(200).json({ coalesced: true, key });
+            return;
+        }
+
+        const entry: CoalesceEntry = {
+            timer: setTimeout(() => {
+                coalesceBatches.delete(key);
+                deliverCoalescedBatch(entry);
+            }, COALESCE_WINDOW_MS),
+            events: [{ formatted, event: eventStr }],
+            webhookId: req.params.id,
+            subject,
+        };
+        entry.timer.unref();
+        coalesceBatches.set(key, entry);
+
+        res.status(200).json({ coalesced: true, key });
+        return;
+    }
+
+    // Non-coalesceable events (push, etc.) deliver immediately
     let messageId: string | undefined;
     if (config.threadId) {
         try {
@@ -443,52 +567,17 @@ app.post("/api/webhooks/:id", (req: express.Request<{ id: string }> & { rawBody?
                 message: formatted,
             });
             messageId = result.messageId;
-
-            // Send processing status to Telegram thread (fire-and-forget)
-            const settings = readSettings();
-            const botToken = settings.telegram_bot_token as string | undefined;
-            const chatId = settings.telegram_chat_id as number | undefined;
-            if (botToken && chatId) {
-                const payload = req.body as { action?: string; issue?: { number?: number; title?: string }; pull_request?: { number?: number; title?: string } };
-                const entity = payload.pull_request || payload.issue;
-                const kind = payload.pull_request ? "PR" : "Issue";
-                const label = entity ? `${kind} #${entity.number}: ${entity.title}` : githubEvent || "event";
-                const action = payload.action ? ` (${payload.action})` : "";
-                fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({
-                        chat_id: chatId,
-                        message_thread_id: config.threadId,
-                        text: `⏳ Processing ${label}${action}...`,
-                    }),
-                }).catch(() => {}); // best-effort
-            }
         } catch (err) {
             res.status(500).json({ error: toErrorMessage(err) });
             return;
         }
     }
 
-    // Ntfy debounce — batch notifications for the same topic
     if (config.ntfy && formatted) {
         debounceNtfy(config.ntfy.topic, config.ntfy.debounceMs ?? 0, formatted);
     }
 
-    // Log delivery
-    try {
-        const deliveryEntry = JSON.stringify({
-            webhookId: req.params.id,
-            ts: Date.now(),
-            event: githubEvent ? `${githubEvent}${req.body?.action ? `.${req.body.action}` : ""}` : "unknown",
-            status: "ok",
-            ...(config.threadId ? { threadId: config.threadId } : {}),
-            ...(config.ntfy ? { ntfy: true } : {}),
-        });
-        fs.appendFileSync(DELIVERIES_FILE, deliveryEntry + "\n");
-    } catch {
-        // Best-effort logging — don't fail the webhook delivery
-    }
+    logDelivery(req.params.id, [eventStr], config, false);
 
     res.status(200).json({ delivered: true, ...(messageId ? { messageId } : {}) });
 });
