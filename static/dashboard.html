@@ -1051,6 +1051,11 @@ tr.clickable { cursor: pointer; }
             <input id="wh-labels" type="text" placeholder="agent:triage, bug" style="width:100%;background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-primary);padding:6px 10px;border-radius:4px;font-size:12px;font-family:inherit;">
             <div style="font-size:10px;color:var(--text-secondary);margin-top:2px;">Only deliver if issue/PR has one of these labels. Leave empty for all.</div>
           </div>
+          <div id="wh-ignore-senders-row" style="margin-bottom:12px;display:none;">
+            <label style="display:block;font-size:11px;color:var(--text-secondary);margin-bottom:4px;text-transform:uppercase;letter-spacing:0.5px;">Ignore Senders (comma-separated)</label>
+            <input id="wh-ignore-senders" type="text" placeholder="human-bot[bot]" style="width:100%;background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-primary);padding:6px 10px;border-radius:4px;font-size:12px;font-family:inherit;">
+            <div style="font-size:10px;color:var(--text-secondary);margin-top:2px;">Drop events from these GitHub sender logins. Use to suppress bot echo.</div>
+          </div>
           <div style="margin-bottom:12px;">
             <label style="display:block;font-size:11px;color:var(--text-secondary);margin-bottom:4px;text-transform:uppercase;letter-spacing:0.5px;">ntfy Topic (optional)</label>
             <input id="wh-ntfy-topic" type="text" placeholder="" style="width:100%;background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-primary);padding:6px 10px;border-radius:4px;font-size:12px;font-family:inherit;">
@@ -2867,11 +2872,12 @@ tr.clickable { cursor: pointer; }
     }
   }
 
-  function toggleLabelFilterRow() {
+  function toggleGithubFilterRows() {
     var isGithub = document.getElementById('wh-formatter').value === 'github';
     document.getElementById('wh-label-filter-row').style.display = isGithub ? 'block' : 'none';
+    document.getElementById('wh-ignore-senders-row').style.display = isGithub ? 'block' : 'none';
   }
-  document.getElementById('wh-formatter').addEventListener('change', toggleLabelFilterRow);
+  document.getElementById('wh-formatter').addEventListener('change', toggleGithubFilterRows);
 
   window._showCreateWebhook = function() {
     document.getElementById('wh-edit-id').value = '';
@@ -2879,13 +2885,14 @@ tr.clickable { cursor: pointer; }
     document.getElementById('wh-formatter').value = 'github';
     document.getElementById('wh-events').value = '';
     document.getElementById('wh-labels').value = '';
+    document.getElementById('wh-ignore-senders').value = '';
     document.getElementById('wh-ntfy-topic').value = '';
     document.getElementById('wh-ntfy-debounce').value = '';
     document.getElementById('wh-require-sig').checked = true;
     document.getElementById('webhook-modal-title').textContent = 'Create Webhook';
     document.getElementById('wh-submit-btn').textContent = 'Create';
     populateThreadDropdown();
-    toggleLabelFilterRow();
+    toggleGithubFilterRows();
     document.getElementById('webhook-modal').style.display = 'flex';
   };
 
@@ -2897,6 +2904,7 @@ tr.clickable { cursor: pointer; }
     document.getElementById('wh-formatter').value = wh.formatter || 'raw';
     document.getElementById('wh-events').value = (wh.eventFilter || []).join(', ');
     document.getElementById('wh-labels').value = (wh.labelFilter || []).join(', ');
+    document.getElementById('wh-ignore-senders').value = (wh.ignoreSenders || []).join(', ');
     document.getElementById('wh-ntfy-topic').value = wh.ntfyTopic || '';
     document.getElementById('wh-ntfy-debounce').value = wh.ntfyDebounceMs || '';
     document.getElementById('wh-require-sig').checked = wh.requireSignature !== false;
@@ -2905,7 +2913,7 @@ tr.clickable { cursor: pointer; }
     populateThreadDropdown().then(function() {
       document.getElementById('wh-thread').value = String(wh.threadId);
     });
-    toggleLabelFilterRow();
+    toggleGithubFilterRows();
     document.getElementById('webhook-modal').style.display = 'flex';
   };
 
@@ -2936,6 +2944,8 @@ tr.clickable { cursor: pointer; }
     var eventFilter = eventsRaw ? eventsRaw.split(',').map(function(s) { return s.trim(); }).filter(Boolean) : [];
     var labelsRaw = document.getElementById('wh-labels').value.trim();
     var labelFilter = labelsRaw ? labelsRaw.split(',').map(function(s) { return s.trim(); }).filter(Boolean) : [];
+    var ignoreSendersRaw = document.getElementById('wh-ignore-senders').value.trim();
+    var ignoreSenders = ignoreSendersRaw ? ignoreSendersRaw.split(',').map(function(s) { return s.trim(); }).filter(Boolean) : [];
     var ntfyTopic = document.getElementById('wh-ntfy-topic').value.trim() || undefined;
     var ntfyDebounceRaw = document.getElementById('wh-ntfy-debounce').value.trim();
     var ntfyDebounceMs = ntfyDebounceRaw ? parseInt(ntfyDebounceRaw, 10) : undefined;
@@ -2943,7 +2953,7 @@ tr.clickable { cursor: pointer; }
     if (!name) { alert('Name is required'); return; }
 
     var requireSignature = document.getElementById('wh-require-sig').checked;
-    var body = { name: name, formatter: formatter, eventFilter: eventFilter, labelFilter: labelFilter, requireSignature: requireSignature };
+    var body = { name: name, formatter: formatter, eventFilter: eventFilter, labelFilter: labelFilter, ignoreSenders: ignoreSenders, requireSignature: requireSignature };
     if (threadId) body.threadId = threadId;
     if (ntfyTopic) body.ntfyTopic = ntfyTopic;
     if (ntfyDebounceMs) body.ntfyDebounceMs = ntfyDebounceMs;
