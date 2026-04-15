@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "skills": {
+    "repo-wiki": {
+      "source": "holonym-foundation/internal-docs",
+      "sourceType": "github",
+      "computedHash": "ae02fe9d84f71fa8f20eea7a6b97bf86ed91032ed2c1004c5fd48750a138ca71"
+    }
+  }
+}

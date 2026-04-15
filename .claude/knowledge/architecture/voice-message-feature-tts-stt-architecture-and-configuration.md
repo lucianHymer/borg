@@ -1,5 +1,0 @@
-# Voice message feature (TTS/STT) architecture and configuration
-
-Borg has bidirectional voice messaging via a Speaches container (Kokoro-82M TTS + faster-whisper STT) exposed as an OpenAI-compatible HTTP API. STT: telegram-client downloads OGG, queue-processor transcribes via Speaches before routing to Claude. TTS: telegram-client handles "Listen" inline button callbacks — distills text via agent SDK query() with haiku, then synthesizes via Speaches, sends voice reply. The distillForSpeech function uses the agent SDK (not raw fetch) with haiku to create a spoken summary. TTS voice and speed are configurable via .borg/settings.json (tts_voice, tts_speed) with defaults bf_alice and 1.0. The Speaches container handles request queuing internally — no application-level concurrency limiting needed. Audio files stored in .borg/audio/ (outgoing TTS) and .borg/audio/incoming/ (downloaded voice messages), cleaned up after use with periodic sweep as backup.
-
-**Related files:** src/audio.ts, src/telegram-client.ts, src/queue-processor.ts, src/session-manager.ts, docker-compose.yml

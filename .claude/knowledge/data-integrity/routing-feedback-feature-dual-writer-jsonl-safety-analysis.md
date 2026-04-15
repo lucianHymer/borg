@@ -1,5 +1,0 @@
-# Routing feedback feature - dual-writer JSONL safety analysis
-
-routing.jsonl has two writers across two processes: telegram-client.ts (logDecision + logCorrection) and mcp-tools.ts (logCorrection via log_routing_correction tool, which runs in queue-processor process). The file header comment says "Single-writer: only telegram-client.ts should write to this path" but this is now factually incorrect. appendFileSync with O_APPEND is atomic on ext4 for writes under 4096 bytes per POSIX guarantee. Each routing entry is well under 4096 bytes (max ~4.5KB with 4096-char prompt), so cross-process appends are safe. However, the rotation in rotateIfNeeded() has a TOCTOU race: both processes could check size, both decide to rotate, one renames successfully, the other's rename fails (source gone). The try/catch handles this gracefully -- at most one entry is lost. The comment should be updated to reflect the dual-writer reality.
-
-**Related files:** src/routing-logger.ts, src/mcp-tools.ts, src/telegram-client.ts

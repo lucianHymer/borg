@@ -1,5 +1,0 @@
-# Three-layer workflow abstraction: generic skills, Borg bridge, native fallback
-
-Workflow skills use a three-layer abstraction: (1) Generic workflow skills in project .claude/skills/workflows/ — describe roles, coordination patterns, who goes first using natural language, NO tool-specific references (say "create a thread" not "create_thread MCP tool"). These are portable and work with any team infrastructure. (2) Borg team bridge skill (~/.claude/skills/borg-teams.md) — the ONE globally-installed Borg-specific piece. Maps generic team concepts to Borg MCP tools (create_thread, send_message, etc.). (3) Claude Code native fallback — same workflows work without Borg, agent just implements "create a thread" differently. Dev team workflow has 4 roles: Planner, Worker, Reviewer, Documenter. The Documenter interviews teammates after work is done, captures learnings into CLAUDE.md (kept tight and token-efficient since every line costs tokens in every future session), and trims stale entries.
-
-**Related files:** docs/plans/2026-03-05-feat-collaborative-agent-teams-infrastructure-plan.md
