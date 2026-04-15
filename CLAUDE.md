@@ -100,9 +100,3 @@ The `init` service runs automatically before other containers, creating zone dir
 ## Wiki
 
 @wiki/index.md
-
-
-## Mim Knowledge
-
-@.claude/knowledge/INSTRUCTIONS.md
-@.claude/knowledge/KNOWLEDGE_MAP_CLAUDE.md
