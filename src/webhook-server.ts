@@ -44,6 +44,7 @@ interface WebhookConfig {
     formatter: string;         // "github" | "raw"
     eventFilter?: string[];    // e.g. ["issues", "pull_request"]
     labelFilter?: string[];    // e.g. ["agent:triage"] — only deliver if issue/PR has a matching label
+    ignoreSenders?: string[];  // e.g. ["human-bot[bot]"] — drop events from these sender logins
     ntfy?: { topic: string; debounceMs?: number };
     createdAt: number;
 }
@@ -355,7 +356,7 @@ app.get("/api/webhooks/list", requireToken, (_req, res) => {
 app.post("/api/webhooks/create", requireToken, (req, res) => {
     const ALLOWED_HMAC_ALGORITHMS = ["sha256", "sha1", "sha512"];
     const ALLOWED_FORMATTERS = Object.keys(formatters);
-    const { name, signatureHeader, hmacAlgorithm, threadId, formatter, eventFilter, labelFilter, ntfy, ntfyTopic, ntfyDebounceMs, requireSignature: reqSig } = req.body || {};
+    const { name, signatureHeader, hmacAlgorithm, threadId, formatter, eventFilter, labelFilter, ignoreSenders, ntfy, ntfyTopic, ntfyDebounceMs, requireSignature: reqSig } = req.body || {};
     const requireSig = reqSig !== false; // default true
     if (!name || typeof name !== "string") {
         res.status(400).json({ error: "name is required" });
@@ -381,6 +382,10 @@ app.post("/api/webhooks/create", requireToken, (req, res) => {
         res.status(400).json({ error: "labelFilter must be an array of strings" });
         return;
     }
+    if (ignoreSenders && (!Array.isArray(ignoreSenders) || !ignoreSenders.every((e: unknown) => typeof e === "string"))) {
+        res.status(400).json({ error: "ignoreSenders must be an array of strings" });
+        return;
+    }
 
     const id = "wh_" + crypto.randomBytes(4).toString("hex");
     const secret = requireSig ? crypto.randomBytes(32).toString("hex") : "";
@@ -397,6 +402,7 @@ app.post("/api/webhooks/create", requireToken, (req, res) => {
         ...(threadId != null ? { threadId } : {}),
         ...(eventFilter ? { eventFilter } : {}),
         ...(labelFilter ? { labelFilter } : {}),
+        ...(ignoreSenders ? { ignoreSenders } : {}),
         ...(ntfy ? { ntfy } : ntfyTopic ? { ntfy: { topic: ntfyTopic, ...(ntfyDebounceMs ? { debounceMs: ntfyDebounceMs } : {}) } } : {}),
     };
 
@@ -417,7 +423,7 @@ app.put("/api/webhooks/:id/update", requireToken, (req: express.Request<{ id: st
         return;
     }
 
-    const { name, threadId, ntfy, ntfyTopic, ntfyDebounceMs, formatter, eventFilter, labelFilter } = req.body || {};
+    const { name, threadId, ntfy, ntfyTopic, ntfyDebounceMs, formatter, eventFilter, labelFilter, ignoreSenders } = req.body || {};
     if (name !== undefined) existing.name = name;
     if (threadId !== undefined) existing.threadId = threadId;
     if (ntfy !== undefined) existing.ntfy = ntfy;
@@ -425,6 +431,7 @@ app.put("/api/webhooks/:id/update", requireToken, (req: express.Request<{ id: st
     if (formatter !== undefined) existing.formatter = formatter;
     if (eventFilter !== undefined) existing.eventFilter = eventFilter;
     if (labelFilter !== undefined) existing.labelFilter = labelFilter;
+    if (ignoreSenders !== undefined) existing.ignoreSenders = ignoreSenders;
 
     webhooks[req.params.id] = existing;
     writeWebhooks(webhooks);
@@ -510,6 +517,15 @@ app.post("/api/webhooks/:id", (req: express.Request<{ id: string }> & { rawBody?
         const hasMatch = config.labelFilter.some(f => labels.includes(f));
         if (!hasMatch) {
             res.status(200).json({ filtered: true, reason: "label" });
+            return;
+        }
+    }
+
+    // Sender filtering — drop events from ignored senders (e.g. the bot's own GitHub App)
+    if (config.ignoreSenders && config.ignoreSenders.length > 0) {
+        const senderLogin = (req.body as { sender?: { login?: string } })?.sender?.login;
+        if (senderLogin && config.ignoreSenders.includes(senderLogin)) {
+            res.status(200).json({ filtered: true, reason: "sender" });
             return;
         }
     }
