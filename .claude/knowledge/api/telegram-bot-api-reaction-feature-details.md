@@ -1,5 +1,0 @@
-# Telegram Bot API Reaction Feature Details
-
-MessageReactionUpdated has 7 fields: chat, message_id, date, old_reaction, new_reaction, user (optional), actor_chat (optional). Does NOT include message_thread_id — to determine which thread a reaction belongs to, you must look up the message_id in your own message history. The allowed_updates values are "message_reaction" (per-user) and "message_reaction_count" (anonymous/aggregated). Bots do NOT receive updates for reactions set by bots (including self). setMessageReaction accepts chat_id, message_id, reaction (array of ReactionType), is_big (bool). Non-premium bots limited to 1 reaction per message. Bots can't use paid reactions. Service messages can't be reacted to. 79 valid emoji reactions exist as of Bot API 9.0. Custom emoji reactions require either prior presence on the message or explicit admin allowance.
-
-**Related files:** src/telegram-client.ts

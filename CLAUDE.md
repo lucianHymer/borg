@@ -8,11 +8,10 @@ Compound knowledge into repos. The repo should get smarter over time — workflo
 
 ## Architecture
 
-- **Telegram Client** (`src/telegram-client.ts`) — grammY bot handling all forum topics, I/O and routing log finalization
+- **Telegram Client** (`src/telegram-client.ts`) — grammY bot handling all forum topics, I/O
 - **Queue Processor** (`src/queue-processor.ts`) — SDK v2 sessions, sticky model, history injection
 - **Session Manager** (`src/session-manager.ts`) — threadId → session lifecycle, threads.json
 - **Message History** (`src/message-history.ts`) — shared JSONL log, tagged by threadId; carries optional token usage + cost fields on outgoing entries
-- **Routing Logger** (`src/routing-logger.ts`) — JSONL log of routing decisions
 - **Zone Config** (`src/zone-config.ts`) — zone-config.json loader, validation, mtime caching
 
 ## Security Zones
@@ -98,7 +97,6 @@ docker compose up    # Start infra + core + perimeter containers
 The `init` service runs automatically before other containers, creating zone directories, config files, and migrating data from old single-container `.borg/` if present. No manual `init-zones.sh` run needed.
 
 
-## Mim Knowledge
+## Wiki
 
-@.claude/knowledge/INSTRUCTIONS.md
-@.claude/knowledge/KNOWLEDGE_MAP_CLAUDE.md
+@wiki/index.md

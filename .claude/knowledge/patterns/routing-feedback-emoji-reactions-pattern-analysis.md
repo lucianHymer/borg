@@ -1,5 +1,0 @@
-# Routing feedback emoji reactions pattern analysis
-
-Pattern analysis of routing feedback feature identified 3 HIGH severity duplications: (1) readRecentJsonl fully duplicated between dashboard.ts and mcp-tools.ts, (2) corrections merge logic triplicated across dashboard.ts, mcp-tools.ts, and dashboard.html, (3) lookupMessageModel with divergent implementations (cached in telegram-client.ts, uncached in mcp-tools.ts). Also found RoutingMetadataInput identical to RoutingMetadata (should be consolidated), model name strings in 7+ locations (needs canonical constant), and Zod schemas (LogEntrySchema, CorrectionEntrySchema) exported but never used for validation. Recommended extraction to src/routing-utils.ts for shared JSONL reading and merge logic.
-
-**Related files:** src/mcp-tools.ts, src/dashboard.ts, src/telegram-client.ts, src/routing-logger.ts, src/types.ts
