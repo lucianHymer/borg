@@ -68,7 +68,7 @@ Queue messages carry a `source` field: `"user"`, `"cross-thread"`, `"heartbeat"`
 
 ## Model Selection
 
-Sticky per-thread model — each thread uses its configured model for all messages (`threadConfig.model`). Default: `sonnet[1m]`. Change via `/model <haiku|sonnet|opus>` (also resets the session to maximize prompt cache hits). The `[1m]` suffix enables 1M context window. Effort defaults to `medium`; include "ultrathink" in a message for `max` (opus) or `high` (sonnet). Heartbeats are always haiku one-shot sessions (no resume, no cache sharing with the main thread).
+Sticky per-thread model — each thread uses its configured model for all messages (`threadConfig.model`). Default: `sonnet[1m]`. Change via `/model <haiku|sonnet|opus>` (also resets the session to maximize prompt cache hits). The `[1m]` suffix enables 1M context window. Effort defaults to `xhigh` (opus 4.7 only; falls back to `high` on other models); include "ultrathink" in a message for `max` (opus) or `high` (sonnet). Heartbeats are always haiku one-shot sessions (no resume, no cache sharing with the main thread).
 
 ## Scheduled Tasks
 
@@ -100,3 +100,9 @@ The `init` service runs automatically before other containers, creating zone dir
 ## Wiki
 
 @wiki/index.md
+
+
+## Mim Knowledge
+
+@.claude/knowledge/INSTRUCTIONS.md
+@.claude/knowledge/KNOWLEDGE_MAP_CLAUDE.md

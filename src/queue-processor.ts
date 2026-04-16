@@ -683,9 +683,9 @@ async function buildQueryOptions(
     // Update task-lists mapping so telegram-client can find which threads use which task list
     updateTaskListMapping(threadId, taskListId, threadConfig.team);
 
-    // Effort: default medium, "ultrathink" in message bumps to max (opus) or high (sonnet)
+    // Effort: default xhigh, "ultrathink" in message bumps to max (opus) or high (sonnet)
     const isUltrathink = messageText ? /\bultrathink\b/i.test(messageText) : false;
-    let effort: "low" | "medium" | "high" | "max" = "medium";
+    let effort: "low" | "medium" | "high" | "xhigh" | "max" = "xhigh";
     if (isUltrathink) {
         effort = effectiveModel.includes("opus") ? "max" : "high";
     }
@@ -1403,6 +1403,7 @@ async function processHeartbeat(msg: IncomingMessage): Promise<{ text: string; u
         prompt: heartbeatPrompt,
         options: {
             model: heartbeatModel,
+            effort: "medium",
             cwd: threadConfig.cwd,
             canUseTool: sdkCanUseTool,
             settingSources: ["project", "user"],
@@ -1471,7 +1472,7 @@ async function processScheduledTask(task: ScheduledTask): Promise<{ text: string
         prompt: task.prompt,
         options: {
             model: taskModel,
-            effort: "medium",
+            effort: "xhigh",
             cwd: task.cwd,
             canUseTool: sdkCanUseTool,
             settingSources: ["project", "user"],
@@ -1539,7 +1540,7 @@ async function processOneShot(msg: IncomingMessage): Promise<{ text: string; mod
         prompt: msg.message,
         options: {
             model: effectiveModel,
-            effort: "medium",
+            effort: "xhigh",
             cwd,
             canUseTool: sdkCanUseTool,
             settingSources: ["project", "user"],
