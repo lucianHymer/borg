@@ -34,6 +34,13 @@ RUN npm run build
 # Remove devDependencies after compilation
 RUN npm prune --production
 
+# Remove the musl variant of the Claude Code native binary: node:22-slim is
+# glibc-based (Debian), but claude-agent-sdk >=0.2.116 resolves the musl
+# package first on Linux and fails to exec it. Deleting musl forces the
+# SDK's resolver to fall through to the glibc variant.
+RUN rm -rf /app/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64-musl \
+           /app/node_modules/@anthropic-ai/claude-agent-sdk-linux-arm64-musl
+
 # ── Runtime setup ────────────────────────────────────────────────────
 COPY entrypoint.sh heartbeat-cron.sh ./
 COPY scripts/ ./scripts/
