@@ -8,6 +8,8 @@ RUN npm ci
 
 # Build TypeScript
 COPY src/ src/
+COPY scripts/ scripts/
+COPY tsconfig.scripts.json ./
 RUN npm run build && npm prune --production
 
 # Copy static files

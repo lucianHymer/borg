@@ -187,7 +187,7 @@ services:
       - "-listenip=0.0.0.0"
       - "-allowfrom=0.0.0.0/0"
       - "-allowhealthcheck"
-      - "-allowGET=/v1\\..{1,2}/(containers/json.*|containers/[a-f0-9]+/(json|stats.*)|_ping)"
+      - "-allowGET=/v1\\..{1,2}/(containers/json.*|containers/[a-zA-Z0-9][a-zA-Z0-9_.-]*/(json|stats.*)|_ping)"
       - "-allowPOST=/v1\\..{1,2}/(containers/([a-f0-9]+/(update|start|stop)|create.*)|networks/.+/connect)"
       - "-allowDELETE=/v1\\..{1,2}/containers/[a-f0-9]+.*"
     volumes:
