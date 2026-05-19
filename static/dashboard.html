@@ -864,6 +864,7 @@ tr.clickable { cursor: pointer; }
       <select id="zone-filter-select" style="background:var(--bg-secondary);color:var(--text-primary);border:1px solid var(--border);border-radius:4px;padding:2px 6px;font-size:12px;">
         <option value="">All</option>
       </select>
+      <button id="create-zone-btn" onclick="window._openCreateZone()" style="margin-left:8px;background:var(--bg-secondary);color:var(--accent-green);border:1px solid var(--accent-green);border-radius:4px;padding:1px 8px;font-size:12px;cursor:pointer;font-family:inherit;">+ Zone</button>
       <span id="zone-pending-count" style="margin-left:12px;font-size:12px;color:var(--accent-yellow);display:none;"></span>
     </div>
     <table id="threads-table">
@@ -1079,6 +1080,32 @@ tr.clickable { cursor: pointer; }
           <button onclick="window._copyWebhookSecret()" style="position:absolute;top:6px;right:6px;background:var(--bg-secondary);border:1px solid var(--border);color:var(--text-secondary);border-radius:4px;padding:2px 8px;font-size:10px;cursor:pointer;font-family:inherit;">Copy</button>
         </div>
         <button onclick="window._closeSecretModal()" class="usage-period-btn" style="margin-top:16px;width:100%;padding:8px;">Done</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Create Zone modal -->
+  <div id="create-zone-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:1000;align-items:center;justify-content:center;">
+    <div style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;max-width:480px;width:90%;display:flex;flex-direction:column;overflow:hidden;">
+      <div style="display:flex;justify-content:space-between;align-items:center;padding:16px 20px;border-bottom:1px solid var(--border);">
+        <span style="font-weight:600;font-size:15px;">Create New Zone</span>
+        <button onclick="window._closeCreateZone()" style="background:none;border:none;color:var(--text-secondary);font-size:20px;cursor:pointer;padding:0;line-height:1;">×</button>
+      </div>
+      <div style="padding:16px 20px;">
+        <div style="margin-bottom:12px;">
+          <label style="display:block;font-size:11px;color:var(--text-secondary);margin-bottom:4px;text-transform:uppercase;letter-spacing:0.5px;">Zone Name</label>
+          <input id="cz-name" type="text" placeholder="my-zone" autocomplete="off" style="width:100%;background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-primary);padding:6px 10px;border-radius:4px;font-size:12px;font-family:inherit;">
+          <div id="cz-name-hint" style="font-size:10px;color:var(--text-secondary);margin-top:4px;">lowercase, a–z 0–9 -, 2–31 chars</div>
+        </div>
+        <div style="margin-bottom:12px;">
+          <label style="display:block;font-size:11px;color:var(--text-secondary);margin-bottom:4px;text-transform:uppercase;letter-spacing:0.5px;">Template</label>
+          <div id="cz-templates" style="display:flex;flex-direction:column;gap:6px;"></div>
+        </div>
+        <div id="cz-error" style="display:none;color:var(--accent-red,#ff6b6b);font-size:12px;margin-bottom:12px;"></div>
+        <div style="display:flex;gap:8px;justify-content:flex-end;">
+          <button onclick="window._closeCreateZone()" class="usage-period-btn" style="padding:6px 14px;">Cancel</button>
+          <button id="cz-create-btn" onclick="window._submitCreateZone()" class="usage-period-btn" style="padding:6px 14px;border-color:var(--accent-green);color:var(--accent-green);" disabled>Create</button>
+        </div>
       </div>
     </div>
   </div>
@@ -3031,6 +3058,111 @@ tr.clickable { cursor: pointer; }
       alert('Request failed: ' + e.message);
     }
   };
+
+  // ─── Create Zone modal ───
+
+  var _createZoneState = { templates: null, reservedNames: null, nameRegex: null };
+
+  window._openCreateZone = async function() {
+    // Lazy-load templates the first time
+    if (!_createZoneState.templates) {
+      try {
+        var resp = await fetch('/api/zone-templates');
+        if (!resp.ok) throw new Error('Failed to load templates');
+        var data = await resp.json();
+        _createZoneState.templates = data.templates;
+        _createZoneState.reservedNames = new Set(data.reservedNames);
+        _createZoneState.nameRegex = new RegExp(data.nameRegex);
+      } catch (err) {
+        alert('Could not load templates: ' + err.message);
+        return;
+      }
+    }
+    // Render template radios
+    var tplContainer = document.getElementById('cz-templates');
+    tplContainer.innerHTML = '';
+    var names = Object.keys(_createZoneState.templates);
+    names.forEach(function(tplName, idx) {
+      var desc = _createZoneState.templates[tplName].description || '';
+      var radioId = 'cz-tpl-' + tplName;
+      var wrap = document.createElement('label');
+      wrap.style.cssText = 'display:flex;align-items:flex-start;gap:8px;font-size:12px;color:var(--text-primary);cursor:pointer;padding:6px;border:1px solid var(--border);border-radius:4px;';
+      wrap.innerHTML = '<input type="radio" name="cz-template" value="' + escapeAttr(tplName) + '" id="' + radioId + '"' + (idx === 0 ? ' checked' : '') + ' style="margin-top:2px;">' +
+        '<div><div style="font-weight:600;">' + escapeHtml(tplName) + '</div>' +
+        '<div style="font-size:11px;color:var(--text-secondary);">' + escapeHtml(desc) + '</div></div>';
+      tplContainer.appendChild(wrap);
+    });
+    Array.from(document.getElementsByName('cz-template')).forEach(function(r) { r.onchange = _validateCreateZone; });
+    // Reset state
+    document.getElementById('cz-name').value = '';
+    document.getElementById('cz-error').style.display = 'none';
+    document.getElementById('cz-name').oninput = _validateCreateZone;
+    _validateCreateZone();
+    document.getElementById('create-zone-modal').style.display = 'flex';
+    setTimeout(function() { document.getElementById('cz-name').focus(); }, 0);
+  };
+
+  window._closeCreateZone = function() {
+    document.getElementById('create-zone-modal').style.display = 'none';
+  };
+
+  function _validateCreateZone() {
+    var name = document.getElementById('cz-name').value.trim();
+    var template = (document.querySelector('input[name="cz-template"]:checked') || {}).value;
+    var hint = document.getElementById('cz-name-hint');
+    var ok = true;
+    if (!name) { ok = false; hint.style.color = 'var(--text-secondary)'; }
+    else if (!_createZoneState.nameRegex.test(name)) { ok = false; hint.textContent = 'invalid format: lowercase, a–z 0–9 -, must start alphanumeric, 2–31 chars'; hint.style.color = 'var(--accent-red,#ff6b6b)'; }
+    else if (_createZoneState.reservedNames.has(name)) { ok = false; hint.textContent = 'reserved name'; hint.style.color = 'var(--accent-red,#ff6b6b)'; }
+    else { hint.textContent = 'lowercase, a–z 0–9 -, 2–31 chars'; hint.style.color = 'var(--text-secondary)'; }
+    if (!template) ok = false;
+    document.getElementById('cz-create-btn').disabled = !ok;
+  }
+
+  window._submitCreateZone = async function() {
+    var name = document.getElementById('cz-name').value.trim();
+    var template = (document.querySelector('input[name="cz-template"]:checked') || {}).value;
+    if (!name || !template) return;
+    var btn = document.getElementById('cz-create-btn');
+    var err = document.getElementById('cz-error');
+    err.style.display = 'none';
+    btn.disabled = true;
+    var origText = btn.textContent;
+    btn.textContent = 'Creating…';
+    try {
+      var resp = await fetch('/api/zones', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: name, template: template }),
+      });
+      var body = await resp.json().catch(function() { return {}; });
+      if (!resp.ok) {
+        err.textContent = (body.error || ('HTTP ' + resp.status)) + (body.step ? ' (step: ' + body.step + ')' : '');
+        err.style.display = 'block';
+        btn.disabled = false;
+        btn.textContent = origText;
+        return;
+      }
+      // Success — close + refresh
+      window._closeCreateZone();
+      if (typeof fetchOverview === 'function') fetchOverview();
+    } catch (e) {
+      err.textContent = e.message;
+      err.style.display = 'block';
+      btn.disabled = false;
+      btn.textContent = origText;
+    }
+  };
+
+  // Close on background click + ESC
+  document.getElementById('create-zone-modal').addEventListener('click', function(e) {
+    if (e.target.id === 'create-zone-modal') window._closeCreateZone();
+  });
+  document.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape' && document.getElementById('create-zone-modal').style.display === 'flex') {
+      window._closeCreateZone();
+    }
+  });
 
   // ─── View: Usage ───
 
