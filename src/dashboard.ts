@@ -959,6 +959,10 @@ app.post("/api/zones", async (req, res) => {
             });
             return;
         }
+        if (SYSTEM_ZONE_NAMES.has(name)) {
+            res.status(400).json({ error: "Cannot create system zone", step: "validate" });
+            return;
+        }
         if (RESERVED_ZONE_NAMES.has(name)) {
             res.status(400).json({
                 error: `Zone name "${name}" is reserved`,
@@ -968,6 +972,18 @@ app.post("/api/zones", async (req, res) => {
         }
         if (!template) {
             res.status(400).json({ error: "Missing template", step: "validate" });
+            return;
+        }
+
+        // Validate template existence pre-lock (cheap; avoids lock + rollback path)
+        try {
+            const templates = loadZoneTemplates(ZONE_TEMPLATES_PATH);
+            if (!(template in templates)) {
+                res.status(400).json({ error: `Unknown template "${template}"`, step: "validate" });
+                return;
+            }
+        } catch (err) {
+            res.status(500).json({ error: toErrorMessage(err), step: "load-templates" });
             return;
         }
 
@@ -1026,6 +1042,18 @@ app.post("/api/zones", async (req, res) => {
                 zoneDirCreated = true;
             } catch (err) {
                 throw new Error(`Failed to create zone "${name}" at step "create-zone-dir": ${toErrorMessage(err)}`);
+            }
+
+            // 6b. Sync skills/global/ → claude-skills/ (mirror init-zones.sh L147-149)
+            const skillsGlobalDir = path.join(SCRIPT_DIR, "skills", "global");
+            const zoneSkillsDir = path.join(BORG_ZONES_DIR, name, "claude-skills");
+            if (fs.existsSync(skillsGlobalDir)) {
+                try {
+                    fs.cpSync(skillsGlobalDir, zoneSkillsDir, { recursive: true });
+                } catch (err) {
+                    // Best-effort — log and continue. Mirrors init-zones.sh's `|| true`.
+                    console.warn(`[dashboard] Failed to sync skills/global → ${zoneSkillsDir}: ${toErrorMessage(err)}`);
+                }
             }
 
             // 7. Create workspace dir (AD7)
