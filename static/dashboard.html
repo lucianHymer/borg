@@ -1483,14 +1483,23 @@ tr.clickable { cursor: pointer; }
 
   var _availableZones = []; // populated from /api/zones
 
+  function zoneColor(name) {
+    if (name === 'core') return 'var(--accent-green)';
+    if (name === 'perimeter') return 'var(--accent-yellow)';
+    var h = 0;
+    for (var i = 0; i < name.length; i++) {
+      h = ((h << 5) - h + name.charCodeAt(i)) | 0;
+    }
+    return 'hsl(' + (Math.abs(h) % 360) + ', 60%, 55%)';
+  }
+
   function zoneBadge(zone, threadId) {
     if (!zone) {
       return '<span class="zone-badge" style="color:var(--text-secondary);cursor:pointer;font-size:11px;" ' +
         'data-thread-id="' + escapeHtml(String(threadId)) + '" data-zone="" ' +
         'title="Click to assign zone">—</span>';
     }
-    var colors = { core: 'var(--accent-green)', perimeter: 'var(--accent-yellow)' };
-    var color = colors[zone] || 'var(--text-secondary)';
+    var color = zoneColor(zone);
     return '<span class="badge zone-badge" style="background:' + color + ';color:#000;font-size:10px;cursor:pointer;" ' +
       'data-thread-id="' + escapeHtml(String(threadId)) + '" data-zone="' + escapeHtml(zone) + '" ' +
       'title="Click to change zone">' + escapeHtml(zone) + '</span>';
