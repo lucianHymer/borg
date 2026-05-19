@@ -1,10 +1,40 @@
 services:
   # ── Init: ensure zone directories, config files, and migrations ──
+  # Uses the dashboard image so the compiled TS supervisor
+  # (dist/scripts/ensure-zone-containers.js) is available alongside
+  # scripts/init-zones.sh.
   init:
-    image: node:22-slim
+    build:
+      context: .
+      dockerfile: Dockerfile.dashboard
+    depends_on:
+      docker-proxy:
+        condition: service_healthy
     volumes:
-      - .:/project
-    entrypoint: ["bash", "/project/scripts/init-zones.sh", "/project"]
+      - ./.borg-zones:/app/.borg-zones
+      - ./.borg-infra:/app/.borg-infra
+      - ./threads.json:/app/threads.json
+      - ./zone-config.json:/app/zone-config.json
+      - ./zone-templates.json:/app/zone-templates.json:ro
+      - ./settings.json:/app/settings.json
+      - ./zone-config.example.json:/app/zone-config.example.json:ro
+      - ./scripts:/app/scripts:ro
+      - ./skills:/app/skills:ro
+      - ${WORKSPACE_HOST_BASE}:/host-workspaces
+      - ${CLAUDE_CREDENTIALS}:/home/node/.claude/.credentials.json:ro
+    environment:
+      - BORG_REPO_ROOT=${BORG_REPO_ROOT}
+      - WORKSPACE_HOST_BASE=${WORKSPACE_HOST_BASE}
+      - WORKSPACE_ROOT=${WORKSPACE_ROOT}
+      - BROKER_SECRET=${BROKER_SECRET}
+      - PUBLIC_HOST=${PUBLIC_HOST}
+      - CLAUDE_CREDENTIALS=${CLAUDE_CREDENTIALS}
+      - DOCKER_PROXY_URL=http://docker-proxy:2375/v1.47
+      - ZONE_CONFIG_PATH=/app/zone-config.json
+      - ZONE_TEMPLATES_PATH=/app/zone-templates.json
+    entrypoint: ["bash", "-c", "bash /app/scripts/init-zones.sh /app && node /app/dist/scripts/ensure-zone-containers.js"]
+    networks:
+      - internal
     restart: "no"
 
   broker:
@@ -46,12 +76,11 @@ services:
     volumes:
       - ./.borg-infra:/app/.borg-infra
       - ./.borg-infra:/app/.borg
-      - ./.borg-core:/app/.borg-core
-      - ./.borg-perimeter:/app/.borg-perimeter
+      - ./.borg-zones:/app/.borg-zones
       - ./threads.json:/app/threads.json
       - ./zone-config.json:/app/zone-config.json
+      - ./zone-templates.json:/app/zone-templates.json:ro
       - ./settings.json:/app/settings.json
-      - ${WORKSPACE_ROOT}:${WORKSPACE_ROOT}:ro
       - ${CLAUDE_CREDENTIALS}:/home/node/.claude/.credentials.json:ro
     environment:
       - NODE_ENV=production
@@ -66,6 +95,7 @@ services:
 
   # ── Core: agent SDK sessions for trusted threads ──
   core:
+    image: borg-agent:latest
     build: .
     restart: on-failure
     init: true
@@ -78,18 +108,18 @@ services:
       infra:
         condition: service_started
     volumes:
-      - ./.borg-core:/app/.borg
+      - ./.borg-zones/core:/app/.borg
       - ./threads.json:/app/threads.json
       - ./zone-config.json:/app/zone-config.json
       - ./settings.json:/app/settings.json
-      # Workspace access
-      - ${WORKSPACE_ROOT}:${WORKSPACE_ROOT}
+      # Workspace access (AD7: per-zone host workspace)
+      - ${WORKSPACE_HOST_BASE}/workspace-core:${WORKSPACE_ROOT}
       # Credentials
       - ./secrets/github-installations.json:/secrets/github-installations.json:ro
       - ${CLAUDE_CREDENTIALS}:/home/node/.claude/.credentials.json
-      - ./.borg-core/claude-skills:/home/node/.claude/skills
+      - ./.borg-zones/core/claude-skills:/home/node/.claude/skills
       - claude-plugins-core:/home/node/.claude/plugins
-      - ./.borg-core/claude-settings.json:/home/node/.claude/settings.json
+      - ./.borg-zones/core/claude-settings.json:/home/node/.claude/settings.json
     environment:
       - NODE_ENV=production
       - BORG_ZONE=core
@@ -109,6 +139,7 @@ services:
 
   # ── Perimeter: agent SDK sessions for untrusted threads ──
   perimeter:
+    image: borg-agent:latest
     build: .
     restart: on-failure
     init: true
@@ -121,18 +152,18 @@ services:
       infra:
         condition: service_started
     volumes:
-      - ./.borg-perimeter:/app/.borg
+      - ./.borg-zones/perimeter:/app/.borg
       - ./threads.json:/app/threads.json
       - ./zone-config.json:/app/zone-config.json
       - ./settings.json:/app/settings.json
-      # Workspace access (sandboxed by Claude Code)
-      - ${WORKSPACE_ROOT}:${WORKSPACE_ROOT}
+      # Workspace access (AD7: per-zone host workspace, isolated from core)
+      - ${WORKSPACE_HOST_BASE}/workspace-perimeter:${WORKSPACE_ROOT}
       # Credentials (limited)
       - ./secrets/github-installations.json:/secrets/github-installations.json:ro
       - ${CLAUDE_CREDENTIALS}:/home/node/.claude/.credentials.json
-      - ./.borg-perimeter/claude-skills:/home/node/.claude/skills
+      - ./.borg-zones/perimeter/claude-skills:/home/node/.claude/skills
       - claude-plugins-perimeter:/home/node/.claude/plugins
-      - ./.borg-perimeter/claude-settings.json:/home/node/.claude/settings.json
+      - ./.borg-zones/perimeter/claude-settings.json:/home/node/.claude/settings.json
       # NO SSH keys, NO docker-proxy access
     environment:
       - NODE_ENV=production
@@ -157,7 +188,7 @@ services:
       - "-allowfrom=0.0.0.0/0"
       - "-allowhealthcheck"
       - "-allowGET=/v1\\..{1,2}/(containers/json.*|containers/[a-f0-9]+/(json|stats.*)|_ping)"
-      - "-allowPOST=/v1\\..{1,2}/containers/([a-f0-9]+/(update|start|stop)|create.*)"
+      - "-allowPOST=/v1\\..{1,2}/(containers/([a-f0-9]+/(update|start|stop)|create.*)|networks/.+/connect)"
       - "-allowDELETE=/v1\\..{1,2}/containers/[a-f0-9]+.*"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
@@ -187,22 +218,30 @@ services:
       docker-proxy:
         condition: service_healthy
     volumes:
-      - ./.borg-core:/app/.borg:ro
-      - ./.borg-core:/app/.borg-core:ro
-      - ./.borg-perimeter:/app/.borg-perimeter:ro
+      # Primary view (core's .borg) — preserves single-zone code paths during migration
+      - ./.borg-zones/core:/app/.borg:ro
+      # Parent ro mount — used by dashboard for reading all zones
+      - ./.borg-zones:/app/.borg-zones:ro
+      # Parent rw mount — used ONLY for writing task-stop signals (Option B, AD plan)
+      - ./.borg-zones:/app/.borg-zones-rw
       - ./.borg-infra:/app/.borg-infra:ro
-      # rw mounts for background task stop signals (dashboard writes, queue-processor reads)
-      - ./.borg-core/queue/task-stop:/app/.borg-core/queue/task-stop
-      - ./.borg-perimeter/queue/task-stop:/app/.borg-perimeter/queue/task-stop
       - ./threads.json:/app/threads.json:ro
       - ./zone-config.json:/app/zone-config.json:ro
       - ./settings.json:/app/settings.json:ro
-      - ${WORKSPACE_ROOT:-/home/lucian/workspace}:/home/lucian/workspace:ro
+      # Workspace browsing: host workspaces parent (rw so dashboard can mkdir per-zone workspaces on create)
+      - ${WORKSPACE_HOST_BASE}:/host-workspaces
     ports:
       - "127.0.0.1:3100:3100"
     environment:
       - DOCKER_PROXY_URL=http://docker-proxy:2375/v1.47
       - COMPOSE_PROJECT=${COMPOSE_PROJECT_NAME:-borg}
+      - WORKSPACE_HOST_BASE=${WORKSPACE_HOST_BASE}
+      - WORKSPACE_ROOT=${WORKSPACE_ROOT}
+      - BROKER_SECRET=${BROKER_SECRET}
+      - PUBLIC_HOST=${PUBLIC_HOST}
+      - CLAUDE_CREDENTIALS=${CLAUDE_CREDENTIALS}
+      - BORG_REPO_ROOT=${BORG_REPO_ROOT}
+      - TASK_STOP_BASE=/app/.borg-zones-rw
     networks:
       - internal
     healthcheck:
