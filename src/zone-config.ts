@@ -13,7 +13,10 @@ import { writeJsonFileSafe } from "./types.js";
 export const ZoneConfigSchema = z.object({
     zones: z.record(
         z.string(), // zone name (e.g. "core", "perimeter")
-        z.object({ threads: z.array(z.number().int().positive()) }),
+        z.object({
+            threads: z.array(z.number().int().positive()),
+            template: z.enum(["trusted", "untrusted"]).optional(),
+        }),
     ),
     defaults: z.object({
         newThread: z.string(),

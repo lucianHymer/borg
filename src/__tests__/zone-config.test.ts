@@ -320,3 +320,72 @@ describe("thread lifecycle zone management", () => {
         expect(isSameZone(config, 600, 1)).toBe(false);    // different zone from core
     });
 });
+
+describe("template field (AD8/AD4)", () => {
+    it("parses zone with template field", () => {
+        const config: ZoneConfig = {
+            zones: {
+                core: { threads: [1], template: "trusted" },
+                perimeter: { threads: [], template: "untrusted" },
+            },
+            defaults: { newThread: "perimeter" },
+        };
+        writeConfig(config);
+        const loaded = loadZoneConfig(CONFIG_PATH);
+        expect(loaded).not.toBeNull();
+        expect(loaded!.zones.core.template).toBe("trusted");
+        expect(loaded!.zones.perimeter.template).toBe("untrusted");
+    });
+
+    it("parses zone WITHOUT template field (backwards compat)", () => {
+        // Legacy config — no template field at all
+        const legacy = {
+            zones: {
+                core: { threads: [1, 43, 58] },
+                perimeter: { threads: [100, 200] },
+            },
+            defaults: { newThread: "perimeter" },
+        };
+        fs.writeFileSync(CONFIG_PATH, JSON.stringify(legacy, null, 2));
+        const loaded = loadZoneConfig(CONFIG_PATH);
+        expect(loaded).not.toBeNull();
+        expect(loaded!.zones.core.template).toBeUndefined();
+        expect(loaded!.zones.perimeter.template).toBeUndefined();
+    });
+
+    it("rejects invalid template value", () => {
+        const bad = {
+            zones: {
+                core: { threads: [1], template: "garbage" },
+                perimeter: { threads: [] },
+            },
+            defaults: { newThread: "perimeter" },
+        };
+        fs.writeFileSync(CONFIG_PATH, JSON.stringify(bad, null, 2));
+        let caught: Error | null = null;
+        try {
+            loadZoneConfig(CONFIG_PATH);
+        } catch (err) {
+            caught = err as Error;
+        }
+        expect(caught).not.toBeNull();
+        expect(caught!.message.toLowerCase()).toContain("template");
+    });
+
+    it("accepts mixed-template configs (some zones with, some without)", () => {
+        const mixed = {
+            zones: {
+                core: { threads: [1], template: "trusted" },
+                perimeter: { threads: [100] }, // no template
+                dmz: { threads: [], template: "untrusted" },
+            },
+            defaults: { newThread: "perimeter" },
+        };
+        fs.writeFileSync(CONFIG_PATH, JSON.stringify(mixed, null, 2));
+        const loaded = loadZoneConfig(CONFIG_PATH);
+        expect(loaded).not.toBeNull();
+        expect(loaded!.zones.core.template).toBe("trusted");
+        expect(loaded!.zones.perimeter.template).toBeUndefined();
+        expect(loaded!.zones.dmz.template).toBe("untrusted");
+    });
+});
