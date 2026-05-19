@@ -861,7 +861,7 @@ tr.clickable { cursor: pointer; }
     <h3>Active Threads</h3>
     <div id="zone-filter" style="margin-bottom:8px;display:none;">
       <label style="font-size:12px;color:var(--text-secondary);">Zone: </label>
-      <select id="zone-filter-select" style="background:var(--bg-card);color:var(--text-primary);border:1px solid var(--border);border-radius:4px;padding:2px 6px;font-size:12px;">
+      <select id="zone-filter-select" style="background:var(--bg-secondary);color:var(--text-primary);border:1px solid var(--border);border-radius:4px;padding:2px 6px;font-size:12px;">
         <option value="">All</option>
       </select>
       <span id="zone-pending-count" style="margin-left:12px;font-size:12px;color:var(--accent-yellow);display:none;"></span>
@@ -1477,7 +1477,7 @@ tr.clickable { cursor: pointer; }
     if (!team && !role) return '';
     var parts = [];
     if (team) parts.push('<span class="badge" style="background:var(--accent-blue);color:#000;font-size:10px;">' + escapeHtml(team) + '</span>');
-    if (role) parts.push('<span class="badge" style="background:var(--bg-alt);color:var(--text-secondary);font-size:10px;border:1px solid var(--border);">' + escapeHtml(role) + '</span>');
+    if (role) parts.push('<span class="badge" style="background:var(--bg-tertiary);color:var(--text-secondary);font-size:10px;border:1px solid var(--border);">' + escapeHtml(role) + '</span>');
     return parts.join(' ');
   }
 
@@ -1507,7 +1507,7 @@ tr.clickable { cursor: pointer; }
 
     var dropdown = document.createElement('div');
     dropdown.id = 'zone-dropdown';
-    dropdown.style.cssText = 'position:fixed;z-index:1000;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;padding:4px 0;box-shadow:0 4px 12px rgba(0,0,0,0.3);' +
+    dropdown.style.cssText = 'position:fixed;z-index:1000;background:var(--bg-secondary);border:1px solid var(--border);border-radius:6px;padding:4px 0;box-shadow:0 4px 12px rgba(0,0,0,0.3);' +
       'top:' + (rect.bottom + 4) + 'px;left:' + rect.left + 'px;min-width:100px;';
 
     _availableZones.forEach(function(z) {
@@ -1515,7 +1515,7 @@ tr.clickable { cursor: pointer; }
       item.textContent = z;
       item.style.cssText = 'padding:4px 12px;cursor:pointer;font-size:12px;color:var(--text-primary);';
       if (z === currentZone) item.style.color = 'var(--text-secondary)';
-      item.onmouseenter = function() { if (z !== currentZone) item.style.background = 'var(--bg-alt)'; };
+      item.onmouseenter = function() { if (z !== currentZone) item.style.background = 'var(--bg-tertiary)'; };
       item.onmouseleave = function() { item.style.background = ''; };
       item.onclick = function(e) {
         e.stopPropagation();
@@ -1540,7 +1540,7 @@ tr.clickable { cursor: pointer; }
       var removeItem = document.createElement('div');
       removeItem.textContent = 'Remove from zone';
       removeItem.style.cssText = 'padding:4px 12px;cursor:pointer;font-size:12px;color:var(--accent-red);';
-      removeItem.onmouseenter = function() { removeItem.style.background = 'var(--bg-alt)'; };
+      removeItem.onmouseenter = function() { removeItem.style.background = 'var(--bg-tertiary)'; };
       removeItem.onmouseleave = function() { removeItem.style.background = ''; };
       removeItem.onclick = function(e) {
         e.stopPropagation();
