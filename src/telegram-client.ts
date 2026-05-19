@@ -795,7 +795,16 @@ bot.command("do", async (ctx) => {
         oneshotModel: model,
     };
 
-    const incomingDir = resolveIncomingForThread(threadId);
+    let incomingDir: string;
+    try {
+        incomingDir = resolveIncomingForThread(threadId);
+    } catch (err) {
+        log("ERROR", `Failed to resolve incoming dir for /do in thread ${threadId}: ${toErrorMessage(err)}`);
+        await ctx.reply("Couldn't run /do — zone configuration is broken. Please contact the operator.", {
+            message_thread_id: getCtxThreadOpt(ctx),
+        });
+        return;
+    }
     fs.mkdirSync(incomingDir, { recursive: true });
     const queueFile = path.join(incomingDir, `telegram_${messageId}.json`);
     const tmpFile = queueFile + ".tmp";
@@ -956,7 +965,19 @@ function queueIncomingMessage(
     ctx: any,
     telegramMessageId: number,
 ): void {
-    const incomingDir = resolveIncomingForThread(threadId);
+    let incomingDir: string;
+    try {
+        incomingDir = resolveIncomingForThread(threadId);
+    } catch (err) {
+        log("ERROR", `Failed to resolve incoming dir for thread ${threadId}: ${toErrorMessage(err)}`);
+        // Best-effort user notification; if ctx.reply itself blows up, swallow.
+        try {
+            void ctx.reply("Couldn't queue your message — zone configuration is broken. Please contact the operator.", {
+                message_thread_id: getCtxThreadOpt(ctx),
+            });
+        } catch { /* nothing useful we can do */ }
+        return;
+    }
     fs.mkdirSync(incomingDir, { recursive: true });
     const queueFile = path.join(incomingDir, `telegram_${messageId}.json`);
     const tmpFile = queueFile + ".tmp";
@@ -1156,7 +1177,13 @@ bot.on("message:text").filter(
                 messageId,
             };
 
-            const broadcastIncoming = resolveIncomingForThread(threadId);
+            let broadcastIncoming: string;
+            try {
+                broadcastIncoming = resolveIncomingForThread(threadId);
+            } catch (err) {
+                log("ERROR", `Broadcast fan-out: failed to resolve incoming dir for thread ${threadId}: ${toErrorMessage(err)} — skipping`);
+                continue;
+            }
             fs.mkdirSync(broadcastIncoming, { recursive: true });
             const queueFile = path.join(broadcastIncoming, `broadcast_${messageId}.json`);
             const tmpFile = queueFile + ".tmp";
@@ -1662,7 +1689,18 @@ async function pollOutgoingQueue(): Promise<void> {
 
                     // Same zone: deliver to target zone's incoming queue, then fall through to display
                     const incomingId = data.messageId.replace(/_tg$/, "");
-                    const targetZone = zoneConfig ? getThreadZone(zoneConfig, data.targetThreadId) : "core";
+                    if (!zoneConfig) {
+                        // No silent fallback to "core" — that's how A5 silently mis-routed.
+                        // Skip this file; leave it on disk so the next poll cycle retries
+                        // once zone-config is readable again.
+                        log(
+                            "WARN",
+                            `Cross-thread same-zone delivery skipped for ${file}: zone-config.json is missing or unreadable. ` +
+                            `File left in queue for retry.`,
+                        );
+                        continue;
+                    }
+                    const targetZone = getThreadZone(zoneConfig, data.targetThreadId);
                     const targetIncoming = resolveZoneIncoming(targetZone);
 
                     const incoming = {
