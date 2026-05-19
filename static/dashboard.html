@@ -1110,6 +1110,21 @@ tr.clickable { cursor: pointer; }
     </div>
   </div>
 
+  <!-- Manage Zones modal -->
+  <div id="manage-zones-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:1000;align-items:center;justify-content:center;">
+    <div style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;max-width:640px;width:90%;max-height:80vh;display:flex;flex-direction:column;overflow:hidden;">
+      <div style="display:flex;justify-content:space-between;align-items:center;padding:16px 20px;border-bottom:1px solid var(--border);">
+        <span style="font-weight:600;font-size:15px;">Zones</span>
+        <button onclick="window._closeManageZones()" style="background:none;border:none;color:var(--text-secondary);font-size:20px;cursor:pointer;padding:0;line-height:1;">×</button>
+      </div>
+      <div id="mz-list" style="padding:8px 20px 16px 20px;overflow-y:auto;flex:1;"></div>
+      <div style="padding:12px 20px;border-top:1px solid var(--border);display:flex;justify-content:flex-end;gap:8px;">
+        <button onclick="window._closeManageZones()" class="usage-period-btn" style="padding:6px 14px;">Close</button>
+        <button onclick="window._closeManageZones(); window._openCreateZone();" class="usage-period-btn" style="padding:6px 14px;border-color:var(--accent-green);color:var(--accent-green);">+ Create new zone</button>
+      </div>
+    </div>
+  </div>
+
   <!-- View: Usage -->
   <div id="view-usage" class="view">
     <h2 style="margin-bottom:12px;">Token Usage & Cost</h2>
@@ -1591,6 +1606,22 @@ tr.clickable { cursor: pointer; }
       };
       dropdown.appendChild(removeItem);
     }
+
+    // Always-present "Manage zones…" entry
+    var manageSep = document.createElement('div');
+    manageSep.style.cssText = 'border-top:1px solid var(--border);margin:4px 0;';
+    dropdown.appendChild(manageSep);
+    var manageItem = document.createElement('div');
+    manageItem.textContent = 'Manage zones…';
+    manageItem.style.cssText = 'padding:4px 12px;cursor:pointer;font-size:12px;color:var(--text-secondary);';
+    manageItem.onmouseenter = function() { manageItem.style.background = 'var(--bg-tertiary)'; };
+    manageItem.onmouseleave = function() { manageItem.style.background = ''; };
+    manageItem.onclick = function(e) {
+      e.stopPropagation();
+      dropdown.remove();
+      window._openManageZones();
+    };
+    dropdown.appendChild(manageItem);
 
     document.body.appendChild(dropdown);
     // Close on outside click
@@ -3161,6 +3192,98 @@ tr.clickable { cursor: pointer; }
   document.addEventListener('keydown', function(e) {
     if (e.key === 'Escape' && document.getElementById('create-zone-modal').style.display === 'flex') {
       window._closeCreateZone();
+    }
+  });
+
+  // ─── Manage Zones modal ───
+
+  const SYSTEM_ZONES = new Set(['core', 'perimeter', 'infra']);
+
+  window._openManageZones = async function() {
+    document.getElementById('manage-zones-modal').style.display = 'flex';
+    await _renderManageZones();
+  };
+
+  window._closeManageZones = function() {
+    document.getElementById('manage-zones-modal').style.display = 'none';
+  };
+
+  async function _renderManageZones() {
+    var listEl = document.getElementById('mz-list');
+    listEl.innerHTML = '<div style="color:var(--text-secondary);font-size:12px;padding:12px 0;">Loading…</div>';
+    try {
+      var resp = await fetch('/api/zones');
+      if (!resp.ok) throw new Error('HTTP ' + resp.status);
+      var data = await resp.json();
+      if (!data.configured) {
+        listEl.innerHTML = '<div style="color:var(--text-secondary);font-size:12px;padding:12px 0;">Zone config not initialized yet. Create the first zone to bootstrap.</div>';
+        return;
+      }
+      var zones = data.config.zones || {};
+      var containerStatus = data.containerStatus || {};
+      var names = Object.keys(zones).sort(function(a, b) {
+        // System zones first, then alphabetical
+        var aSys = SYSTEM_ZONES.has(a), bSys = SYSTEM_ZONES.has(b);
+        if (aSys !== bSys) return aSys ? -1 : 1;
+        return a.localeCompare(b);
+      });
+      var html = '';
+      names.forEach(function(name) {
+        var info = zones[name] || {};
+        var threads = (info.threads || []).length;
+        var status = containerStatus[name] || 'unknown';
+        var isSystem = SYSTEM_ZONES.has(name);
+        var statusColor = (status === 'running' || status === 'managed-by-compose') ? 'var(--accent-green)'
+          : status === 'missing' ? 'var(--accent-red,#ff6b6b)'
+          : 'var(--accent-yellow)';
+        var statusText = status === 'managed-by-compose' ? 'running' : status;
+        var deleteBtn = '';
+        if (isSystem) {
+          deleteBtn = '<span style="color:var(--text-secondary);font-size:11px;">system</span>';
+        } else if (threads > 0) {
+          deleteBtn = '<button disabled title="Reassign ' + threads + ' thread' + (threads > 1 ? 's' : '') + ' first" style="background:none;border:1px solid var(--border);color:var(--text-secondary);border-radius:3px;padding:2px 8px;font-size:11px;cursor:not-allowed;font-family:inherit;">Delete</button>';
+        } else {
+          deleteBtn = '<button onclick="window._deleteZone(\'' + escapeAttr(name) + '\')" style="background:none;border:1px solid var(--accent-red,#ff6b6b);color:var(--accent-red,#ff6b6b);border-radius:3px;padding:2px 8px;font-size:11px;cursor:pointer;font-family:inherit;">Delete</button>';
+        }
+        html += '<div style="display:flex;align-items:center;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--border);">' +
+          '<div style="display:flex;align-items:center;gap:8px;">' +
+            '<span style="background:' + zoneColor(name) + ';color:#000;font-size:10px;padding:2px 6px;border-radius:3px;">' + escapeHtml(name) + '</span>' +
+            '<span style="font-size:11px;color:' + statusColor + ';">' + escapeHtml(statusText) + '</span>' +
+            (info.template ? '<span style="font-size:10px;color:var(--text-secondary);">tpl: ' + escapeHtml(info.template) + '</span>' : '') +
+            '<span style="font-size:10px;color:var(--text-secondary);">' + threads + ' thread' + (threads === 1 ? '' : 's') + '</span>' +
+          '</div>' +
+          deleteBtn +
+        '</div>';
+      });
+      listEl.innerHTML = html || '<div style="color:var(--text-secondary);font-size:12px;padding:12px 0;">No zones configured.</div>';
+    } catch (err) {
+      listEl.innerHTML = '<div style="color:var(--accent-red,#ff6b6b);font-size:12px;padding:12px 0;">Failed to load zones: ' + escapeHtml(err.message) + '</div>';
+    }
+  }
+
+  window._deleteZone = async function(name) {
+    if (!confirm('Delete zone "' + name + '"? Its directory will be archived under .borg-zones/.archived/.')) return;
+    try {
+      var resp = await fetch('/api/zones/' + encodeURIComponent(name), { method: 'DELETE' });
+      var body = await resp.json().catch(function() { return {}; });
+      if (!resp.ok) {
+        alert(body.error || ('HTTP ' + resp.status));
+        return;
+      }
+      await _renderManageZones();
+      if (typeof fetchOverview === 'function') fetchOverview();
+    } catch (e) {
+      alert('Failed: ' + e.message);
+    }
+  };
+
+  // Background click + ESC for manage modal
+  document.getElementById('manage-zones-modal').addEventListener('click', function(e) {
+    if (e.target.id === 'manage-zones-modal') window._closeManageZones();
+  });
+  document.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape' && document.getElementById('manage-zones-modal').style.display === 'flex') {
+      window._closeManageZones();
     }
   });
 
