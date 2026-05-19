@@ -156,6 +156,69 @@ Validation runs in the API endpoint AND in the create UI (defense in depth).
 
 No data is permanently destroyed. A future "purge" command could clear old archives.
 
+### AD7: Per-zone workspace via `${WORKSPACE_HOST_BASE}/workspace-${ZONE}`
+
+Today both `core` and `perimeter` mount `${WORKSPACE_ROOT}:${WORKSPACE_ROOT}` pass-through. Filesystem "isolation" is only Claude Code's in-process permission system — a harness-escaped agent in perimeter could read the entire workspace. AD7 makes isolation real at the Docker mount layer.
+
+**The shape:**
+- Each zone container mounts `${WORKSPACE_HOST_BASE}/workspace-${ZONE}` (host) → `${WORKSPACE_ROOT}` (container)
+- Inside any container, the path is always `${WORKSPACE_ROOT}` (= `/home/lucian/workspace`) — agents never see or need their zone name in cwd
+- Per-zone subdirs are bind-mount siblings on the host: `~/workspace-core/`, `~/workspace-perimeter/`, `~/workspace-foo/`
+- No `workspaces` schema field — path is deterministic from zone name. Simpler.
+
+**Env vars:**
+- New: `WORKSPACE_HOST_BASE` (default `/home/lucian`) — parent dir on the host where `workspace-{zone}/` subdirs live
+- Unchanged: `WORKSPACE_ROOT=/home/lucian/workspace` — canonical *inside-container* path, kept identical to current value so agents' muscle memory stays intact
+
+**Compose changes (static zones):**
+```yaml
+core:
+  - ${WORKSPACE_HOST_BASE}/workspace-core:${WORKSPACE_ROOT}      # CHANGED
+perimeter:
+  - ${WORKSPACE_HOST_BASE}/workspace-perimeter:${WORKSPACE_ROOT} # CHANGED
+```
+
+**Base spec (dynamic zones):**
+```json
+{ "type": "bind", "source": "${WORKSPACE_HOST_BASE}/workspace-{ZONE}", "target": "${WORKSPACE_ROOT}" }
+```
+Workspace mount is part of the **base** spec (every dynamic zone gets it), not per-template — there's no useful zone without a workspace, and templates are about credentials/network, not storage.
+
+**Who can write to `${WORKSPACE_HOST_BASE}`:**
+- **`init`** — rw mount, mkdirs `workspace-${zone}` + chowns 1000:1000 for each zone in zone-config, then exits
+- **`dashboard`** — rw mount, mkdirs + chowns when creating a new dynamic zone (must happen *before* Docker mounts it into the zone container, otherwise Docker auto-creates as root-owned and the agent can't write)
+- **Agent zone containers** — mount only their own subdir at `${WORKSPACE_ROOT}`; cannot see parent or sibling zones
+- **`infra`** — no workspace mount (unchanged)
+
+**Dashboard file viewer:**
+- Today mounts `${WORKSPACE_ROOT}:/home/lucian/workspace:ro`
+- Switches to `${WORKSPACE_HOST_BASE}:/host-workspaces:ro` (dual-purpose with the rw mount above — Docker honors the most permissive when paths overlap; we use the rw path for mkdirs and the ro symlink for serving)
+- Frontend file viewer gets a zone selector; defaults to the zone of the currently-viewed thread
+
+**Borg repo location:** Moves from `~/workspace/borg` → `~/workspace-core/borg`. Borg is just another repo core works on; "perimeter cannot edit borg's source" is correct posture. The compose project root moves with it; users `cd ~/workspace-core/borg && docker compose up -d`.
+
+**Migration (host-side, manual — one-time, BEFORE `docker compose up`):**
+```bash
+mv ~/workspace ~/workspace-core
+mkdir ~/workspace-perimeter
+sudo chown -R 1000:1000 ~/workspace-core ~/workspace-perimeter
+# borg repo is now at ~/workspace-core/borg
+cd ~/workspace-core/borg
+docker compose up -d
+```
+
+**Loud failure mode if skipped:** Docker auto-creates empty `~/workspace-core` (root-owned), agents see an empty workspace, repo edits fail with permission errors. Noisy and immediate. Document prominently at the top of the migration section.
+
+**Dynamic zone create flow extension:** Between zone-config write and container create, the dashboard:
+1. mkdir `${WORKSPACE_HOST_BASE}/workspace-${name}` via its rw mount
+2. chown 1000:1000 (the dashboard runs as a uid that can chown — verify; if not, use Node's `fs.chownSync` which requires CAP_CHOWN)
+3. Build container spec with workspace mount
+4. POST containers/create
+
+If the chown can't be done from the dashboard (uid restriction), fall back to spawning a one-shot helper container that does the chown — adds a Docker API call but keeps the dashboard's caps narrow. Decided at implementation time after probing the dashboard container's effective uid.
+
+**Trade-off accepted:** dashboard has rw on `${WORKSPACE_HOST_BASE}` (could in theory create `workspace-anything` or delete subdirs). This is bounded ambient authority on a directory the dashboard already needs to see read-only, and the dashboard is explicitly the "agentless human interface." Consistent with the broader sole-writer model. Per-zone workspace deletion is gated through the same delete flow that archives the zone directory.
+
 ---
 
 ## Detailed Design
@@ -286,7 +349,6 @@ New file `zone-templates.json` at repo root:
     "memory": "4G",
     "networks": ["internal", "dev"],
     "mounts": [
-      { "type": "bind", "source": "${WORKSPACE_ROOT}", "target": "${WORKSPACE_ROOT}" },
       { "type": "bind", "source": "./secrets/github-installations.json", "target": "/secrets/github-installations.json", "readonly": true },
       { "type": "bind", "source": "${CLAUDE_CREDENTIALS}", "target": "/home/node/.claude/.credentials.json" },
       { "type": "bind", "source": "./.borg-zones/{ZONE}/claude-skills", "target": "/home/node/.claude/skills" },
@@ -306,7 +368,6 @@ New file `zone-templates.json` at repo root:
     "memory": "1G",
     "networks": ["internal"],
     "mounts": [
-      { "type": "bind", "source": "${WORKSPACE_ROOT}", "target": "${WORKSPACE_ROOT}" },
       { "type": "bind", "source": "./secrets/github-installations.json", "target": "/secrets/github-installations.json", "readonly": true },
       { "type": "bind", "source": "${CLAUDE_CREDENTIALS}", "target": "/home/node/.claude/.credentials.json" },
       { "type": "bind", "source": "./.borg-zones/{ZONE}/claude-skills", "target": "/home/node/.claude/skills" },
@@ -335,6 +396,7 @@ New file `zone-templates.json` at repo root:
   "stop_grace_period": "30s",
   "mounts": [
     { "type": "bind", "source": "./.borg-zones/{ZONE}", "target": "/app/.borg" },
+    { "type": "bind", "source": "${WORKSPACE_HOST_BASE}/workspace-{ZONE}", "target": "${WORKSPACE_ROOT}" },
     { "type": "bind", "source": "./threads.json", "target": "/app/threads.json" },
     { "type": "bind", "source": "./zone-config.json", "target": "/app/zone-config.json" },
     { "type": "bind", "source": "./settings.json", "target": "/app/settings.json" }
@@ -634,13 +696,16 @@ A junior dev should be able to work through this in order.
 7. **`scripts/ensure-zone-containers.ts`** — new file. Invoked at end of `init-zones.sh`. Calls `ensureZoneContainersExist()`.
 8. **`docker-compose.yml`** — apply the diff from "Compose Changes":
    - `infra.volumes` — replace per-zone mounts with `.borg-zones` parent + `.borg-infra` + `zone-templates.json:ro`
-   - `core.volumes` — `.borg-zones/core:/app/.borg`
-   - `perimeter.volumes` — `.borg-zones/perimeter:/app/.borg`
-   - `dashboard.volumes` — `.borg-zones` parent ro + separate rw mount for task-stop + `.borg-infra` ro
+   - `core.volumes` — `.borg-zones/core:/app/.borg` + workspace becomes `${WORKSPACE_HOST_BASE}/workspace-core:${WORKSPACE_ROOT}` (AD7)
+   - `perimeter.volumes` — `.borg-zones/perimeter:/app/.borg` + workspace becomes `${WORKSPACE_HOST_BASE}/workspace-perimeter:${WORKSPACE_ROOT}` (AD7)
+   - `dashboard.volumes` — `.borg-zones` parent ro + separate rw mount for task-stop + `.borg-infra` ro + `${WORKSPACE_HOST_BASE}:/host-workspaces` (rw for zone-create, ro view for file browser)
+   - `dashboard.environment` — add `WORKSPACE_HOST_BASE`, `WORKSPACE_ROOT`, `BROKER_SECRET`, `PUBLIC_HOST`, `CLAUDE_CREDENTIALS` (needed for template placeholder resolution at zone-create time)
+   - `init.volumes` — add `${WORKSPACE_HOST_BASE}:/host-workspaces` (rw, for per-zone workspace dir creation)
    - `core` and `perimeter` services: add `image: borg-agent:latest` (alongside `build: .`)
    - Add `init` service step to invoke `scripts/ensure-zone-containers.ts` after the existing setup
 9. **`Dockerfile.infra`** — no changes expected. Sanity-check that path references aren't hardcoded.
 10. **`zone-config.example.json`** — bump to include `template` fields on `core` (trusted) and `perimeter` (untrusted). Default `newThread` stays `core`.
+10a. **`.env.example`** — add `WORKSPACE_HOST_BASE=/path/to/parent` with comment explaining per-zone workspace mounts. Update `WORKSPACE_ROOT` comment to clarify it's now the **container-internal** path, not the host path.
 
 ### Phase B — Dashboard backend
 
@@ -680,19 +745,74 @@ A junior dev should be able to work through this in order.
 
 For each existing Borg deployment:
 
-1. Pull the branch. Don't `docker compose up` yet.
-2. `docker compose down` — stops all containers.
-3. `docker compose up -d` — triggers the new `init` service:
-   - Detects `.borg-core/` + `.borg-perimeter/` at repo root + no `.borg-zones/` → renames into `.borg-zones/core` and `.borg-zones/perimeter`
-   - Creates any missing subdirs
-   - `chown -R 1000:1000` the new tree
-   - Calls `ensure-zone-containers.ts`, which sees zone-config.json contains only `core` and `perimeter` (both compose-managed) and exits no-op
-4. Verify in the dashboard that threads still appear in their zones.
-5. Drop the old `.borg-core/` / `.borg-perimeter/` after one successful run (they should already have been renamed, not copied — verify nothing's left behind).
+> **READ BEFORE `docker compose up`:** This migration has a **host-side step** (workspace rename) that cannot be automated by the init container. If you skip it, Docker will silently create empty workspace dirs as root-owned, agents will see an empty workspace, and any file edit will fail with EACCES. Do the host steps first.
 
-**Rollback:** Revert the branch, `docker compose down`, `mv .borg-zones/core .borg-core && mv .borg-zones/perimeter .borg-perimeter`, `docker compose up -d`. The rename is reversible because we didn't copy data.
+### Step 1 — Host-side (manual, one-time)
 
-**Live trading-ops thread (thread 1146):** Note in the rollout plan that this thread runs in core and must not have a forced stop. The compose `stop_grace_period: 30s` should be honored.
+```bash
+docker compose down
+
+# 1a. Workspace rename (AD7)
+mv ~/workspace ~/workspace-core
+mkdir ~/workspace-perimeter
+sudo chown -R 1000:1000 ~/workspace-core ~/workspace-perimeter
+
+# 1b. The borg repo now lives at ~/workspace-core/borg
+cd ~/workspace-core/borg
+
+# 1c. Add the new env var to .env
+echo 'WORKSPACE_HOST_BASE=/home/lucian' >> .env   # adjust path for your host
+```
+
+Verify before continuing:
+- `ls ~/workspace-core/borg/docker-compose.yml` shows the file
+- `ls -ld ~/workspace-core ~/workspace-perimeter` shows uid/gid `1000:1000`
+
+### Step 2 — Container-side (automated)
+
+```bash
+cd ~/workspace-core/borg
+docker compose pull   # or build, depending on your setup
+docker compose up -d
+```
+
+The new `init` service:
+- Detects `.borg-core/` + `.borg-perimeter/` at repo root + no `.borg-zones/` → renames into `.borg-zones/core` and `.borg-zones/perimeter`
+- Creates any missing subdirs
+- `chown -R 1000:1000` the new `.borg-zones/` tree
+- Ensures `${WORKSPACE_HOST_BASE}/workspace-${zone}/` exists + chowned for each zone in zone-config
+- Calls `ensure-zone-containers.ts`, which sees zone-config.json contains only `core` and `perimeter` (both compose-managed) and exits no-op
+
+### Step 3 — Verify
+
+- Open the dashboard; threads appear in their zones as before
+- `docker exec borg-core-1 ls /home/lucian/workspace` shows your repos
+- `docker exec borg-perimeter-1 ls /home/lucian/workspace` shows an **empty** directory (intentional — perimeter no longer has cross-zone fs access; this is the bug fix)
+
+### Step 4 — Cleanup (after one good day)
+
+- `rm -rf ~/workspace-core/borg/.borg-core ~/workspace-core/borg/.borg-perimeter` if init's rename left them behind (it should not — `mv` was used, not `cp`)
+
+### Rollback
+
+```bash
+docker compose down
+mv ~/workspace-core/borg ~/borg-tmp   # save it
+mv ~/workspace-core ~/workspace
+mv ~/borg-tmp ~/workspace/borg
+cd ~/workspace/borg
+git checkout main      # or whatever pre-AD7 branch
+mv .borg-zones/core .borg-core 2>/dev/null || true
+mv .borg-zones/perimeter .borg-perimeter 2>/dev/null || true
+rm -rf ~/workspace-perimeter
+docker compose up -d
+```
+
+The data renames are reversible because all operations used `mv`, not `cp`. The borg-repo move is also reversible.
+
+### Live trading-ops thread (thread 1146)
+
+This thread runs in core and must not have a forced stop. The compose `stop_grace_period: 30s` is honored by `docker compose down`. Plan the migration during a market-closed window if possible.
 
 ---
 
@@ -761,7 +881,15 @@ docker compose up -d --build
 - **Network attachment:** Docker's `POST /containers/create` accepts one network in `HostConfig.NetworkMode`; secondary networks require `POST /networks/{id}/connect` calls after create. Get this right in `zone-supervisor.ts` — the dev network attachment for `trusted` zones is critical for the trading-ops workflow.
 - **Workspace mount uid mismatch:** Mounting `${WORKSPACE_ROOT}` works because the host owns the files as `1000:1000` and the container runs as `node` (uid 1000). If a new zone wants different filesystem boundaries (e.g. read-only workspace), templates are the right knob. Out of scope here.
 - **Claude credentials mount:** The credentials file is mounted into every zone. This is per the existing design (`core` and `perimeter` both mount it) but worth flagging — a compromised untrusted zone could read Claude credentials. Consider per-zone credentials in Phase 2.
-- **`init` service ordering:** `init` runs once at compose-up and exits successfully. If `ensure-zone-containers.ts` fails (e.g., docker-proxy not yet healthy), compose treats the init as failed and downstream services don't start. **Mitigation:** Make `ensure-zone-containers.ts` resilient — retry with backoff for up to 30s waiting on docker-proxy, log loudly but exit 0 even on individual zone failures (the dashboard will surface "missing" state for the user to investigate).
+- **`init` service ordering:** `init` runs once at compose-up and exits successfully. If `ensure-zone-containers.ts` fails (e.g., docker-proxy not yet healthy), compose treats the init as failed and downstream services don't start. **Mitigation:** Make `ensure-zone-containers.ts` resilient — retry with backoff for up to 30s waiting on docker-proxy, log loudly but exit 0 even on individual zone failures (the dashboard will surface "missing" state for the user to investigate). Also: init now needs `depends_on: docker-proxy: service_healthy` (currently no dep — was just `node:22-slim` running a shell script).
+
+- **Supervisor image:** `ensure-zone-containers.ts` needs compiled TS. Run it under the **dashboard image** (already has compiled `src/`, already mounts `zone-config.json` and the templates file). Init becomes a two-stage script: stage 1 = shell (mkdirs, chowns); stage 2 = `docker exec` into the dashboard image's entrypoint with an alternate command. Alternative considered: compile a standalone supervisor binary — rejected as duplication.
+
+- **Dynamic-zone supervisor scope (AD3 clarification):** Supervisor creates a container only if **no container with that name exists** (running OR stopped). If a user manually `docker stop borg-zone-foo`, the supervisor on next boot leaves it stopped — user intent is preserved. Phase 2 will add explicit "start zone" UI; for now, manual `docker start borg-zone-foo` works.
+
+- **Dashboard's chown capability:** dashboard runs as `node` (uid 1000) by default. mkdir works fine; chown to 1000:1000 of a dir the dashboard just created is also fine (you own what you create). But if `init` created the dir first as uid 1000, the dashboard re-chowning is a no-op. Verified path: no special caps needed. If a future change runs the dashboard as a different uid, fall back to spawning a one-shot helper container that does chown via root inside the helper.
+
+- **Latent dashboard issue: `BORG_DIR` reads (out of scope, follow-up).** Audit found 18 places in `src/dashboard.ts` that read from `BORG_DIR` (= `/app/.borg`, mapped to core) for "primary zone" stats: queue counters (line 240), disk usage (line 246), message-history reads (309/319/332/439), sessions dir (line 32), logs (line 509). In a multi-zone world some of these should iterate across all zones (queue depth across all zones, disk usage as a sum, etc.). For this PR: keep `/app/.borg:ro → core` mount to preserve current behavior. **Follow-up PR: "Generalize dashboard BORG_DIR primary-zone reads to iterate across zones."** File this immediately after merge so it doesn't get lost; the first non-core zone you create will surface the bug.
 
 ---
 
@@ -779,9 +907,18 @@ docker compose up -d --build
 ## Summary Diff (TL;DR)
 
 - Move `.borg-{core,perimeter}` → `.borg-zones/{core,perimeter}`. Keep `.borg-infra/` as a sibling. Add `.borg-zones/.archived/` for soft-deletes.
-- One-time migration in `init-zones.sh`.
+- **AD7:** Per-zone workspace mounts — host `${WORKSPACE_HOST_BASE}/workspace-{zone}/` → container `${WORKSPACE_ROOT}`. Real filesystem isolation between zones. Perimeter loses cross-zone fs access (bug fix). Manual host rename required during migration.
+- Borg repo moves from `~/workspace/borg` → `~/workspace-core/borg`.
+- One-time `init-zones.sh` migration for `.borg-` dirs; manual `mv ~/workspace ~/workspace-core` for the workspace tree.
 - Dynamically-created zones are real Docker containers created by the dashboard via docker-proxy; a startup hook re-creates them on host reboot from `zone-config.json`.
-- Two templates: `trusted` (clone of core) and `untrusted` (clone of perimeter), defined in `zone-templates.json`.
+- Two templates: `trusted` (clone of core) and `untrusted` (clone of perimeter), defined in `zone-templates.json`. Workspace mount is per-zone-instance (AD7), not per-template.
 - Dashboard gets create/delete UI; existing badge dropdown styling bug (`--bg-card`/`--bg-alt` reference undefined CSS vars) fixed inline.
 - Knowledge entries and the Zone Security Reviewer skill updated to drop hardcoded `core`/`perimeter`/`infra` enumeration and describe the generic shape.
-- Portability preserved: state is on disk; new hosts come up via rsync + `docker compose up`.
+- Portability preserved: state is on disk; new hosts come up via rsync (now including `~/workspace-{core,perimeter,...}/`) + `docker compose up`.
+
+## PR sequencing
+
+- **PR 1** (Phase A + B): plumbing + dashboard backend. Includes AD7 (compose + workspace mounts + migration). Safe to ship without UI — existing zone-filter dropdown still works for assignment.
+- **PR 2** (Phase C + D): dashboard create/delete UI + knowledge updates.
+- **PR 3** (Phase E): tests.
+- **PR 4** (follow-up): BORG_DIR generalization in dashboard (see Open Risks).
