@@ -116,14 +116,16 @@ A new step in the `init` container reads `zone-config.json` and, for each zone t
 - A long-running supervisor would conflict with future "zone restart/stop" features (Phase 2) by fighting state.
 - The dashboard already handles the runtime create/delete; init only needs the cold-boot case.
 
+**Image choice (Q2 decision):** The `init` service runs under the **dashboard image** (NOT `node:22-slim`) so it has the compiled TypeScript supervisor available without a separate build step. Init's entrypoint becomes a two-stage shell: `bash scripts/init-zones.sh && node dist/ensure-zone-containers.js`. The compose service definition changes accordingly: image swap from `node:22-slim` to the dashboard image, `networks: [internal]` (so it can reach `docker-proxy`), and `depends_on: { docker-proxy: { condition: service_healthy } }`.
+
 ### AD4: Templates
 
 Two templates baked into `zone-config.json`:
 
 - **trusted** — clone of current `core`:
   - Mounts: workspace, github-installations, claude credentials, claude skills, claude settings, claude plugins (named volume per zone), `${WORKSPACE_ROOT}`
-  - Networks: `internal`, `dev`
-  - Env: `CREDENTIAL_BROKER_URL`, `BROKER_SECRET`, `PUBLIC_HOST`, `DEV_NETWORK`, `DOCKER_PROXY_URL`
+  - Networks: `internal` ONLY (Q1 decision: current `core` service is on `internal` only despite carrying a `DEV_NETWORK=borg_dev` env var; we preserve that behavior. The `dev` network is not auto-attached.)
+  - Env: `CREDENTIAL_BROKER_URL`, `BROKER_SECRET`, `PUBLIC_HOST`, `DOCKER_PROXY_URL` (the `DEV_NETWORK` env var is dropped — dead/unused with `internal`-only attachment)
   - Resource limit: 4G memory
 - **untrusted** — clone of current `perimeter`:
   - Mounts: workspace, github-installations, claude credentials, claude skills, claude settings, claude plugins (named volume per zone), `${WORKSPACE_ROOT}` (sandboxed by Claude Code itself)
@@ -218,6 +220,28 @@ docker compose up -d
 If the chown can't be done from the dashboard (uid restriction), fall back to spawning a one-shot helper container that does the chown — adds a Docker API call but keeps the dashboard's caps narrow. Decided at implementation time after probing the dashboard container's effective uid.
 
 **Trade-off accepted:** dashboard has rw on `${WORKSPACE_HOST_BASE}` (could in theory create `workspace-anything` or delete subdirs). This is bounded ambient authority on a directory the dashboard already needs to see read-only, and the dashboard is explicitly the "agentless human interface." Consistent with the broader sole-writer model. Per-zone workspace deletion is gated through the same delete flow that archives the zone directory.
+
+### AD8: Findings from pre-implementation code audit
+
+A read-through of the existing codebase surfaced gaps the original plan didn't account for. Each item below has a one-line "What it is" + one-line "What to do."
+
+1. **telegram-client.ts has 3 hardcoded zone sites the original plan missed.** `ZONE_STATUS_DIRS` constant (lines 47–50), `getOutgoingQueueDirs()` function (lines 145–150), and DM thread auto-registration fallback at line 431 (literal `"perimeter"`). All three must be generalized as part of Phase A (new task A6 in the checklist) — derive from `zone-config.json` with the same 5s cache as `listZoneDirs()`.
+
+2. **docker-proxy regex missing `POST /networks/{id}/connect`.** The current `allowPOST` regex is `containers/...` only; trusted zones can't be attached to additional networks without this. Phase A must extend the regex. Even though Q1 dropped `dev` from the trusted template, leaving the regex as-is means a future "needs another network" feature has to chase down this gap — extend it now.
+
+3. **Init container has no compose network membership today.** When init runs the supervisor against docker-proxy, it needs `networks: [internal]`. Compose change list updated accordingly (also see AD3 Q2 paragraph).
+
+4. **`zoneDirs` count is 11, not 8.** The original "8+ locations" estimate undercounted. Confirmed locations (approximate): 728–730, 852–854, 973–976, 1153–1156, 1259–1262, 1325–1328, 1417–1420, 1456–1459, 1527–1530, 1592–1595, plus a `TASK_ZONE_DIRS` constant. Refactor scope is larger than originally listed.
+
+5. **Test directory and framework correction.** Tests live in `src/__tests__/` (NOT `tests/`), use Vitest with `globals: true`, and **no mocking libraries** (no `nock`, no `msw`). Existing `src/__tests__/zone-config.test.ts` is comprehensive (323 lines). New tests should follow house style: real fs + temp dirs + inline `fetch` mocks where Docker proxy is involved.
+
+6. **No CI pipeline exists.** No GitHub Actions, no pre-commit hooks. Verification is local: `npm test` + `npm run build`. (Future PR could add Actions.)
+
+7. **DM thread auto-registration bug exposed by audit.** `telegram-client.ts:431` hardcodes the string `"perimeter"` as the DM thread's default zone. After generalization it must read `config.defaults.newThread`. Same task as item 1 above.
+
+8. **Skills sync overwrites on every boot.** `init-zones.sh` runs `cp -rf skills/global/. .borg-${zone}/claude-skills/` per zone on every container start. Any in-zone skills customization is lost on restart. Not a blocker for this PR; flag as known behavior in the docs but defer to a future PR if we want incremental sync.
+
+9. **Loud-fail check is unimplemented in the plan.** AD7's "loud failure mode if user skips workspace mv" needs a concrete check in `init-zones.sh`. Spec: after the per-zone `mkdir` of `${WORKSPACE_HOST_BASE}/workspace-${zone}`, if the resulting dir is **owned by root** (i.e., Docker auto-created it because the user didn't host-side `mv` first), exit non-zero with a clear error message naming the path and the host-side `mv` command to run.
 
 ---
 
@@ -347,7 +371,7 @@ New file `zone-templates.json` at repo root:
   "trusted": {
     "image": "borg-agent:latest",
     "memory": "4G",
-    "networks": ["internal", "dev"],
+    "networks": ["internal"],
     "mounts": [
       { "type": "bind", "source": "./secrets/github-installations.json", "target": "/secrets/github-installations.json", "readonly": true },
       { "type": "bind", "source": "${CLAUDE_CREDENTIALS}", "target": "/home/node/.claude/.credentials.json" },
@@ -359,7 +383,6 @@ New file `zone-templates.json` at repo root:
       "CREDENTIAL_BROKER_URL": "http://broker:3000",
       "BROKER_SECRET": "${BROKER_SECRET}",
       "PUBLIC_HOST": "${PUBLIC_HOST}",
-      "DEV_NETWORK": "borg_dev",
       "DOCKER_PROXY_URL": "http://docker-proxy:2375/v1.47"
     }
   },
@@ -694,6 +717,10 @@ A junior dev should be able to work through this in order.
 5. **`src/zone-supervisor.ts`** — new file. Exports `createZoneContainer(name, template)`, `deleteZoneContainer(name)`, `ensureZoneContainersExist()`. All three speak Docker API directly via `fetch` to the docker-proxy URL.
 6. **`scripts/init-zones.sh`** — rewrite per "Migration script" above. Old-→-new directory rename; per-zone seeding loop reads `zone-config.json`; `chown -R` on the new tree.
 7. **`scripts/ensure-zone-containers.ts`** — new file. Invoked at end of `init-zones.sh`. Calls `ensureZoneContainersExist()`.
+7a. **(A6) `src/telegram-client.ts`** — generalize hardcoded zone arrays surfaced by audit (AD8 item 1). Three sites:
+   - `ZONE_STATUS_DIRS` constant (lines 47–50) — replace with a `listZoneDirs()`-style helper backed by `zone-config.json` + 5s cache
+   - `getOutgoingQueueDirs()` (lines 145–150) — same helper, returns `{zone, dir}` pairs
+   - DM thread auto-registration fallback (line 431) — replace literal `"perimeter"` with `config.defaults.newThread` (AD8 item 7)
 8. **`docker-compose.yml`** — apply the diff from "Compose Changes":
    - `infra.volumes` — replace per-zone mounts with `.borg-zones` parent + `.borg-infra` + `zone-templates.json:ro`
    - `core.volumes` — `.borg-zones/core:/app/.borg` + workspace becomes `${WORKSPACE_HOST_BASE}/workspace-core:${WORKSPACE_ROOT}` (AD7)
@@ -701,6 +728,10 @@ A junior dev should be able to work through this in order.
    - `dashboard.volumes` — `.borg-zones` parent ro + separate rw mount for task-stop + `.borg-infra` ro + `${WORKSPACE_HOST_BASE}:/host-workspaces` (rw for zone-create, ro view for file browser)
    - `dashboard.environment` — add `WORKSPACE_HOST_BASE`, `WORKSPACE_ROOT`, `BROKER_SECRET`, `PUBLIC_HOST`, `CLAUDE_CREDENTIALS` (needed for template placeholder resolution at zone-create time)
    - `init.volumes` — add `${WORKSPACE_HOST_BASE}:/host-workspaces` (rw, for per-zone workspace dir creation)
+   - `init.image` — swap from `node:22-slim` to the **dashboard image** so it has the compiled TS supervisor available (Q2 / AD3 Q2 paragraph); entrypoint becomes `bash scripts/init-zones.sh && node dist/ensure-zone-containers.js`
+   - `init.networks` — add `[internal]` (AD8 item 3) so the supervisor can reach `docker-proxy`
+   - `init.depends_on` — add `docker-proxy: { condition: service_healthy }`
+   - `docker-proxy` — extend `allowPOST` regex to permit `POST /networks/.*/connect` in addition to existing `containers/...` rules (AD8 item 2). Required for any future multi-network attach; reserved now to avoid chasing the gap later.
    - `core` and `perimeter` services: add `image: borg-agent:latest` (alongside `build: .`)
    - Add `init` service step to invoke `scripts/ensure-zone-containers.ts` after the existing setup
 9. **`Dockerfile.infra`** — no changes expected. Sanity-check that path references aren't hardcoded.
@@ -709,7 +740,7 @@ A junior dev should be able to work through this in order.
 
 ### Phase B — Dashboard backend
 
-11. **`src/dashboard.ts`** — replace all hardcoded `zoneDirs` arrays with `listZoneDirs()` helper.
+11. **`src/dashboard.ts`** — replace all hardcoded `zoneDirs` arrays with `listZoneDirs()` helper. Audit confirms **11 locations** (not the originally estimated 8+), plus a `TASK_ZONE_DIRS` constant — see AD8 item 4 for line ranges.
 12. **`src/dashboard.ts`** — add `POST /api/zones`, `DELETE /api/zones/:name`, `GET /api/zone-templates`.
 13. **`src/dashboard.ts`** — extend `GET /api/zones` response with `template` and `containerStatus` per zone.
 14. **`src/dashboard.ts`** — task-stop write path: switch base from `/app/.borg-core/queue/task-stop` and `/app/.borg-perimeter/queue/task-stop` to `${TASK_STOP_BASE}/${zoneName}/queue/task-stop`. Default `TASK_STOP_BASE=/app/.borg-zones-rw`. Look up zone by scanning task state files (existing logic, just generalized).
@@ -734,10 +765,12 @@ A junior dev should be able to work through this in order.
 
 ### Phase E — Tests
 
-27. **`tests/zone-config.test.ts`** — extend with template field assertions.
-28. **`tests/zone-supervisor.test.ts`** — new. Mock docker-proxy `fetch` (via `nock` or a tiny in-process HTTP stub). Test create-success, create-rollback-on-failure, delete-success, delete-refuse-on-threads.
-29. **`tests/zone-lock.test.ts`** — new. Test mutex behavior on concurrent acquires.
-30. **`tests/dashboard.zones.test.ts`** — new. Supertest-style coverage of POST/DELETE endpoints with mocked Docker API.
+Tests live in `src/__tests__/` (Vitest, `globals: true`, no `nock`/`msw` — see AD8 item 5). Follow the house style of the existing 323-line `src/__tests__/zone-config.test.ts`: real fs + temp dirs + inline `fetch` mocks where the Docker proxy is involved. Verification is local: `npm test` + `npm run build` (no CI — AD8 item 6).
+
+27. **`src/__tests__/zone-config.test.ts`** — extend with template field assertions.
+28. **`src/__tests__/zone-supervisor.test.ts`** — new. Inline-mock `fetch` (no `nock`). Test create-success, create-rollback-on-failure, delete-success, delete-refuse-on-threads.
+29. **`src/__tests__/zone-lock.test.ts`** — new. Test mutex behavior on concurrent acquires.
+30. **`src/__tests__/dashboard.zones.test.ts`** — new. Exercise POST/DELETE endpoints with `fetch`-mocked Docker API.
 
 ---
 
