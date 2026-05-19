@@ -4,8 +4,8 @@ Message flow from Telegram to Claude SDK and back.
 
 ## Two-Process Architecture
 
-- **telegram-client** (infra container) -- grammY bot, handles all Telegram I/O, slash commands, routing log finalization
-- **queue-processor** (core/perimeter containers) -- SDK v2 sessions, processes incoming queue messages
+- **telegram-client** (infra container) -- grammY bot, handles all Telegram I/O, slash commands, routing log finalization. Infra mounts `.borg-zones/` parent read-only plus `.borg-infra/`.
+- **queue-processor** (agent-zone containers) -- SDK v2 sessions, processes incoming queue messages. Each agent zone mounts its own `.borg-zones/<name>/` at `/app/.borg`.
 
 Telegram slash commands (`/clear`, `/compact`, `/setdir`, etc.) are handled directly by `bot.command()` handlers in telegram-client. They never flow through the incoming message queue. Don't add redundant intercepts in queue-processor.
 

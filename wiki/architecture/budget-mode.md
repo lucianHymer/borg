@@ -19,7 +19,7 @@ Routes SDK queries through a Minimax proxy instead of direct Anthropic API.
 
 - Health check: `checkProxyAvailable()` verifies proxy before use
 - Graceful fallback: on connection errors (ECONNREFUSED, timeout), resets proxy state and retries with direct API
-- Settings shared via `/app/settings.json` across zones (infra writes, core/perimeter reads)
+- Settings shared via `/app/settings.json` across all zones (infra writes, agent zones read)
 - Cache invalidation: `statusInterval` checks settings mtime every 2s to detect `/budget_on` changes
 
 See: `scripts/minimax-proxy.ts`, `src/queue-processor.ts`, `src/session-manager.ts`, `src/telegram-client.ts`
