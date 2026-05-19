@@ -27,7 +27,7 @@ import { cleanupAudioFile, startPeriodicCleanup, ensureModels, distillForSpeech,
 import { storeVoiceTranscript } from "./voice-cache.js";
 import { startPeriodicCleanup as startImageCleanup } from "./images.js";
 import { toTelegramMarkdownV2, escapeMarkdownV2 } from "./markdown-v2.js";
-import { loadZoneConfig, getThreadZone, isSameZone, addThreadToZone, saveZoneConfig } from "./zone-config.js";
+import { loadZoneConfig, getThreadZone, isSameZone, addThreadToZone, saveZoneConfig, listZoneDirs } from "./zone-config.js";
 import { startWebhookServer, stopWebhookServer } from "./webhook-server.js";
 import { generateAuthCode } from "./auth.js";
 
@@ -35,6 +35,7 @@ import { generateAuthCode } from "./auth.js";
 
 const SCRIPT_DIR = path.resolve(__dirname, "..");
 const ZONE_CONFIG_PATH = process.env.ZONE_CONFIG_PATH || path.join(SCRIPT_DIR, "zone-config.json");
+const BORG_ZONES_DIR = path.join(SCRIPT_DIR, ".borg-zones");
 
 // Infra's own storage — telegram-client always runs in the infra container
 const BORG_INFRA_DIR = path.join(SCRIPT_DIR, ".borg-infra");
@@ -43,11 +44,14 @@ const LOG_FILE = path.join(BORG_INFRA_DIR, "logs/telegram.log");
 const MESSAGE_MODELS_FILE = path.join(BORG_INFRA_DIR, "message-models.json");
 const MARKDOWN_PARSE_FAILURES = path.join(BORG_INFRA_DIR, "markdown-parse-failures.jsonl");
 
-// Zone status directories — queue-processors write status files to their zone's dir
-const ZONE_STATUS_DIRS = [
-    path.join(SCRIPT_DIR, ".borg-core/status"),
-    path.join(SCRIPT_DIR, ".borg-perimeter/status"),
-];
+/**
+ * Zone status directories — queue-processors write status files to their
+ * zone's dir. Derived dynamically from zone-config.json so adding a new zone
+ * doesn't require a code change. Backed by loadZoneConfig's mtime cache.
+ */
+function listZoneStatusDirs(): string[] {
+    return listZoneDirs(ZONE_CONFIG_PATH, BORG_ZONES_DIR, "status");
+}
 
 /**
  * Get the pending queue directory (infra owns all cross-zone approvals).
@@ -140,13 +144,11 @@ function resolveZoneImagesIncoming(threadId: number): string {
 }
 
 /**
- * Get all outgoing queue directories to poll (one per zone).
+ * Get all outgoing queue directories to poll (one per zone). Derived from
+ * zone-config.json so new zones are picked up automatically.
  */
 function getOutgoingQueueDirs(): string[] {
-    return [
-        path.join(SCRIPT_DIR, ".borg-core/queue/outgoing"),
-        path.join(SCRIPT_DIR, ".borg-perimeter/queue/outgoing"),
-    ];
+    return listZoneDirs(ZONE_CONFIG_PATH, BORG_ZONES_DIR, "queue/outgoing");
 }
 const DEDUP_WINDOW_MS = 10_000; // 10 seconds
 const TASK_LISTS_FILE = path.join(SCRIPT_DIR, ".borg", TASK_LISTS_FILENAME);
@@ -175,7 +177,7 @@ function isDuplicate(threadId: number, senderId: string, text: string): boolean 
 
 // ─── Ensure Directories Exist ───
 
-[QUEUE_DEAD_LETTER, ...ZONE_STATUS_DIRS, path.dirname(LOG_FILE), path.dirname(MESSAGE_MODELS_FILE)].forEach(
+[QUEUE_DEAD_LETTER, ...listZoneStatusDirs(), path.dirname(LOG_FILE), path.dirname(MESSAGE_MODELS_FILE)].forEach(
     (dir) => {
         if (!fs.existsSync(dir)) {
             fs.mkdirSync(dir, { recursive: true });
@@ -428,8 +430,8 @@ function autoRegisterDmThread(ctx: Context, settings: Settings): number {
         const zoneConfig = loadZoneConfig(ZONE_CONFIG_PATH);
         if (zoneConfig) {
             const updated = structuredClone(zoneConfig);
-            const defaultZone = updated.defaults?.newThread || "perimeter";
-            addThreadToZone(updated, threadId, defaultZone as "core" | "perimeter");
+            const defaultZone = updated.defaults.newThread;
+            addThreadToZone(updated, threadId, defaultZone);
             saveZoneConfig(ZONE_CONFIG_PATH, updated);
         }
     } catch { /* zone config may not exist — non-fatal */ }
@@ -1964,7 +1966,7 @@ function cleanupPendingMessages(): void {
  * Returns the full path if found, null otherwise.
  */
 function findThreadStatusData(threadId: number): ThreadStatusData | null {
-    for (const dir of ZONE_STATUS_DIRS) {
+    for (const dir of listZoneStatusDirs()) {
         const data = readThreadStatus(dir, threadId);
         if (data) return data;
     }
@@ -1973,7 +1975,7 @@ function findThreadStatusData(threadId: number): ThreadStatusData | null {
 
 // Legacy: find old per-messageId status files (for cleanup during migration)
 function findStatusFile(messageId: string): string | null {
-    for (const dir of ZONE_STATUS_DIRS) {
+    for (const dir of listZoneStatusDirs()) {
         const filePath = path.join(dir, `${messageId}.json`);
         if (fs.existsSync(filePath)) return filePath;
     }
@@ -1992,7 +1994,7 @@ async function pollThreadStatus(): Promise<void> {
     try {
         // Collect all active thread IDs from all zone dirs
         const activeThreadIds = new Set<number>();
-        for (const dir of ZONE_STATUS_DIRS) {
+        for (const dir of listZoneStatusDirs()) {
             for (const tid of listActiveThreadStatuses(dir)) {
                 activeThreadIds.add(tid);
             }

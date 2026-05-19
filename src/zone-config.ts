@@ -5,6 +5,7 @@
  */
 
 import fs from "fs";
+import path from "path";
 import { z } from "zod/v4";
 import { writeJsonFileSafe } from "./types.js";
 
@@ -147,4 +148,46 @@ export function saveZoneConfig(configPath: string, config: ZoneConfig): void {
 export function clearZoneConfigCache(): void {
     cachedConfig = null;
     cachedMtime = 0;
+}
+
+// ─── Zone directory enumeration ───
+
+/**
+ * List per-zone directories of the form `{zonesRoot}/{zone}/{subpath}` for
+ * every zone declared in zone-config.json. Used by infra to discover all
+ * zones at runtime instead of hardcoding zone names.
+ *
+ * Returns an empty array if the config file is missing or unreadable; callers
+ * decide whether that should be treated as fatal. Backed by `loadZoneConfig`'s
+ * mtime cache, so calling per poll is cheap.
+ *
+ * @param configPath  Path to zone-config.json.
+ * @param zonesRoot   Filesystem path that contains the per-zone directories
+ *                    (e.g. `/app/.borg-zones`).
+ * @param subpath     Sub-path within each zone dir (e.g. `"status"` or
+ *                    `"queue/outgoing"`). Pass `""` to get the zone roots.
+ */
+export function listZoneDirs(configPath: string, zonesRoot: string, subpath: string): string[] {
+    const config = loadZoneConfig(configPath);
+    if (!config) return [];
+    return Object.keys(config.zones).map((zone) =>
+        subpath ? path.join(zonesRoot, zone, subpath) : path.join(zonesRoot, zone),
+    );
+}
+
+/**
+ * Like `listZoneDirs` but returns `{zone, dir}` pairs so callers can attribute
+ * results back to the originating zone.
+ */
+export function listZoneDirsWithNames(
+    configPath: string,
+    zonesRoot: string,
+    subpath: string,
+): Array<{ zone: ZoneName; dir: string }> {
+    const config = loadZoneConfig(configPath);
+    if (!config) return [];
+    return Object.keys(config.zones).map((zone) => ({
+        zone,
+        dir: subpath ? path.join(zonesRoot, zone, subpath) : path.join(zonesRoot, zone),
+    }));
 }
