@@ -23,12 +23,13 @@ import { toErrorMessage, isValidSessionId, ValidationError } from "./types.js";
 import type { PendingApproval, BackgroundTaskState } from "./types.js";
 import { mergeCorrectionsOntoDecisions } from "./routing-logger.js";
 import { readRecentJsonl } from "./jsonl-reader.js";
-import { loadZoneConfig, getThreadZone, addThreadToZone, removeThreadFromZones, saveZoneConfig, clearZoneConfigCache, listZoneDirs } from "./zone-config.js";
+import { loadZoneConfig, getThreadZone, addThreadToZone, removeThreadFromZones, saveZoneConfig, clearZoneConfigCache, listZoneDirs, listZoneDirsWithNames } from "./zone-config.js";
 
 const SCRIPT_DIR = path.resolve(__dirname, "..");
 const BORG_DIR = path.join(SCRIPT_DIR, ".borg");
 const BORG_INFRA_DIR = path.join(SCRIPT_DIR, ".borg-infra");
 const BORG_ZONES_DIR = path.join(SCRIPT_DIR, ".borg-zones");
+const TASK_STOP_BASE = process.env.TASK_STOP_BASE ?? path.join(SCRIPT_DIR, ".borg-zones");
 const STATIC_DIR = path.join(SCRIPT_DIR, "static");
 const SESSIONS_DIR = path.join(BORG_DIR, "sessions");
 // threads.json is at project root (shared across all zone containers)
@@ -1360,8 +1361,11 @@ app.post("/api/background-tasks/:taskId/stop", (req, res) => {
     const { taskId } = req.params;
     if (!SAFE_ID.test(taskId)) { res.status(400).json({ error: "Invalid taskId" }); return; }
 
-    // Find which zone this task belongs to by scanning task state files
-    for (const dir of taskZoneDirs()) {
+    // Find which zone this task belongs to by scanning task state files.
+    // Iterate zone-keyed dirs only (no legacy BORG_DIR) because task-stop writes
+    // must land under TASK_STOP_BASE/{zone}/queue/task-stop — which is a separate
+    // read-write mount in compose, distinct from the read-only zones mount.
+    for (const { zone, dir } of listZoneDirsWithNames(ZONE_CONFIG_PATH, BORG_ZONES_DIR, "")) {
         const tasksDir = path.join(dir, "queue/tasks");
         if (!fs.existsSync(tasksDir)) continue;
         try {
@@ -1370,8 +1374,8 @@ app.post("/api/background-tasks/:taskId/stop", (req, res) => {
                 try {
                     const data = JSON.parse(fs.readFileSync(path.join(tasksDir, file), "utf8"));
                     if (data.tasks && data.tasks[taskId]) {
-                        // Found the task — write stop signal to this zone
-                        const stopDir = path.join(dir, "queue/task-stop");
+                        // Found the task — write stop signal to the rw-mounted base for this zone
+                        const stopDir = path.join(TASK_STOP_BASE, zone, "queue/task-stop");
                         if (!fs.existsSync(stopDir)) {
                             fs.mkdirSync(stopDir, { recursive: true });
                         }
