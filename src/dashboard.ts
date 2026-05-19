@@ -23,11 +23,12 @@ import { toErrorMessage, isValidSessionId, ValidationError } from "./types.js";
 import type { PendingApproval, BackgroundTaskState } from "./types.js";
 import { mergeCorrectionsOntoDecisions } from "./routing-logger.js";
 import { readRecentJsonl } from "./jsonl-reader.js";
-import { loadZoneConfig, getThreadZone, addThreadToZone, removeThreadFromZones, saveZoneConfig, clearZoneConfigCache } from "./zone-config.js";
+import { loadZoneConfig, getThreadZone, addThreadToZone, removeThreadFromZones, saveZoneConfig, clearZoneConfigCache, listZoneDirs } from "./zone-config.js";
 
 const SCRIPT_DIR = path.resolve(__dirname, "..");
 const BORG_DIR = path.join(SCRIPT_DIR, ".borg");
 const BORG_INFRA_DIR = path.join(SCRIPT_DIR, ".borg-infra");
+const BORG_ZONES_DIR = path.join(SCRIPT_DIR, ".borg-zones");
 const STATIC_DIR = path.join(SCRIPT_DIR, "static");
 const SESSIONS_DIR = path.join(BORG_DIR, "sessions");
 // threads.json is at project root (shared across all zone containers)
@@ -726,8 +727,7 @@ function findSessionLogFile(sessionId: string): string | null {
     // Search across all zone session directories (infra, core, perimeter)
     const sessionDirs = [
         SESSIONS_DIR,
-        path.join(SCRIPT_DIR, ".borg-core", "sessions"),
-        path.join(SCRIPT_DIR, ".borg-perimeter", "sessions"),
+        ...listZoneDirs(ZONE_CONFIG_PATH, BORG_ZONES_DIR, "sessions"),
     ];
 
     for (const dir of sessionDirs) {
@@ -849,10 +849,9 @@ app.get("/api/logs/:type", (req, res) => {
 // ─── Zone Management API ───
 
 const ZONE_CONFIG_PATH = process.env.ZONE_CONFIG_PATH || path.join(SCRIPT_DIR, "zone-config.json");
-const PENDING_DIRS = [
-    path.join(SCRIPT_DIR, ".borg-core/queue/pending"),
-    path.join(SCRIPT_DIR, ".borg-perimeter/queue/pending"),
-];
+function pendingDirs(): string[] {
+    return listZoneDirs(ZONE_CONFIG_PATH, BORG_ZONES_DIR, "queue/pending");
+}
 
 // GET /api/zones — zone configuration with thread-to-zone mapping
 app.get("/api/zones", (_req, res) => {
@@ -937,7 +936,7 @@ app.post("/api/zones/remove", (req, res) => {
 app.get("/api/zones/pending", (_req, res) => {
     try {
         const pending: Array<PendingApproval & { ageMs: number }> = [];
-        for (const dir of PENDING_DIRS) {
+        for (const dir of pendingDirs()) {
             if (!fs.existsSync(dir)) continue;
             const files = fs.readdirSync(dir).filter(f => f.endsWith(".json"));
             for (const file of files) {
@@ -969,11 +968,9 @@ app.get("/api/usage", (_req, res) => {
 
     // Collect message history from all zone directories
     const historyFiles: string[] = [];
-    const borgDir = BORG_DIR;
     const zoneDirs = [
-        borgDir,
-        path.join(SCRIPT_DIR, ".borg-core"),
-        path.join(SCRIPT_DIR, ".borg-perimeter"),
+        BORG_DIR,
+        ...listZoneDirs(ZONE_CONFIG_PATH, BORG_ZONES_DIR, ""),
     ];
 
     for (const dir of zoneDirs) {
@@ -1152,8 +1149,7 @@ app.get("/api/usage/queries", (_req, res) => {
     const historyFiles: string[] = [];
     const zoneDirs = [
         BORG_DIR,
-        path.join(SCRIPT_DIR, ".borg-core"),
-        path.join(SCRIPT_DIR, ".borg-perimeter"),
+        ...listZoneDirs(ZONE_CONFIG_PATH, BORG_ZONES_DIR, ""),
     ];
     for (const dir of zoneDirs) {
         const main = path.join(dir, "message-history.jsonl");
@@ -1258,8 +1254,7 @@ app.get("/api/scheduled-tasks", (_req, res) => {
     // Read scheduled-tasks.json from all zone directories
     const zoneDirs = [
         BORG_DIR,
-        path.join(SCRIPT_DIR, ".borg-core"),
-        path.join(SCRIPT_DIR, ".borg-perimeter"),
+        ...listZoneDirs(ZONE_CONFIG_PATH, BORG_ZONES_DIR, ""),
     ];
 
     interface TaskEntry {
@@ -1321,18 +1316,20 @@ app.get("/api/scheduled-tasks", (_req, res) => {
 // Input validation: messageId and taskId must be safe for use in file paths
 const SAFE_ID = /^[a-zA-Z0-9_\-]+$/;
 
-// Zone directories for cross-zone task scanning (infra reads all zones)
-const TASK_ZONE_DIRS = [
-    BORG_DIR,
-    path.join(SCRIPT_DIR, ".borg-core"),
-    path.join(SCRIPT_DIR, ".borg-perimeter"),
-];
+// Zone directories for cross-zone task scanning (infra reads all zones).
+// Backed by loadZoneConfig's mtime cache, so calling per request is cheap.
+function taskZoneDirs(): string[] {
+    return [
+        BORG_DIR,
+        ...listZoneDirs(ZONE_CONFIG_PATH, BORG_ZONES_DIR, ""),
+    ];
+}
 
 // GET /api/background-tasks — returns all active background tasks across zones
 app.get("/api/background-tasks", (_req, res) => {
     const allStates: BackgroundTaskState[] = [];
 
-    for (const dir of TASK_ZONE_DIRS) {
+    for (const dir of taskZoneDirs()) {
         const tasksDir = path.join(dir, "queue/tasks");
         if (!fs.existsSync(tasksDir)) continue;
         try {
@@ -1364,7 +1361,7 @@ app.post("/api/background-tasks/:taskId/stop", (req, res) => {
     if (!SAFE_ID.test(taskId)) { res.status(400).json({ error: "Invalid taskId" }); return; }
 
     // Find which zone this task belongs to by scanning task state files
-    for (const dir of TASK_ZONE_DIRS) {
+    for (const dir of taskZoneDirs()) {
         const tasksDir = path.join(dir, "queue/tasks");
         if (!fs.existsSync(tasksDir)) continue;
         try {
@@ -1416,8 +1413,7 @@ function findResponseByMessageId(messageId: string): {
 } {
     const zoneDirs = [
         BORG_DIR,
-        path.join(SCRIPT_DIR, ".borg-core"),
-        path.join(SCRIPT_DIR, ".borg-perimeter"),
+        ...listZoneDirs(ZONE_CONFIG_PATH, BORG_ZONES_DIR, ""),
     ];
 
     let incoming: Record<string, unknown> | null = null;
@@ -1455,8 +1451,7 @@ function findResponseByMessageId(messageId: string): {
 function findResponseInTail(messageId: string): Record<string, unknown> | null {
     const zoneDirs = [
         BORG_DIR,
-        path.join(SCRIPT_DIR, ".borg-core"),
-        path.join(SCRIPT_DIR, ".borg-perimeter"),
+        ...listZoneDirs(ZONE_CONFIG_PATH, BORG_ZONES_DIR, ""),
     ];
     const TAIL_BYTES = 128 * 1024;
     for (const dir of zoneDirs) {
@@ -1490,7 +1485,7 @@ function findResponseInTail(messageId: string): Record<string, unknown> | null {
  * Find background task state for a given messageId across all zone directories.
  */
 function findBackgroundTasks(messageId: string): BackgroundTaskState | null {
-    for (const dir of TASK_ZONE_DIRS) {
+    for (const dir of taskZoneDirs()) {
         const taskFile = path.join(dir, "queue/tasks", `${messageId}.json`);
         if (fs.existsSync(taskFile)) {
             try {
@@ -1526,8 +1521,7 @@ app.get("/api/response/:messageId", (req, res) => {
     if (!resolvedSessionId) {
         const zoneDirs = [
             BORG_DIR,
-            path.join(SCRIPT_DIR, ".borg-core"),
-            path.join(SCRIPT_DIR, ".borg-perimeter"),
+            ...listZoneDirs(ZONE_CONFIG_PATH, BORG_ZONES_DIR, ""),
         ];
         for (const dir of zoneDirs) {
             // Try thread-keyed status file
@@ -1591,8 +1585,7 @@ app.get("/api/response/:messageId/feed", (req, res) => {
     function findStatusFile(): string | null {
         const zoneDirs = [
             BORG_DIR,
-            path.join(SCRIPT_DIR, ".borg-core"),
-            path.join(SCRIPT_DIR, ".borg-perimeter"),
+            ...listZoneDirs(ZONE_CONFIG_PATH, BORG_ZONES_DIR, ""),
         ];
         // Resolve messageId → threadId for thread-keyed status lookup
         const { incoming, outgoing } = findResponseByMessageId(messageId);
