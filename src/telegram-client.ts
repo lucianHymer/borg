@@ -27,7 +27,7 @@ import { cleanupAudioFile, startPeriodicCleanup, ensureModels, distillForSpeech,
 import { storeVoiceTranscript } from "./voice-cache.js";
 import { startPeriodicCleanup as startImageCleanup } from "./images.js";
 import { toTelegramMarkdownV2, escapeMarkdownV2 } from "./markdown-v2.js";
-import { loadZoneConfig, getThreadZone, isSameZone, addThreadToZone, saveZoneConfig, listZoneDirs } from "./zone-config.js";
+import { loadZoneConfig, getThreadZone, isSameZone, addThreadToZone, saveZoneConfig, listZoneDirs, resolveZoneSubdir } from "./zone-config.js";
 import { startWebhookServer, stopWebhookServer } from "./webhook-server.js";
 import { generateAuthCode } from "./auth.js";
 
@@ -76,71 +76,63 @@ function findPendingFile(pendingId: string): string | null {
  * Resolve the incoming queue path for a target zone.
  */
 function resolveZoneIncoming(targetZone: string): string {
-    return path.join(SCRIPT_DIR, `.borg-${targetZone}/queue/incoming`);
+    return resolveZoneSubdir(targetZone, BORG_ZONES_DIR, "queue/incoming");
 }
 
 /**
  * Resolve the outgoing queue path for a target zone.
  */
 function resolveZoneOutgoing(targetZone: string): string {
-    return path.join(SCRIPT_DIR, `.borg-${targetZone}/queue/outgoing`);
+    return resolveZoneSubdir(targetZone, BORG_ZONES_DIR, "queue/outgoing");
 }
 
 /**
  * Resolve the incoming queue path for a specific thread by looking up its zone.
+ * Throws if zone-config is missing/unreadable — that's a broken configuration
+ * and silently routing to a hardcoded zone is what made A5 silently mis-route
+ * messages.
  */
 function resolveIncomingForThread(threadId: number): string {
-    try {
-        const config = loadZoneConfig(ZONE_CONFIG_PATH);
-        if (!config) return resolveZoneIncoming("core");
-        const zone = getThreadZone(config, threadId);
-        return resolveZoneIncoming(zone);
-    } catch {
-        return resolveZoneIncoming("core");
-    }
+    const config = loadZoneConfig(ZONE_CONFIG_PATH);
+    if (!config) throw new Error(`Cannot resolve incoming queue for thread ${threadId}: zone-config.json is missing or unreadable`);
+    const zone = getThreadZone(config, threadId);
+    return resolveZoneIncoming(zone);
 }
 
 /**
  * Resolve the cancel queue directory for a thread's zone.
+ * Throws if zone-config is missing/unreadable — see resolveIncomingForThread.
+ * Callers should handle the error and surface it to the user; silently routing
+ * cancel signals to the wrong zone could leave SDK processes running.
  */
 function resolveZoneCancelDir(threadId: number): string {
-    try {
-        const config = loadZoneConfig(ZONE_CONFIG_PATH);
-        if (!config) return path.join(SCRIPT_DIR, ".borg-core/queue/cancel");
-        const zone = getThreadZone(config, threadId);
-        return path.join(SCRIPT_DIR, `.borg-${zone}/queue/cancel`);
-    } catch {
-        return path.join(SCRIPT_DIR, ".borg-core/queue/cancel");
-    }
+    const config = loadZoneConfig(ZONE_CONFIG_PATH);
+    if (!config) throw new Error(`Cannot resolve cancel dir for thread ${threadId}: zone-config.json is missing or unreadable`);
+    const zone = getThreadZone(config, threadId);
+    return resolveZoneSubdir(zone, BORG_ZONES_DIR, "queue/cancel");
 }
 
 /**
  * Resolve the audio incoming directory for a thread's zone.
  * Voice/image files must be written to the target zone's dir so queue-processor can read them.
+ * Throws if zone-config is missing/unreadable — see resolveIncomingForThread.
  */
 function resolveZoneAudioIncoming(threadId: number): string {
-    try {
-        const config = loadZoneConfig(ZONE_CONFIG_PATH);
-        if (!config) return path.join(SCRIPT_DIR, ".borg-core/audio/incoming");
-        const zone = getThreadZone(config, threadId);
-        return path.join(SCRIPT_DIR, `.borg-${zone}/audio/incoming`);
-    } catch {
-        return path.join(SCRIPT_DIR, ".borg-core/audio/incoming");
-    }
+    const config = loadZoneConfig(ZONE_CONFIG_PATH);
+    if (!config) throw new Error(`Cannot resolve audio dir for thread ${threadId}: zone-config.json is missing or unreadable`);
+    const zone = getThreadZone(config, threadId);
+    return resolveZoneSubdir(zone, BORG_ZONES_DIR, "audio/incoming");
 }
 
 /**
  * Resolve the images incoming directory for a thread's zone.
+ * Throws if zone-config is missing/unreadable — see resolveIncomingForThread.
  */
 function resolveZoneImagesIncoming(threadId: number): string {
-    try {
-        const config = loadZoneConfig(ZONE_CONFIG_PATH);
-        if (!config) return path.join(SCRIPT_DIR, ".borg-core/images/incoming");
-        const zone = getThreadZone(config, threadId);
-        return path.join(SCRIPT_DIR, `.borg-${zone}/images/incoming`);
-    } catch {
-        return path.join(SCRIPT_DIR, ".borg-core/images/incoming");
-    }
+    const config = loadZoneConfig(ZONE_CONFIG_PATH);
+    if (!config) throw new Error(`Cannot resolve images dir for thread ${threadId}: zone-config.json is missing or unreadable`);
+    const zone = getThreadZone(config, threadId);
+    return resolveZoneSubdir(zone, BORG_ZONES_DIR, "images/incoming");
 }
 
 /**
@@ -1217,7 +1209,16 @@ bot.on("message:voice").filter(
         // Fire-and-forget: download + STT + queue runs outside the handler
         // so other messages are not blocked while waiting for transcription.
         void (async () => {
-            const zoneAudioDir = resolveZoneAudioIncoming(threadId);
+            let zoneAudioDir: string;
+            try {
+                zoneAudioDir = resolveZoneAudioIncoming(threadId);
+            } catch (err) {
+                log("ERROR", `Failed to resolve audio dir for thread ${threadId}: ${toErrorMessage(err)}`);
+                await bot.api.sendMessage(chatId, "Couldn't process your voice message — zone configuration is broken. Please contact the operator.", {
+                    message_thread_id: threadMsgId,
+                });
+                return;
+            }
             if (!fs.existsSync(zoneAudioDir)) fs.mkdirSync(zoneAudioDir, { recursive: true });
             const oggPath = path.join(zoneAudioDir, `${messageId}.ogg`);
 
@@ -1351,7 +1352,16 @@ bot.on("message:photo").filter(
         // Download the image file
         const photoId = generateMessageId();
         const ext = path.extname(file.file_path || ".jpg") || ".jpg";
-        const zoneImagesDir = resolveZoneImagesIncoming(threadId);
+        let zoneImagesDir: string;
+        try {
+            zoneImagesDir = resolveZoneImagesIncoming(threadId);
+        } catch (err) {
+            log("ERROR", `Failed to resolve images dir for thread ${threadId}: ${toErrorMessage(err)}`);
+            await ctx.reply("Couldn't process your image — zone configuration is broken. Please contact the operator.", {
+                message_thread_id: getCtxThreadOpt(ctx),
+            });
+            return;
+        }
         if (!fs.existsSync(zoneImagesDir)) fs.mkdirSync(zoneImagesDir, { recursive: true });
         const imagePath = path.join(zoneImagesDir, `${photoId}${ext}`);
         const canonicalImagePath = canonicalIncomingPath(`${photoId}${ext}`);
@@ -1473,7 +1483,16 @@ bot.on("message:document").filter(
 
         const messageId = generateMessageId();
         const ext = path.extname(doc.file_name || file.file_path || "");
-        const zoneFilesDir = resolveZoneImagesIncoming(threadId);
+        let zoneFilesDir: string;
+        try {
+            zoneFilesDir = resolveZoneImagesIncoming(threadId);
+        } catch (err) {
+            log("ERROR", `Failed to resolve files dir for thread ${threadId}: ${toErrorMessage(err)}`);
+            await ctx.reply("Couldn't process your file — zone configuration is broken. Please contact the operator.", {
+                message_thread_id: getCtxThreadOpt(ctx),
+            });
+            return;
+        }
         if (!fs.existsSync(zoneFilesDir)) fs.mkdirSync(zoneFilesDir, { recursive: true });
         const localPath = path.join(zoneFilesDir, `${messageId}${ext}`);
 
@@ -2250,7 +2269,14 @@ bot.on("callback_query:data", async (ctx) => {
         }
 
         // Write cancel signal file to the correct zone's cancel dir
-        const cancelDir = resolveZoneCancelDir(pending.threadId);
+        let cancelDir: string;
+        try {
+            cancelDir = resolveZoneCancelDir(pending.threadId);
+        } catch (err) {
+            log("ERROR", `Failed to resolve cancel dir for thread ${pending.threadId}: ${toErrorMessage(err)}`);
+            await ctx.answerCallbackQuery({ text: "Failed to cancel: zone config broken" });
+            return;
+        }
         fs.mkdirSync(cancelDir, { recursive: true });
         const cancelFile = path.join(cancelDir, `${queueMessageId}.json`);
         const tmpFile = cancelFile + ".tmp";

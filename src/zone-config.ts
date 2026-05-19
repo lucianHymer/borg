@@ -191,3 +191,18 @@ export function listZoneDirsWithNames(
         dir: subpath ? path.join(zonesRoot, zone, subpath) : path.join(zonesRoot, zone),
     }));
 }
+
+/**
+ * Build a `{zonesRoot}/{zone}/{subpath}` path for a single zone. Pure path
+ * construction — does not consult zone-config, does not validate that the
+ * zone exists. Callers that need validation should look the zone up in
+ * zone-config first.
+ *
+ * @param zone        Zone name (e.g. `"core"`).
+ * @param zonesRoot   Filesystem path containing the per-zone directories.
+ * @param subpath     Sub-path within the zone dir (e.g. `"queue/incoming"`).
+ *                    Pass `""` to get the zone root.
+ */
+export function resolveZoneSubdir(zone: ZoneName, zonesRoot: string, subpath: string): string {
+    return subpath ? path.join(zonesRoot, zone, subpath) : path.join(zonesRoot, zone);
+}
