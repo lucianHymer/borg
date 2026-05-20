@@ -111,7 +111,7 @@ services:
       - ./.borg-zones/core:/app/.borg
       - ./threads.json:/app/threads.json
       - ./zone-config.json:/app/zone-config.json:ro
-      - ./settings.json:/app/settings.json
+      - ./settings.json:/app/settings.json:ro
       # Workspace access (AD7: per-zone host workspace)
       - ${WORKSPACE_HOST_BASE}/workspace-core:${WORKSPACE_ROOT}
       # Credentials
@@ -155,7 +155,7 @@ services:
       - ./.borg-zones/perimeter:/app/.borg
       - ./threads.json:/app/threads.json
       - ./zone-config.json:/app/zone-config.json:ro
-      - ./settings.json:/app/settings.json
+      - ./settings.json:/app/settings.json:ro
       # Workspace access (AD7: per-zone host workspace, isolated from core)
       - ${WORKSPACE_HOST_BASE}/workspace-perimeter:${WORKSPACE_ROOT}
       # Credentials (limited)

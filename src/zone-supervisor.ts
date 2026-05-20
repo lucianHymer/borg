@@ -216,7 +216,7 @@ function buildSpec(
         { Type: "bind", Source: `${workspaceHostBase}/workspace-${zoneName}`, Target: workspaceRoot },
         { Type: "bind", Source: `${repoRoot}/threads.json`, Target: "/app/threads.json" },
         { Type: "bind", Source: `${repoRoot}/zone-config.json`, Target: "/app/zone-config.json", ReadOnly: true },
-        { Type: "bind", Source: `${repoRoot}/settings.json`, Target: "/app/settings.json" },
+        { Type: "bind", Source: `${repoRoot}/settings.json`, Target: "/app/settings.json", ReadOnly: true },
     ];
 
     // Template mounts (with placeholder substitution)
