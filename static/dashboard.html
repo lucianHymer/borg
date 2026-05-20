@@ -3261,7 +3261,10 @@ tr.clickable { cursor: pointer; }
       // Row not found — surface error via the webhooks list as a fallback.
       var list = document.getElementById('webhooks-list');
       if (list) {
+        // Remove any stale banners so repeated failures don't stack.
+        list.querySelectorAll('.webhook-row-error').forEach(function(el) { el.remove(); });
         var err = document.createElement('div');
+        err.className = 'webhook-row-error';
         err.setAttribute('role', 'alert');
         err.setAttribute('aria-live', 'polite');
         err.style.cssText = 'color:var(--accent-red,#ff6b6b);font-size:12px;padding:8px 0;';
@@ -3294,7 +3297,10 @@ tr.clickable { cursor: pointer; }
           cell.innerHTML = original;
           var list = document.getElementById('webhooks-list');
           if (list) {
+            // Remove any stale banners so repeated failures don't stack.
+            list.querySelectorAll('.webhook-row-error').forEach(function(el) { el.remove(); });
             var err = document.createElement('div');
+            err.className = 'webhook-row-error';
             err.setAttribute('role', 'alert');
             err.setAttribute('aria-live', 'polite');
             err.style.cssText = 'color:var(--accent-red,#ff6b6b);font-size:12px;padding:8px 0;';
