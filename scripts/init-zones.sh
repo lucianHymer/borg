@@ -39,13 +39,23 @@ ZONE_DIRS=(
 INFRA_DIRS=(queue/pending queue/outgoing logs)
 
 # ── Section 2: Migrate old .borg-core / .borg-perimeter → .borg-zones/ (one-shot) ──
+#
+# Per-zone idempotency gates: if a previous run crashed between mvs (OOM,
+# host reboot, kill -9), the outer-gate version `[ ! -d .borg-zones ]` would
+# become false after the first mv succeeded, orphaning the second legacy dir
+# forever. Independent existence checks let partial migrations complete on
+# the next boot.
 
-if { [ -d .borg-core ] || [ -d .borg-perimeter ]; } && [ ! -d .borg-zones ]; then
-    echo "[init-zones] Detected old .borg-{core,perimeter}/ — migrating to .borg-zones/"
+if [ -d .borg-core ] || [ -d .borg-perimeter ]; then
     mkdir -p .borg-zones
-    [ -d .borg-core ] && mv .borg-core .borg-zones/core
-    [ -d .borg-perimeter ] && mv .borg-perimeter .borg-zones/perimeter
-    echo "[init-zones] Migration complete"
+    if [ -d .borg-core ] && [ ! -d .borg-zones/core ]; then
+        echo "[init-zones] Migrating .borg-core/ → .borg-zones/core/"
+        mv .borg-core .borg-zones/core
+    fi
+    if [ -d .borg-perimeter ] && [ ! -d .borg-zones/perimeter ]; then
+        echo "[init-zones] Migrating .borg-perimeter/ → .borg-zones/perimeter/"
+        mv .borg-perimeter .borg-zones/perimeter
+    fi
 fi
 
 # ── Section 3: Ensure shared config files exist ──
