@@ -76,7 +76,11 @@ services:
     volumes:
       - ./.borg-infra:/app/.borg-infra
       - ./.borg-infra:/app/.borg
-      - ./.borg-zones:/app/.borg-zones:ro
+      # Infra is the routing layer — writes to /app/.borg-zones/<zone>/queue/incoming/
+      # and /app/.borg-zones/<zone>/queue/cancel/ for message + cancel routing.
+      # Cross-zone isolation is enforced by agent containers mounting only their own
+      # .borg-zones/<name>/ subdirectory, NOT by restricting infra's mount.
+      - ./.borg-zones:/app/.borg-zones
       - ./threads.json:/app/threads.json
       - ./zone-config.json:/app/zone-config.json
       - ./zone-templates.json:/app/zone-templates.json:ro
