@@ -76,7 +76,7 @@ services:
     volumes:
       - ./.borg-infra:/app/.borg-infra
       - ./.borg-infra:/app/.borg
-      - ./.borg-zones:/app/.borg-zones
+      - ./.borg-zones:/app/.borg-zones:ro
       - ./threads.json:/app/threads.json
       - ./zone-config.json:/app/zone-config.json
       - ./zone-templates.json:/app/zone-templates.json:ro
@@ -110,7 +110,7 @@ services:
     volumes:
       - ./.borg-zones/core:/app/.borg
       - ./threads.json:/app/threads.json
-      - ./zone-config.json:/app/zone-config.json
+      - ./zone-config.json:/app/zone-config.json:ro
       - ./settings.json:/app/settings.json
       # Workspace access (AD7: per-zone host workspace)
       - ${WORKSPACE_HOST_BASE}/workspace-core:${WORKSPACE_ROOT}
@@ -154,7 +154,7 @@ services:
     volumes:
       - ./.borg-zones/perimeter:/app/.borg
       - ./threads.json:/app/threads.json
-      - ./zone-config.json:/app/zone-config.json
+      - ./zone-config.json:/app/zone-config.json:ro
       - ./settings.json:/app/settings.json
       # Workspace access (AD7: per-zone host workspace, isolated from core)
       - ${WORKSPACE_HOST_BASE}/workspace-perimeter:${WORKSPACE_ROOT}
