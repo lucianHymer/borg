@@ -213,12 +213,20 @@ if [ -d .borg ] && [ -f .borg/settings.json ] && [ ! -f .borg-zones/core/setting
 
     mkdir -p .borg-zones/core .borg-zones/perimeter .borg-infra
 
-    # Core gets the main data (most threads are typically core)
+    # Core gets the main data (most threads are typically core).
+    # cp -p preserves the 0600 mode on auth-tokens.json (and mtimes generally).
     for f in message-history.jsonl settings.json heartbeat-state.json \
              markdown-parse-failures.jsonl voice-transcripts.json \
-             task-lists.json task-pins.json; do
-        [ -f ".borg/$f" ] && cp ".borg/$f" ".borg-zones/core/$f"
+             task-lists.json task-pins.json \
+             auth-tokens.json webhooks.json; do
+        [ -f ".borg/$f" ] && cp -p ".borg/$f" ".borg-zones/core/$f"
     done
+
+    # Defensive: ensure 0600 on auth-tokens.json even if cp -p was bypassed
+    # (e.g. exotic filesystem). No-op when the file wasn't migrated.
+    [ -f .borg-zones/core/auth-tokens.json ] && chmod 600 .borg-zones/core/auth-tokens.json
+
+    echo "[init-zones] Migrated auth-tokens.json + webhooks.json to .borg-zones/core/ (if present)"
 
     # Sessions
     if [ -d .borg/sessions ] && [ -n "$(ls -A .borg/sessions/ 2>/dev/null)" ]; then
