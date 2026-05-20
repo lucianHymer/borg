@@ -921,6 +921,12 @@ tr.clickable { cursor: pointer; }
 </div>
 
 <div id="main">
+  <!-- Page-level error banner (used when something fails outside any open modal,
+       e.g. template-load failure during _openCreateZone before the modal opens) -->
+  <div id="page-error" role="alert" aria-live="polite" style="display:none;background:rgba(248,81,73,0.1);border:1px solid var(--accent-red,#ff6b6b);color:var(--accent-red,#ff6b6b);padding:8px 12px;margin:8px;border-radius:4px;font-size:12px;display:none;">
+    <span id="page-error-text"></span>
+    <button onclick="window._dismissPageError()" aria-label="Dismiss error" style="background:none;border:none;color:var(--accent-red,#ff6b6b);font-size:14px;cursor:pointer;float:right;line-height:1;padding:0 4px;">×</button>
+  </div>
   <!-- View: Overview -->
   <div id="view-overview" class="view">
     <h2>System Overview</h2>
@@ -1134,6 +1140,7 @@ tr.clickable { cursor: pointer; }
             <label style="display:block;font-size:11px;color:var(--text-secondary);margin-bottom:4px;text-transform:uppercase;letter-spacing:0.5px;">ntfy Debounce (ms, optional)</label>
             <input id="wh-ntfy-debounce" type="number" placeholder="120000" style="width:100%;background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-primary);padding:6px 10px;border-radius:4px;font-size:12px;font-family:inherit;">
           </div>
+          <div id="wh-error" role="alert" aria-live="polite" style="display:none;color:var(--accent-red,#ff6b6b);font-size:12px;margin-bottom:12px;"></div>
           <button id="wh-submit-btn" onclick="window._submitWebhook()" class="usage-period-btn" style="border-color:var(--accent-green);color:var(--accent-green);width:100%;padding:8px;">Create</button>
         </div>
       </div>
@@ -1187,6 +1194,7 @@ tr.clickable { cursor: pointer; }
         <button onclick="window._closeManageZones()" aria-label="Close" style="background:none;border:none;color:var(--text-secondary);font-size:20px;cursor:pointer;padding:0;line-height:1;">×</button>
       </div>
       <div id="mz-list" style="padding:8px 20px 16px 20px;overflow-y:auto;flex:1;"></div>
+      <div id="mz-error" role="alert" aria-live="polite" style="display:none;color:var(--accent-red,#ff6b6b);font-size:12px;padding:0 20px 12px 20px;"></div>
       <div style="padding:12px 20px;border-top:1px solid var(--border);display:flex;justify-content:flex-end;gap:8px;">
         <button onclick="window._closeManageZones()" class="usage-period-btn" style="padding:6px 14px;">Close</button>
         <button onclick="window._closeManageZones(); window._openCreateZone();" class="usage-period-btn" style="padding:6px 14px;border-color:var(--accent-green);color:var(--accent-green);">+ Create new zone</button>
@@ -1655,14 +1663,32 @@ tr.clickable { cursor: pointer; }
 
   var _availableZones = []; // populated from /api/zones
 
+  // Relative luminance for hsl(h, s%, l%) per WCAG sRGB linearization.
+  function hslLuminance(h, s, l) {
+    s /= 100; l /= 100;
+    var a = s * Math.min(l, 1 - l);
+    function f(n) {
+      var k = (n + h / 30) % 12;
+      return l - a * Math.max(-1, Math.min(k - 3, 9 - k, 1));
+    }
+    var r = f(0), g = f(8), b = f(4);
+    function lin(c) { return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4); }
+    return 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b);
+  }
+
   function zoneColor(name) {
-    if (name === 'core') return 'var(--accent-green)';
-    if (name === 'perimeter') return 'var(--accent-yellow)';
+    if (name === 'core') return { bg: 'var(--accent-green)', text: '#000' };
+    if (name === 'perimeter') return { bg: 'var(--accent-yellow)', text: '#000' };
     var h = 0;
     for (var i = 0; i < name.length; i++) {
       h = ((h << 5) - h + name.charCodeAt(i)) | 0;
     }
-    return 'hsl(' + (Math.abs(h) % 360) + ', 60%, 55%)';
+    var hue = Math.abs(h) % 360;
+    var s = 60, l = 55;
+    // Threshold ~0.179 is the WCAG sRGB crossover where black/white text yield
+    // equal contrast (~4.6:1) — picking either side guarantees >= 4.5:1 here.
+    var text = hslLuminance(hue, s, l) > 0.179 ? '#000' : '#fff';
+    return { bg: 'hsl(' + hue + ', ' + s + '%, ' + l + '%)', text: text };
   }
 
   function zoneBadge(zone, threadId) {
@@ -1671,8 +1697,8 @@ tr.clickable { cursor: pointer; }
         'data-thread-id="' + escapeHtml(String(threadId)) + '" data-zone="" ' +
         'title="Click to assign zone">—</span>';
     }
-    var color = zoneColor(zone);
-    return '<span class="badge zone-badge" style="background:' + color + ';color:#000;font-size:10px;cursor:pointer;" ' +
+    var c = zoneColor(zone);
+    return '<span class="badge zone-badge" style="background:' + c.bg + ';color:' + c.text + ';font-size:10px;cursor:pointer;" ' +
       'data-thread-id="' + escapeHtml(String(threadId)) + '" data-zone="' + escapeHtml(zone) + '" ' +
       'title="Click to change zone">' + escapeHtml(zone) + '</span>';
   }
@@ -3243,6 +3269,20 @@ tr.clickable { cursor: pointer; }
 
   var _createZoneState = { templates: null, reservedNames: null, nameRegex: null };
 
+  // Page-level error banner helpers — used when something fails outside any
+  // open modal (e.g. template-load failure before the Create Zone modal opens).
+  window._showPageError = function(msg) {
+    var el = document.getElementById('page-error');
+    var txt = document.getElementById('page-error-text');
+    if (!el || !txt) return;
+    txt.textContent = msg;
+    el.style.display = 'block';
+  };
+  window._dismissPageError = function() {
+    var el = document.getElementById('page-error');
+    if (el) el.style.display = 'none';
+  };
+
   window._openCreateZone = async function() {
     // Lazy-load templates the first time
     if (!_createZoneState.templates) {
@@ -3252,7 +3292,9 @@ tr.clickable { cursor: pointer; }
         _createZoneState.reservedNames = data.reservedNames;
         _createZoneState.nameRegex = data.nameRegex;
       } catch (err) {
-        alert('Could not load templates: ' + err.message);
+        // No modal is open yet — surface via the page-level error banner so the
+        // failure is visible to assistive tech (role=alert, aria-live=polite).
+        window._showPageError('Could not load zone templates: ' + err.message);
         return;
       }
     }
@@ -3408,7 +3450,7 @@ tr.clickable { cursor: pointer; }
         }
         html += '<div style="display:flex;align-items:center;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--border);">' +
           '<div style="display:flex;align-items:center;gap:8px;">' +
-            '<span style="background:' + zoneColor(name) + ';color:#000;font-size:10px;padding:2px 6px;border-radius:3px;">' + escapeHtml(name) + '</span>' +
+            (function() { var c = zoneColor(name); return '<span style="background:' + c.bg + ';color:' + c.text + ';font-size:10px;padding:2px 6px;border-radius:3px;">' + escapeHtml(name) + '</span>'; })() +
             '<span style="font-size:11px;color:' + statusColor + ';">' + escapeHtml(statusText) + '</span>' +
             (info.template ? '<span style="font-size:10px;color:var(--text-secondary);">tpl: ' + escapeHtml(info.template) + '</span>' : '') +
             '<span style="font-size:10px;color:var(--text-secondary);">' + threads + ' thread' + (threads === 1 ? '' : 's') + '</span>' +
