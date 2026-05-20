@@ -16,7 +16,12 @@ export const ZoneConfigSchema = z.object({
         z.string(), // zone name (e.g. "core", "perimeter")
         z.object({
             threads: z.array(z.number().int().positive()),
-            template: z.enum(["trusted", "untrusted"]).optional(),
+            // Template name is just a string here — the templates record in
+            // zone-templates.json is the source of truth on which names are
+            // valid, and `resolveTemplate()` validates at container-create time.
+            // Hardcoding a closed union here would lie to the compiler if a
+            // deployment legitimately added a third template.
+            template: z.string().min(1).optional(),
         }),
     ),
     defaults: z.object({

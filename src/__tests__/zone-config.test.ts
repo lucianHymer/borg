@@ -353,10 +353,30 @@ describe("template field (AD8/AD4)", () => {
         expect(loaded!.zones.perimeter.template).toBeUndefined();
     });
 
-    it("rejects invalid template value", () => {
-        const bad = {
+    it("accepts any non-empty template name (templates record is source of truth)", () => {
+        // Previously this test asserted the schema rejected unknown template
+        // names like "garbage". That hardcoded "trusted" | "untrusted" in two
+        // places (here + zone-templates.json) and would silently break if a
+        // deployment added a third template. Validation now happens at
+        // container-create time via resolveTemplate(), where the templates
+        // record is the source of truth on valid names.
+        const config = {
             zones: {
                 core: { threads: [1], template: "garbage" },
+                perimeter: { threads: [] },
+            },
+            defaults: { newThread: "perimeter" },
+        };
+        fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2));
+        const loaded = loadZoneConfig(CONFIG_PATH);
+        expect(loaded).not.toBeNull();
+        expect(loaded!.zones.core.template).toBe("garbage");
+    });
+
+    it("rejects empty-string template", () => {
+        const bad = {
+            zones: {
+                core: { threads: [1], template: "" },
                 perimeter: { threads: [] },
             },
             defaults: { newThread: "perimeter" },

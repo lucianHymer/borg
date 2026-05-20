@@ -25,14 +25,14 @@ import { mergeCorrectionsOntoDecisions } from "./routing-logger.js";
 import { readRecentJsonl } from "./jsonl-reader.js";
 import { loadZoneConfig, getThreadZone, addThreadToZone, removeThreadFromZones, saveZoneConfig, clearZoneConfigCache, listZoneDirs, listZoneDirsWithNames } from "./zone-config.js";
 import { createZoneContainer, deleteZoneContainer, getZoneContainerStatus } from "./zone-supervisor.js";
-import { loadZoneTemplates, ZONE_NAME_REGEX, RESERVED_ZONE_NAMES } from "./zone-templates.js";
+import { loadZoneTemplates, ZONE_NAME_REGEX, RESERVED_ZONE_NAMES, SYSTEM_ZONE_NAMES } from "./zone-templates.js";
 import { acquireZoneConfigLock } from "./zone-lock.js";
+import { writeTaskStopSignal } from "./task-stop.js";
 
 const SCRIPT_DIR = path.resolve(__dirname, "..");
 const BORG_DIR = path.join(SCRIPT_DIR, ".borg");
 const BORG_INFRA_DIR = path.join(SCRIPT_DIR, ".borg-infra");
 const BORG_ZONES_DIR = path.join(SCRIPT_DIR, ".borg-zones");
-const TASK_STOP_BASE = process.env.TASK_STOP_BASE ?? path.join(SCRIPT_DIR, ".borg-zones");
 const STATIC_DIR = path.join(SCRIPT_DIR, "static");
 const SESSIONS_DIR = path.join(BORG_DIR, "sessions");
 // threads.json is at project root (shared across all zone containers)
@@ -880,8 +880,6 @@ const ZONE_SUBDIRS = [
     "claude-skills",
 ];
 
-const SYSTEM_ZONE_NAMES = new Set(["core", "perimeter", "infra"]);
-
 function pendingDirs(): string[] {
     return listZoneDirs(ZONE_CONFIG_PATH, BORG_ZONES_DIR, "queue/pending");
 }
@@ -1025,7 +1023,7 @@ app.post("/api/zones", async (req, res) => {
 
             // 5. Add to config + save
             const updated = structuredClone(config);
-            updated.zones[name] = { threads: [], template: template as "trusted" | "untrusted" };
+            updated.zones[name] = { threads: [], template };
             saveZoneConfig(ZONE_CONFIG_PATH, updated);
             configAdded = true;
 
@@ -1074,7 +1072,7 @@ app.post("/api/zones", async (req, res) => {
             // 8. Create container
             let containerInfo;
             try {
-                containerInfo = await createZoneContainer({ zoneName: name, template: template as "trusted" | "untrusted" });
+                containerInfo = await createZoneContainer({ zoneName: name, template });
             } catch (err) {
                 // Parse step name from supervisor error message:
                 // "Failed to create zone "x" at step "load-template": ..."
@@ -1223,6 +1221,7 @@ app.get("/api/zone-templates", (_req, res) => {
         res.json({
             templates: out,
             reservedNames: Array.from(RESERVED_ZONE_NAMES),
+            systemNames: Array.from(SYSTEM_ZONE_NAMES),
             nameRegex: ZONE_NAME_REGEX.source,
         });
     } catch (err) {
@@ -1713,8 +1712,9 @@ app.post("/api/background-tasks/:taskId/stop", (req, res) => {
 
     // Find which zone this task belongs to by scanning task state files.
     // Iterate zone-keyed dirs only (no legacy BORG_DIR) because task-stop writes
-    // must land under TASK_STOP_BASE/{zone}/queue/task-stop — which is a separate
-    // read-write mount in compose, distinct from the read-only zones mount.
+    // must land under the rw-mounted zones base (.borg-zones-rw in compose) —
+    // a separate read-write mount, distinct from the read-only zones mount.
+    // The writeTaskStopSignal helper is the only legitimate writer to that mount.
     for (const { zone, dir } of listZoneDirsWithNames(ZONE_CONFIG_PATH, BORG_ZONES_DIR, "")) {
         const tasksDir = path.join(dir, "queue/tasks");
         if (!fs.existsSync(tasksDir)) continue;
@@ -1724,15 +1724,8 @@ app.post("/api/background-tasks/:taskId/stop", (req, res) => {
                 try {
                     const data = JSON.parse(fs.readFileSync(path.join(tasksDir, file), "utf8"));
                     if (data.tasks && data.tasks[taskId]) {
-                        // Found the task — write stop signal to the rw-mounted base for this zone
-                        const stopDir = path.join(TASK_STOP_BASE, zone, "queue/task-stop");
-                        if (!fs.existsSync(stopDir)) {
-                            fs.mkdirSync(stopDir, { recursive: true });
-                        }
-                        const stopFile = path.join(stopDir, `${taskId}.json`);
-                        const tmpFile = stopFile + ".tmp";
-                        fs.writeFileSync(tmpFile, JSON.stringify({ ts: Date.now() }));
-                        fs.renameSync(tmpFile, stopFile);
+                        // Found the task — write stop signal via the helper.
+                        writeTaskStopSignal(zone, taskId, { ts: Date.now() });
                         res.json({ ok: true, taskId });
                         return;
                     }

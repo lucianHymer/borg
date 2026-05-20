@@ -16,13 +16,22 @@
  */
 
 import { loadZoneConfig } from "./zone-config.js";
-import { loadZoneTemplates, resolveTemplate, type ZoneTemplate, type ZoneTemplateMount } from "./zone-templates.js";
+import { loadZoneTemplates, resolveTemplate, SYSTEM_ZONE_NAMES, type ZoneTemplate, type ZoneTemplateMount } from "./zone-templates.js";
 
 // ─── Types ───
 
 export interface CreateZoneOpts {
     zoneName: string;
-    template: "trusted" | "untrusted";
+    /**
+     * Template name. Validated at runtime by `resolveTemplate(templates, name)`
+     * which throws if the key is absent from zone-templates.json. We deliberately
+     * do NOT type this as a closed union of the built-in template names
+     * ("trusted" | "untrusted") because the templates record is loaded from JSON
+     * and may legitimately contain additional templates a deployment has added.
+     * A closed union would force callers to cast — silently bypassing any
+     * downstream exhaustiveness check if a third template were added later.
+     */
+    template: string;
     /** Explicit env overrides — primarily for tests. Production reads process.env. */
     envOverrides?: Record<string, string>;
     /**
@@ -81,8 +90,6 @@ interface RetryOpts {
 }
 
 // ─── Constants ───
-
-const SYSTEM_ZONES = new Set(["core", "perimeter", "infra"]);
 
 const REQUIRED_ENV_VARS = [
     "WORKSPACE_ROOT",
@@ -569,7 +576,7 @@ export async function ensureZoneContainersExist(opts: EnsureOpts): Promise<Ensur
     }
 
     for (const [zoneName, zone] of Object.entries(config.zones)) {
-        if (SYSTEM_ZONES.has(zoneName)) {
+        if (SYSTEM_ZONE_NAMES.has(zoneName)) {
             continue;
         }
         if (!zone.template) {
