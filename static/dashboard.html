@@ -3092,18 +3092,35 @@ tr.clickable { cursor: pointer; }
 
   // ─── Create Zone modal ───
 
+  // Lazily-cached response from GET /api/zone-templates. Shared between the
+  // Create Zone modal and the Manage Zones modal so SYSTEM_ZONE_NAMES is never
+  // hardcoded client-side — the server is the source of truth.
+  var _zoneTemplatesCache = null;
+
+  async function _fetchZoneTemplates() {
+    if (_zoneTemplatesCache) return _zoneTemplatesCache;
+    var resp = await fetch('/api/zone-templates');
+    if (!resp.ok) throw new Error('Failed to load templates (HTTP ' + resp.status + ')');
+    var data = await resp.json();
+    _zoneTemplatesCache = {
+      templates: data.templates,
+      reservedNames: new Set(data.reservedNames),
+      systemNames: new Set(data.systemNames || []),
+      nameRegex: new RegExp(data.nameRegex),
+    };
+    return _zoneTemplatesCache;
+  }
+
   var _createZoneState = { templates: null, reservedNames: null, nameRegex: null };
 
   window._openCreateZone = async function() {
     // Lazy-load templates the first time
     if (!_createZoneState.templates) {
       try {
-        var resp = await fetch('/api/zone-templates');
-        if (!resp.ok) throw new Error('Failed to load templates');
-        var data = await resp.json();
+        var data = await _fetchZoneTemplates();
         _createZoneState.templates = data.templates;
-        _createZoneState.reservedNames = new Set(data.reservedNames);
-        _createZoneState.nameRegex = new RegExp(data.nameRegex);
+        _createZoneState.reservedNames = data.reservedNames;
+        _createZoneState.nameRegex = data.nameRegex;
       } catch (err) {
         alert('Could not load templates: ' + err.message);
         return;
@@ -3197,8 +3214,6 @@ tr.clickable { cursor: pointer; }
 
   // ─── Manage Zones modal ───
 
-  const SYSTEM_ZONES = new Set(['core', 'perimeter', 'infra']);
-
   window._openManageZones = async function() {
     document.getElementById('manage-zones-modal').style.display = 'flex';
     await _renderManageZones();
@@ -3212,9 +3227,24 @@ tr.clickable { cursor: pointer; }
     var listEl = document.getElementById('mz-list');
     listEl.innerHTML = '<div style="color:var(--text-secondary);font-size:12px;padding:12px 0;">Loading…</div>';
     try {
-      var resp = await fetch('/api/zones');
-      if (!resp.ok) throw new Error('HTTP ' + resp.status);
-      var data = await resp.json();
+      // Fetch zones + templates metadata in parallel. The templates response
+      // carries `systemNames` — the canonical set of compose-managed zones
+      // (formerly hardcoded here as ['core','perimeter','infra']).
+      var zonesPromise = fetch('/api/zones').then(function(r) {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.json();
+      });
+      var systemNames;
+      try {
+        var tpl = await _fetchZoneTemplates();
+        systemNames = tpl.systemNames;
+      } catch (e) {
+        // Fall back to an empty set rather than blocking the whole view —
+        // worst case is system zones lose their "system" badge and sort
+        // alphabetically until the templates endpoint recovers.
+        systemNames = new Set();
+      }
+      var data = await zonesPromise;
       if (!data.configured) {
         listEl.innerHTML = '<div style="color:var(--text-secondary);font-size:12px;padding:12px 0;">Zone config not initialized yet. Create the first zone to bootstrap.</div>';
         return;
@@ -3223,7 +3253,7 @@ tr.clickable { cursor: pointer; }
       var containerStatus = data.containerStatus || {};
       var names = Object.keys(zones).sort(function(a, b) {
         // System zones first, then alphabetical
-        var aSys = SYSTEM_ZONES.has(a), bSys = SYSTEM_ZONES.has(b);
+        var aSys = systemNames.has(a), bSys = systemNames.has(b);
         if (aSys !== bSys) return aSys ? -1 : 1;
         return a.localeCompare(b);
       });
@@ -3232,7 +3262,7 @@ tr.clickable { cursor: pointer; }
         var info = zones[name] || {};
         var threads = (info.threads || []).length;
         var status = containerStatus[name] || 'unknown';
-        var isSystem = SYSTEM_ZONES.has(name);
+        var isSystem = systemNames.has(name);
         var statusColor = (status === 'running' || status === 'managed-by-compose') ? 'var(--accent-green)'
           : status === 'missing' ? 'var(--accent-red,#ff6b6b)'
           : 'var(--accent-yellow)';

@@ -49,9 +49,31 @@ export type ZoneTemplates = z.infer<typeof ZoneTemplatesSchema>;
 /** Lowercase alphanumeric + hyphen, 2–31 chars total, must start non-dash. */
 export const ZONE_NAME_REGEX = /^[a-z0-9][a-z0-9-]{1,30}$/;
 
-/** Names that clash with compose services or filesystem conventions. */
+/**
+ * Zones managed by docker-compose (rather than dashboard-created). These
+ * containers have different names and lifecycle semantics — the dynamic
+ * zone supervisor does NOT touch them, and the dashboard renders their
+ * status as "managed-by-compose".
+ *
+ * Must be a subset of RESERVED_ZONE_NAMES (enforced by test + construction
+ * below) — anything compose-managed is also unavailable for dashboard
+ * creation.
+ */
+export const SYSTEM_ZONE_NAMES = new Set(["core", "perimeter", "infra"]);
+
+/**
+ * Names that clash with compose services or filesystem conventions, plus
+ * the system zone names (compose-managed agent containers). Used by the
+ * dashboard create-zone API to reject conflicting new-zone names.
+ *
+ * NOTE: This is the "cannot create a new dynamic zone with this name" set.
+ * It is NOT a generic "this is not a valid zone identifier" check — code
+ * that needs to address existing zones (e.g. writing task-stop signals to
+ * system zones) must validate path-safety separately rather than using
+ * isValidZoneName, which rejects everything in this set.
+ */
 export const RESERVED_ZONE_NAMES = new Set([
-    "infra",
+    ...SYSTEM_ZONE_NAMES,
     "dashboard",
     "broker",
     "init",

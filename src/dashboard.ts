@@ -1135,9 +1135,16 @@ app.delete("/api/zones/:name", async (req, res) => {
             return;
         }
 
-        // 2. Reject system zones
-        if (RESERVED_ZONE_NAMES.has(name) || SYSTEM_ZONE_NAMES.has(name)) {
+        // 2. Reject system + reserved zones. SYSTEM_ZONE_NAMES ⊆
+        // RESERVED_ZONE_NAMES by construction (see zone-templates.ts), so a
+        // single RESERVED check covers both — kept explicit here for the
+        // clearer error message on the system-zone subset.
+        if (SYSTEM_ZONE_NAMES.has(name)) {
             res.status(400).json({ error: "Cannot delete system zone" });
+            return;
+        }
+        if (RESERVED_ZONE_NAMES.has(name)) {
+            res.status(400).json({ error: `Zone name "${name}" is reserved` });
             return;
         }
 

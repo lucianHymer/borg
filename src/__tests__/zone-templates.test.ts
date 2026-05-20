@@ -7,6 +7,7 @@ import {
     isValidZoneName,
     clearZoneTemplatesCache,
     RESERVED_ZONE_NAMES,
+    SYSTEM_ZONE_NAMES,
     ZoneTemplates,
     ZoneTemplate,
 } from "../zone-templates.js";
@@ -233,8 +234,12 @@ describe("isValidZoneName — invalid names", () => {
 });
 
 describe("isValidZoneName — reserved names", () => {
-    // Per AD5, each of these must be rejected
+    // Per AD5, each of these must be rejected. The first three are also
+    // system zones (compose-managed agent containers); the rest are
+    // compose service names or filesystem conventions.
     const reserved = [
+        "core",
+        "perimeter",
         "infra",
         "dashboard",
         "broker",
@@ -253,5 +258,21 @@ describe("isValidZoneName — reserved names", () => {
 
     it("RESERVED_ZONE_NAMES contains exactly the documented set", () => {
         expect(new Set(reserved)).toEqual(RESERVED_ZONE_NAMES);
+    });
+});
+
+describe("SYSTEM_ZONE_NAMES", () => {
+    it("contains the three compose-managed agent zones", () => {
+        expect(SYSTEM_ZONE_NAMES).toEqual(new Set(["core", "perimeter", "infra"]));
+    });
+
+    it("is a subset of RESERVED_ZONE_NAMES (every system zone is also reserved)", () => {
+        // This invariant guarantees the dashboard's create-zone endpoint
+        // cannot accidentally accept a system-zone name even if the explicit
+        // SYSTEM_ZONE_NAMES check were ever removed — RESERVED_ZONE_NAMES
+        // already blocks them.
+        for (const name of SYSTEM_ZONE_NAMES) {
+            expect(RESERVED_ZONE_NAMES.has(name)).toBe(true);
+        }
     });
 });
