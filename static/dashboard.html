@@ -19,6 +19,13 @@
   --accent-red: #f85149;
   --accent-yellow: #d29922;
   --font-mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+  /* ─── Z-Index Scale ───
+   * Layered so modals always render above the zone-badge dropdown,
+   * and nested "secret display" modals render above their parent modal.
+   */
+  --z-dropdown: 900;
+  --z-modal: 1000;
+  --z-modal-nested: 1100;
 }
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -829,6 +836,46 @@ tr.clickable { cursor: pointer; }
   max-height: 500px;
   overflow-y: auto;
 }
+
+/* ─── Modals ───
+ * .modal-backdrop is the full-viewport dimmer; toggle via inline
+ *   style.display = 'flex' / 'none' (legacy JS still uses that pattern).
+ * .modal-shell is the centered card. Override --modal-max-width inline
+ *   for per-modal sizing (defaults to 560px).
+ * .modal-shell--flex gives the standard column layout + overflow clipping
+ *   used by 4 of the 5 modals; the secret-display modal omits it and
+ *   instead sets its own padding via .modal-shell--padded.
+ * Nested modals (e.g. webhook-secret-modal opened on top of webhook-modal)
+ *   add .modal-backdrop--nested to bump z-index above the parent modal.
+ */
+.modal-backdrop {
+  display: none; /* JS flips to 'flex' to show */
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  z-index: var(--z-modal);
+  align-items: center;
+  justify-content: center;
+}
+
+.modal-backdrop--nested { z-index: var(--z-modal-nested); }
+
+.modal-shell {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  width: 90%;
+  max-width: var(--modal-max-width, 560px);
+}
+
+.modal-shell--flex {
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.modal-shell--padded { padding: 20px; }
 </style>
 </head>
 <body>
@@ -987,8 +1034,8 @@ tr.clickable { cursor: pointer; }
   </div>
 
   <!-- Task Detail Modal -->
-  <div id="task-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:1000;align-items:center;justify-content:center;">
-    <div style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;max-width:700px;width:90%;max-height:80vh;display:flex;flex-direction:column;overflow:hidden;">
+  <div id="task-modal" class="modal-backdrop">
+    <div class="modal-shell modal-shell--flex" style="--modal-max-width:700px;">
       <div style="display:flex;justify-content:space-between;align-items:center;padding:16px 20px;border-bottom:1px solid var(--border);">
         <span id="task-modal-name" style="font-weight:600;font-size:15px;"></span>
         <button id="task-modal-close" style="background:none;border:none;color:var(--text-secondary);font-size:20px;cursor:pointer;padding:0;line-height:1;">×</button>
@@ -1012,8 +1059,8 @@ tr.clickable { cursor: pointer; }
     <div id="webhooks-deliveries"></div>
 
     <!-- Create/Edit modal -->
-    <div id="webhook-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:1000;align-items:center;justify-content:center;">
-      <div style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;max-width:560px;width:90%;max-height:80vh;display:flex;flex-direction:column;overflow:hidden;">
+    <div id="webhook-modal" class="modal-backdrop">
+      <div class="modal-shell modal-shell--flex">
         <div style="display:flex;justify-content:space-between;align-items:center;padding:16px 20px;border-bottom:1px solid var(--border);">
           <span id="webhook-modal-title" style="font-weight:600;font-size:15px;">Create Webhook</span>
           <button onclick="window._closeWebhookModal()" style="background:none;border:none;color:var(--text-secondary);font-size:20px;cursor:pointer;padding:0;line-height:1;">×</button>
@@ -1070,9 +1117,9 @@ tr.clickable { cursor: pointer; }
       </div>
     </div>
 
-    <!-- Secret display modal -->
-    <div id="webhook-secret-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:1001;align-items:center;justify-content:center;">
-      <div style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;max-width:500px;width:90%;padding:20px;">
+    <!-- Secret display modal (nested on top of webhook-modal) -->
+    <div id="webhook-secret-modal" class="modal-backdrop modal-backdrop--nested">
+      <div class="modal-shell modal-shell--padded" style="--modal-max-width:500px;">
         <div style="font-weight:600;font-size:15px;margin-bottom:12px;">Webhook Created</div>
         <div style="color:var(--accent-yellow);font-size:12px;margin-bottom:12px;">Copy this secret now — it won't be shown again.</div>
         <div style="position:relative;">
@@ -1085,8 +1132,8 @@ tr.clickable { cursor: pointer; }
   </div>
 
   <!-- Create Zone modal -->
-  <div id="create-zone-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:1000;align-items:center;justify-content:center;">
-    <div style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;max-width:480px;width:90%;display:flex;flex-direction:column;overflow:hidden;">
+  <div id="create-zone-modal" class="modal-backdrop">
+    <div class="modal-shell modal-shell--flex" style="--modal-max-width:480px;">
       <div style="display:flex;justify-content:space-between;align-items:center;padding:16px 20px;border-bottom:1px solid var(--border);">
         <span style="font-weight:600;font-size:15px;">Create New Zone</span>
         <button onclick="window._closeCreateZone()" style="background:none;border:none;color:var(--text-secondary);font-size:20px;cursor:pointer;padding:0;line-height:1;">×</button>
@@ -1111,8 +1158,8 @@ tr.clickable { cursor: pointer; }
   </div>
 
   <!-- Manage Zones modal -->
-  <div id="manage-zones-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:1000;align-items:center;justify-content:center;">
-    <div style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;max-width:640px;width:90%;max-height:80vh;display:flex;flex-direction:column;overflow:hidden;">
+  <div id="manage-zones-modal" class="modal-backdrop">
+    <div class="modal-shell modal-shell--flex" style="--modal-max-width:640px;">
       <div style="display:flex;justify-content:space-between;align-items:center;padding:16px 20px;border-bottom:1px solid var(--border);">
         <span style="font-weight:600;font-size:15px;">Zones</span>
         <button onclick="window._closeManageZones()" style="background:none;border:none;color:var(--text-secondary);font-size:20px;cursor:pointer;padding:0;line-height:1;">×</button>
@@ -1558,7 +1605,7 @@ tr.clickable { cursor: pointer; }
 
     var dropdown = document.createElement('div');
     dropdown.id = 'zone-dropdown';
-    dropdown.style.cssText = 'position:fixed;z-index:1000;background:var(--bg-secondary);border:1px solid var(--border);border-radius:6px;padding:4px 0;box-shadow:0 4px 12px rgba(0,0,0,0.3);' +
+    dropdown.style.cssText = 'position:fixed;z-index:var(--z-dropdown);background:var(--bg-secondary);border:1px solid var(--border);border-radius:6px;padding:4px 0;box-shadow:0 4px 12px rgba(0,0,0,0.3);' +
       'top:' + (rect.bottom + 4) + 'px;left:' + rect.left + 'px;min-width:100px;';
 
     _availableZones.forEach(function(z) {
