@@ -1663,32 +1663,39 @@ tr.clickable { cursor: pointer; }
 
   var _availableZones = []; // populated from /api/zones
 
-  // Relative luminance for hsl(h, s%, l%) per WCAG sRGB linearization.
-  function hslLuminance(h, s, l) {
-    s /= 100; l /= 100;
-    var a = s * Math.min(l, 1 - l);
-    function f(n) {
-      var k = (n + h / 30) % 12;
-      return l - a * Math.max(-1, Math.min(k - 3, 9 - k, 1));
-    }
-    var r = f(0), g = f(8), b = f(4);
-    function lin(c) { return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4); }
-    return 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b);
-  }
+  // Curated palette of 16 pre-validated, visually distinct colors.
+  // Each entry's bg + text pairing clears WCAG 4.5:1 contrast (worst: 5.79:1).
+  // Adjacent entries vary in hue + lightness + saturation, so even on hash
+  // collision the visual ambiguity is bounded. Replaces a 360-hue hash that
+  // hit ~50% collision probability at ~19 zones (birthday paradox).
+  var ZONE_PALETTE = [
+    { bg: 'hsl(0, 65%, 45%)',   text: '#fff' },  // red
+    { bg: 'hsl(25, 70%, 50%)',  text: '#000' },  // orange
+    { bg: 'hsl(45, 80%, 55%)',  text: '#000' },  // yellow
+    { bg: 'hsl(80, 55%, 50%)',  text: '#000' },  // lime
+    { bg: 'hsl(140, 50%, 30%)', text: '#fff' },  // green
+    { bg: 'hsl(170, 55%, 28%)', text: '#fff' },  // teal
+    { bg: 'hsl(195, 70%, 50%)', text: '#000' },  // cyan
+    { bg: 'hsl(220, 65%, 48%)', text: '#fff' },  // blue
+    { bg: 'hsl(250, 55%, 55%)', text: '#fff' },  // indigo
+    { bg: 'hsl(280, 50%, 48%)', text: '#fff' },  // violet
+    { bg: 'hsl(310, 55%, 40%)', text: '#fff' },  // magenta
+    { bg: 'hsl(340, 65%, 45%)', text: '#fff' },  // pink
+    { bg: 'hsl(15, 60%, 70%)',  text: '#000' },  // peach
+    { bg: 'hsl(120, 30%, 70%)', text: '#000' },  // sage
+    { bg: 'hsl(200, 30%, 70%)', text: '#000' },  // sky
+    { bg: 'hsl(290, 30%, 70%)', text: '#000' },  // lilac
+  ];
 
   function zoneColor(name) {
     if (name === 'core') return { bg: 'var(--accent-green)', text: '#000' };
     if (name === 'perimeter') return { bg: 'var(--accent-yellow)', text: '#000' };
     var h = 0;
     for (var i = 0; i < name.length; i++) {
-      h = ((h << 5) - h + name.charCodeAt(i)) | 0;
+      h = (h * 31 + name.charCodeAt(i)) | 0;
     }
-    var hue = Math.abs(h) % 360;
-    var s = 60, l = 55;
-    // Threshold ~0.179 is the WCAG sRGB crossover where black/white text yield
-    // equal contrast (~4.6:1) — picking either side guarantees >= 4.5:1 here.
-    var text = hslLuminance(hue, s, l) > 0.179 ? '#000' : '#fff';
-    return { bg: 'hsl(' + hue + ', ' + s + '%, ' + l + '%)', text: text };
+    var idx = Math.abs(h) % ZONE_PALETTE.length;
+    return ZONE_PALETTE[idx];
   }
 
   function zoneBadge(zone, threadId) {
