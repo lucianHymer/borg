@@ -923,7 +923,7 @@ tr.clickable { cursor: pointer; }
 <div id="main">
   <!-- Page-level error banner (used when something fails outside any open modal,
        e.g. template-load failure during _openCreateZone before the modal opens) -->
-  <div id="page-error" role="alert" aria-live="polite" style="display:none;background:rgba(248,81,73,0.1);border:1px solid var(--accent-red,#ff6b6b);color:var(--accent-red,#ff6b6b);padding:8px 12px;margin:8px;border-radius:4px;font-size:12px;display:none;">
+  <div id="page-error" role="alert" aria-live="polite" style="display:none;background:rgba(248,81,73,0.1);border:1px solid var(--accent-red,#ff6b6b);color:var(--accent-red,#ff6b6b);padding:8px 12px;margin:8px;border-radius:4px;font-size:12px;">
     <span id="page-error-text"></span>
     <button onclick="window._dismissPageError()" aria-label="Dismiss error" style="background:none;border:none;color:var(--accent-red,#ff6b6b);font-size:14px;cursor:pointer;float:right;line-height:1;padding:0 4px;">×</button>
   </div>
@@ -2855,6 +2855,16 @@ tr.clickable { cursor: pointer; }
       }
     }
     if (sensitiveNames.length > 0) {
+      // KEPT AS native confirm() — interim. TODO(a11y): replace with a real
+      // modal dialog (role=alertdialog) for screen-reader compatibility.
+      //
+      // Justification: this is a self-destructive action (reducing memory on
+      // dashboard/docker-proxy can make the dashboard unreachable). The
+      // surrounding logic depends on confirm()'s SYNCHRONOUS blocking
+      // semantics — see the snapshot/re-validate comments above and below.
+      // Converting to an async modal here requires restructuring the entire
+      // applyMemoryChanges() function to a callback/await pattern; doing that
+      // safely is out of scope for this task and is tracked separately.
       var ok = confirm(
         'WARNING: You are adjusting memory for: ' + sensitiveNames.join(', ') + '\n\n' +
         'These containers are required for dashboard operation. ' +
@@ -3102,7 +3112,22 @@ tr.clickable { cursor: pointer; }
   }
   document.getElementById('wh-formatter').addEventListener('change', toggleGithubFilterRows);
 
+  // Show / hide the Webhook modal's inline error region.
+  function _showWhError(msg) {
+    var el = document.getElementById('wh-error');
+    if (!el) return;
+    el.textContent = msg;
+    el.style.display = 'block';
+  }
+  function _clearWhError() {
+    var el = document.getElementById('wh-error');
+    if (!el) return;
+    el.textContent = '';
+    el.style.display = 'none';
+  }
+
   window._showCreateWebhook = function() {
+    _clearWhError();
     document.getElementById('wh-edit-id').value = '';
     document.getElementById('wh-name').value = '';
     document.getElementById('wh-formatter').value = 'github';
@@ -3122,6 +3147,7 @@ tr.clickable { cursor: pointer; }
   window._editWebhook = function(id) {
     var wh = webhooksCache.find(function(w) { return w.id === id; });
     if (!wh) return;
+    _clearWhError();
     document.getElementById('wh-edit-id').value = id;
     document.getElementById('wh-name').value = wh.name || '';
     document.getElementById('wh-formatter').value = wh.formatter || 'raw';
@@ -3173,7 +3199,8 @@ tr.clickable { cursor: pointer; }
     var ntfyDebounceRaw = document.getElementById('wh-ntfy-debounce').value.trim();
     var ntfyDebounceMs = ntfyDebounceRaw ? parseInt(ntfyDebounceRaw, 10) : undefined;
 
-    if (!name) { alert('Name is required'); return; }
+    _clearWhError();
+    if (!name) { _showWhError('Name is required'); return; }
 
     var requireSignature = document.getElementById('wh-require-sig').checked;
     var body = { name: name, formatter: formatter, eventFilter: eventFilter, labelFilter: labelFilter, ignoreSenders: ignoreSenders, requireSignature: requireSignature };
@@ -3197,7 +3224,7 @@ tr.clickable { cursor: pointer; }
       });
       var data = await res.json();
       if (!res.ok) {
-        alert('Error: ' + (data.error || 'Unknown error'));
+        _showWhError('Error: ' + (data.error || 'Unknown error'));
         return;
       }
       window._closeWebhookModal();
@@ -3209,41 +3236,113 @@ tr.clickable { cursor: pointer; }
         fetchWebhooks();
       }
     } catch (e) {
-      alert('Request failed: ' + e.message);
+      _showWhError('Request failed: ' + e.message);
     }
   };
 
-  window._rotateWebhook = async function(id) {
-    if (!confirm('Rotate secret for this webhook? The old secret will stop working immediately.')) return;
-    try {
-      var res = await fetch('/api/webhooks/' + id + '/rotate', { method: 'POST' });
-      var data = await res.json();
-      if (!res.ok) {
-        alert('Error: ' + (data.error || 'Unknown error'));
-        return;
-      }
-      if (data.secret) {
-        document.getElementById('wh-secret-display').textContent = data.secret;
-        openModal(document.getElementById('webhook-secret-modal'));
-      }
-    } catch (e) {
-      alert('Request failed: ' + e.message);
+  // Find a webhook row's action cell by webhook id. Used by the inline
+  // confirm/rotate flows so we can swap the row's action area in place of a
+  // blocking native confirm() dialog.
+  function _findWebhookActionCell(id) {
+    var btns = document.querySelectorAll('#webhooks-list button[onclick*="' + id + '"]');
+    for (var i = 0; i < btns.length; i++) {
+      var td = btns[i].closest('td');
+      if (td) return td;
     }
+    return null;
+  }
+
+  // Show a "Confirm? Yes / Cancel" inline UI inside a webhook row's action
+  // cell. Returns the original innerHTML so the caller can restore it on
+  // cancel. `verb` is e.g. 'Rotate' or 'Delete'; `description` is the prompt.
+  function _showWebhookRowConfirm(id, verb, description, onYes) {
+    var cell = _findWebhookActionCell(id);
+    if (!cell) {
+      // Row not found — surface error via the webhooks list as a fallback.
+      var list = document.getElementById('webhooks-list');
+      if (list) {
+        var err = document.createElement('div');
+        err.setAttribute('role', 'alert');
+        err.setAttribute('aria-live', 'polite');
+        err.style.cssText = 'color:var(--accent-red,#ff6b6b);font-size:12px;padding:8px 0;';
+        err.textContent = 'Could not locate webhook row for confirmation. Please refresh.';
+        list.insertBefore(err, list.firstChild);
+      }
+      return;
+    }
+    var original = cell.innerHTML;
+    var yesId = 'wh-confirm-yes-' + id;
+    var noId = 'wh-confirm-no-' + id;
+    cell.innerHTML =
+      '<span role="alert" style="font-size:11px;color:var(--accent-red,#ff6b6b);margin-right:6px;">' +
+        escapeHtml(description) +
+      '</span>' +
+      '<button id="' + escapeAttr(yesId) + '" style="background:none;border:1px solid var(--accent-red,#ff6b6b);color:var(--accent-red,#ff6b6b);border-radius:3px;padding:1px 6px;font-size:10px;cursor:pointer;font-family:inherit;margin-right:4px;">Yes, ' + escapeHtml(verb.toLowerCase()) + '</button>' +
+      '<button id="' + escapeAttr(noId) + '" style="background:none;border:1px solid var(--border);color:var(--text-secondary);border-radius:3px;padding:1px 6px;font-size:10px;cursor:pointer;font-family:inherit;">Cancel</button>';
+    var yesBtn = document.getElementById(yesId);
+    var noBtn = document.getElementById(noId);
+    if (yesBtn) {
+      yesBtn.focus();
+      yesBtn.onclick = async function() {
+        yesBtn.disabled = true;
+        if (noBtn) noBtn.disabled = true;
+        yesBtn.textContent = verb + '…';
+        try {
+          await onYes(cell, original);
+        } catch (e) {
+          // Restore row + show inline error above the table.
+          cell.innerHTML = original;
+          var list = document.getElementById('webhooks-list');
+          if (list) {
+            var err = document.createElement('div');
+            err.setAttribute('role', 'alert');
+            err.setAttribute('aria-live', 'polite');
+            err.style.cssText = 'color:var(--accent-red,#ff6b6b);font-size:12px;padding:8px 0;';
+            err.textContent = verb + ' failed: ' + e.message;
+            list.insertBefore(err, list.firstChild);
+          }
+        }
+      };
+    }
+    if (noBtn) {
+      noBtn.onclick = function() { cell.innerHTML = original; };
+    }
+  }
+
+  window._rotateWebhook = function(id) {
+    _showWebhookRowConfirm(
+      id,
+      'Rotate',
+      'Rotate secret? The old secret will stop working immediately.',
+      async function() {
+        var res = await fetch('/api/webhooks/' + id + '/rotate', { method: 'POST' });
+        var data = await res.json();
+        if (!res.ok) {
+          throw new Error(data.error || 'Unknown error');
+        }
+        if (data.secret) {
+          document.getElementById('wh-secret-display').textContent = data.secret;
+          openModal(document.getElementById('webhook-secret-modal'));
+        }
+        fetchWebhooks();
+      }
+    );
   };
 
-  window._deleteWebhook = async function(id) {
-    if (!confirm('Delete this webhook? This cannot be undone.')) return;
-    try {
-      var res = await fetch('/api/webhooks/' + id + '/delete', { method: 'DELETE' });
-      var data = await res.json();
-      if (!res.ok) {
-        alert('Error: ' + (data.error || 'Unknown error'));
-        return;
+  window._deleteWebhook = function(id) {
+    _showWebhookRowConfirm(
+      id,
+      'Delete',
+      'Delete this webhook? This cannot be undone.',
+      async function() {
+        var res = await fetch('/api/webhooks/' + id + '/delete', { method: 'DELETE' });
+        var data = await res.json().catch(function() { return {}; });
+        if (!res.ok) {
+          throw new Error(data.error || 'Unknown error');
+        }
+        fetchWebhooks();
       }
-      fetchWebhooks();
-    } catch (e) {
-      alert('Request failed: ' + e.message);
-    }
+    );
   };
 
   // ─── Create Zone modal ───
@@ -3388,6 +3487,7 @@ tr.clickable { cursor: pointer; }
   // ─── Manage Zones modal ───
 
   window._openManageZones = async function() {
+    _clearMzError();
     openModal(document.getElementById('manage-zones-modal'));
     await _renderManageZones();
   };
@@ -3398,6 +3498,10 @@ tr.clickable { cursor: pointer; }
 
   async function _renderManageZones() {
     var listEl = document.getElementById('mz-list');
+    // Note: do NOT clear #mz-error here — _deleteZone calls _showMzError then
+    // re-renders the list on failure, and we want the error to persist so the
+    // user sees why their action failed. _clearMzError is called explicitly by
+    // _deleteZone before issuing a new attempt, and when the modal is reopened.
     listEl.innerHTML = '<div style="color:var(--text-secondary);font-size:12px;padding:12px 0;">Loading…</div>';
     try {
       // Fetch zones + templates metadata in parallel. The templates response
@@ -3464,19 +3568,81 @@ tr.clickable { cursor: pointer; }
     }
   }
 
-  window._deleteZone = async function(name) {
-    if (!confirm('Delete zone "' + name + '"? Its directory will be archived under .borg-zones/.archived/.')) return;
-    try {
-      var resp = await fetch('/api/zones/' + encodeURIComponent(name), { method: 'DELETE' });
-      var body = await resp.json().catch(function() { return {}; });
-      if (!resp.ok) {
-        alert(body.error || ('HTTP ' + resp.status));
-        return;
-      }
-      await _renderManageZones();
-      if (typeof fetchOverview === 'function') fetchOverview();
-    } catch (e) {
-      alert('Failed: ' + e.message);
+  // Show / hide the Manage Zones modal's inline error region.
+  function _showMzError(msg) {
+    var el = document.getElementById('mz-error');
+    if (!el) return;
+    el.textContent = msg;
+    el.style.display = 'block';
+  }
+  function _clearMzError() {
+    var el = document.getElementById('mz-error');
+    if (!el) return;
+    el.textContent = '';
+    el.style.display = 'none';
+  }
+
+  // Inline "Are you sure?" confirm row — replaces native confirm() so we keep
+  // screen-reader compatibility (role=alert) and consistent styling. The
+  // confirm UI swaps into the row in place of the Delete button; cancel
+  // re-renders the list to restore the original button.
+  window._deleteZone = function(name) {
+    _clearMzError();
+    // Find the row containing the clicked Delete button (its label is the
+    // zone-name pill). The list re-renders on success/cancel, so we don't
+    // need a stable per-row id — we locate the row by walking the DOM.
+    var rows = document.querySelectorAll('#mz-list > div');
+    var targetRow = null;
+    for (var i = 0; i < rows.length; i++) {
+      var pill = rows[i].querySelector('span');
+      if (pill && pill.textContent === name) { targetRow = rows[i]; break; }
+    }
+    if (!targetRow) {
+      // Row disappeared mid-flight — fall back to surfacing via mz-error so
+      // the action still has visible feedback.
+      _showMzError('Could not locate row for zone "' + name + '".');
+      return;
+    }
+    // Replace the row's right-hand action area with an inline confirm.
+    var confirmHtml =
+      '<span role="alert" style="font-size:11px;color:var(--accent-red,#ff6b6b);margin-right:8px;">' +
+        'Delete "' + escapeHtml(name) + '"? Archived under .borg-zones/.archived/.' +
+      '</span>' +
+      '<button id="mz-confirm-yes-' + escapeAttr(name) + '" style="background:none;border:1px solid var(--accent-red,#ff6b6b);color:var(--accent-red,#ff6b6b);border-radius:3px;padding:2px 8px;font-size:11px;cursor:pointer;font-family:inherit;margin-right:4px;">Yes, delete</button>' +
+      '<button id="mz-confirm-no-' + escapeAttr(name) + '" style="background:none;border:1px solid var(--border);color:var(--text-secondary);border-radius:3px;padding:2px 8px;font-size:11px;cursor:pointer;font-family:inherit;">Cancel</button>';
+    // Last child of the row is the action area (the Delete button); replace it.
+    var actionEl = targetRow.lastElementChild;
+    var wrap = document.createElement('span');
+    wrap.style.cssText = 'display:flex;align-items:center;';
+    wrap.innerHTML = confirmHtml;
+    targetRow.replaceChild(wrap, actionEl);
+    var yesBtn = document.getElementById('mz-confirm-yes-' + name);
+    var noBtn = document.getElementById('mz-confirm-no-' + name);
+    if (yesBtn) {
+      yesBtn.focus();
+      yesBtn.onclick = async function() {
+        yesBtn.disabled = true;
+        if (noBtn) noBtn.disabled = true;
+        yesBtn.textContent = 'Deleting…';
+        try {
+          var resp = await fetch('/api/zones/' + encodeURIComponent(name), { method: 'DELETE' });
+          var body = await resp.json().catch(function() { return {}; });
+          if (!resp.ok) {
+            _showMzError((body.error || ('HTTP ' + resp.status)) + ' (zone: ' + name + ')');
+            // Restore the row to its original state so the user can retry.
+            await _renderManageZones();
+            return;
+          }
+          await _renderManageZones();
+          if (typeof fetchOverview === 'function') fetchOverview();
+        } catch (e) {
+          _showMzError('Delete failed: ' + e.message + ' (zone: ' + name + ')');
+          await _renderManageZones();
+        }
+      };
+    }
+    if (noBtn) {
+      noBtn.onclick = function() { _renderManageZones(); };
     }
   };
 
