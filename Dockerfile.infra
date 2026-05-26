@@ -8,11 +8,12 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 # ── Dependency layer ──
-COPY package.json package-lock.json tsconfig.json ./
+COPY package.json package-lock.json tsconfig.json tsconfig.scripts.json ./
 RUN npm ci
 
 # ── Build layer ──
 COPY src/ ./src/
+COPY scripts/ ./scripts/
 RUN npm run build && npm prune --production
 
 # ── Runtime setup ──
