@@ -20,7 +20,7 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 # ── Dependency layer (cached unless package*.json changes) ───────────
-COPY package.json package-lock.json tsconfig.json ./
+COPY package.json package-lock.json tsconfig.json tsconfig.scripts.json ./
 
 # Install all deps (devDependencies needed for tsc build)
 RUN npm ci
@@ -28,6 +28,7 @@ RUN npm ci
 # ── Build layer ──────────────────────────────────────────────────────
 COPY src/ ./src/
 COPY .claude/ ./.claude/
+COPY scripts/ ./scripts/
 
 RUN npm run build
 
@@ -43,7 +44,6 @@ RUN rm -rf /app/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64-musl \
 
 # ── Runtime setup ────────────────────────────────────────────────────
 COPY entrypoint.sh heartbeat-cron.sh ./
-COPY scripts/ ./scripts/
 RUN chmod +x entrypoint.sh heartbeat-cron.sh
 
 COPY docker/github-token-helper.sh /usr/local/bin/github-token-helper

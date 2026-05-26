@@ -692,7 +692,7 @@ async function buildQueryOptions(
 
     const opts: Options = {
         model: effectiveModel,
-        effort,
+        effort: effort as Options["effort"],
         cwd: threadConfig.cwd,
         canUseTool: sdkCanUseTool,
         settingSources: ["project", "user"],
@@ -1472,7 +1472,7 @@ async function processScheduledTask(task: ScheduledTask): Promise<{ text: string
         prompt: task.prompt,
         options: {
             model: taskModel,
-            effort: "xhigh",
+            effort: "xhigh" as Options["effort"],
             cwd: task.cwd,
             canUseTool: sdkCanUseTool,
             settingSources: ["project", "user"],
@@ -1540,7 +1540,7 @@ async function processOneShot(msg: IncomingMessage): Promise<{ text: string; mod
         prompt: msg.message,
         options: {
             model: effectiveModel,
-            effort: "xhigh",
+            effort: "xhigh" as Options["effort"],
             cwd,
             canUseTool: sdkCanUseTool,
             settingSources: ["project", "user"],
