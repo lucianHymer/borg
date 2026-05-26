@@ -95,58 +95,27 @@ export async function transcribe(oggPath: string): Promise<string> {
 
 // ─── TTS: Text → MP3 file ───
 
-/** Max chars per TTS chunk — Kokoro-82M truncates beyond ~500 tokens. */
-const TTS_CHUNK_SIZE = 800;
+// Single Speaches call per synthesis — previous chunk+Buffer.concat approach
+// produced broken MP3s that ffmpeg/Telegram only decoded up to the first
+// stream's frame count, truncating long responses. If Speaches/Kokoro itself
+// silently truncates very long inputs, the size log below will reveal it.
 
-/** Split text into chunks at sentence boundaries, respecting max size. */
-function chunkText(text: string, maxLen: number): string[] {
-    if (text.length <= maxLen) return [text];
+export async function synthesize(text: string, voice?: string, speed?: number): Promise<string> {
+    const v = voice ?? "bf_alice";
+    const s = speed ?? 1.0;
+    const startMs = Date.now();
 
-    const chunks: string[] = [];
-    let remaining = text;
-
-    while (remaining.length > 0) {
-        if (remaining.length <= maxLen) {
-            chunks.push(remaining);
-            break;
-        }
-
-        // Find last sentence boundary within maxLen
-        const window = remaining.slice(0, maxLen);
-        let splitAt = -1;
-        // Prefer sentence-ending punctuation followed by space or end
-        for (const sep of [". ", "! ", "? ", ".\n", "!\n", "?\n"]) {
-            const idx = window.lastIndexOf(sep);
-            if (idx > splitAt) splitAt = idx + sep.length;
-        }
-        // Fallback: split at last space
-        if (splitAt <= 0) {
-            splitAt = window.lastIndexOf(" ");
-        }
-        // Last resort: hard split
-        if (splitAt <= 0) {
-            splitAt = maxLen;
-        }
-
-        chunks.push(remaining.slice(0, splitAt).trim());
-        remaining = remaining.slice(splitAt).trim();
-    }
-
-    return chunks.filter(c => c.length > 0);
-}
-
-async function synthesizeChunk(text: string, voice: string, speed: number): Promise<Buffer> {
     const res = await fetch(`${SPEACHES_URL}/v1/audio/speech`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
             model: TTS_MODEL,
-            voice,
+            voice: v,
             input: text,
-            speed,
+            speed: s,
             response_format: "mp3",
         }),
-        signal: AbortSignal.timeout(60_000),
+        signal: AbortSignal.timeout(180_000),
     });
 
     if (!res.ok) {
@@ -154,27 +123,15 @@ async function synthesizeChunk(text: string, voice: string, speed: number): Prom
         throw new Error(`TTS failed (${res.status}): ${body}`);
     }
 
-    return Buffer.from(await res.arrayBuffer());
-}
-
-export async function synthesize(text: string, voice?: string, speed?: number): Promise<string> {
-    const v = voice ?? "bf_alice";
-    const s = speed ?? 1.0;
-    const chunks = chunkText(text, TTS_CHUNK_SIZE);
-
-    // Synthesize all chunks (sequentially — Speaches queues internally)
-    const buffers: Buffer[] = [];
-    for (const chunk of chunks) {
-        buffers.push(await synthesizeChunk(chunk, v, s));
-    }
-
-    // Concatenate MP3 frames (MP3 is frame-based, simple concat works)
-    const combined = Buffer.concat(buffers);
+    const mp3 = Buffer.from(await res.arrayBuffer());
     const filename = `tts_${Date.now()}_${Math.random().toString(36).slice(2, 6)}.mp3`;
     const outPath = path.join(AUDIO_DIR, filename);
     const tmpPath = outPath + ".tmp";
-    fs.writeFileSync(tmpPath, combined);
+    fs.writeFileSync(tmpPath, mp3);
     fs.renameSync(tmpPath, outPath);
+
+    const elapsedMs = Date.now() - startMs;
+    console.log(`[audio] synthesize: input=${text.length} chars, output=${mp3.length} bytes, elapsed=${elapsedMs}ms, voice=${v}, speed=${s}`);
 
     return outPath;
 }
@@ -184,6 +141,7 @@ export async function synthesize(text: string, voice?: string, speed?: number): 
 export async function distillForSpeech(text: string): Promise<string> {
     // Cap input length before sending to distillation (100k chars — well within sonnet's context)
     const truncatedInput = text.length > 100_000 ? text.slice(0, 100_000) : text;
+    const startMs = Date.now();
 
     try {
         const conversation = query({
@@ -209,10 +167,15 @@ export async function distillForSpeech(text: string): Promise<string> {
             }
         }
 
-        return result.trim() || (text.length > 200 ? text.slice(0, 200) + "..." : text);
-    } catch {
-        // Fallback to truncation on SDK error
-        return text.length > 200 ? text.slice(0, 200) + "..." : text;
+        const out = result.trim() || (text.length > 200 ? text.slice(0, 200) + "..." : text);
+        const elapsedMs = Date.now() - startMs;
+        console.log(`[audio] distillForSpeech: input=${text.length} chars (truncated to ${truncatedInput.length}), output=${out.length} chars, elapsed=${elapsedMs}ms`);
+        return out;
+    } catch (err) {
+        const elapsedMs = Date.now() - startMs;
+        const fallback = text.length > 200 ? text.slice(0, 200) + "..." : text;
+        console.log(`[audio] distillForSpeech ERROR: input=${text.length} chars, fallback=${fallback.length} chars, elapsed=${elapsedMs}ms, err=${err instanceof Error ? err.message : String(err)}`);
+        return fallback;
     }
 }
 

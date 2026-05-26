@@ -2374,12 +2374,17 @@ bot.on("callback_query:data", async (ctx) => {
 
         // Try to get full text from cache first (for multi-segment messages)
         const messageModel = lookupMessageModel(messageId);
-        const fullText = messageModel?.fullText || ctx.callbackQuery.message?.text;
+        const cachedText = messageModel?.fullText;
+        const visibleText = ctx.callbackQuery.message?.text;
+        const fullText = cachedText || visibleText;
+        const fullTextSource = cachedText ? "cache" : (visibleText ? "visible" : "none");
 
         if (!fullText) {
             await ctx.answerCallbackQuery({ text: "❌ Message text not found" });
             return;
         }
+
+        log("INFO", `TTS listen: messageId=${messageId} fullText.length=${fullText.length} source=${fullTextSource} cached.length=${cachedText?.length ?? 0} visible.length=${visibleText?.length ?? 0}`);
 
         // Extract message context before async work
         const chatId = ctx.callbackQuery.message!.chat.id;  // safe: message exists (we got text from it or cache)
