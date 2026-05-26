@@ -19,9 +19,38 @@
   --accent-red: #f85149;
   --accent-yellow: #d29922;
   --font-mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+  /* ─── Z-Index Scale ───
+   * Layered so modals always render above the zone-badge dropdown,
+   * and nested "secret display" modals render above their parent modal.
+   */
+  --z-dropdown: 900;
+  --z-modal: 1000;
+  --z-modal-nested: 1100;
 }
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
+
+/* ─── A11y: visible focus indicator ───
+ * Browsers hide :focus on mouse-clicked buttons by default. :focus-visible
+ * restores the outline only for keyboard navigation, so mouse users aren't
+ * spammed with rings on every click while keyboard users can see where they are.
+ */
+:focus-visible {
+  outline: 2px solid var(--accent-blue);
+  outline-offset: 2px;
+}
+
+/* ─── A11y: honor prefers-reduced-motion ───
+ * Vestibular-disorder safety: collapse all animations/transitions to ~0
+ * for users who've opted out at the OS level.
+ */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
 
 html, body {
   height: 100%;
@@ -829,6 +858,46 @@ tr.clickable { cursor: pointer; }
   max-height: 500px;
   overflow-y: auto;
 }
+
+/* ─── Modals ───
+ * .modal-backdrop is the full-viewport dimmer; toggle via inline
+ *   style.display = 'flex' / 'none' (legacy JS still uses that pattern).
+ * .modal-shell is the centered card. Override --modal-max-width inline
+ *   for per-modal sizing (defaults to 560px).
+ * .modal-shell--flex gives the standard column layout + overflow clipping
+ *   used by 4 of the 5 modals; the secret-display modal omits it and
+ *   instead sets its own padding via .modal-shell--padded.
+ * Nested modals (e.g. webhook-secret-modal opened on top of webhook-modal)
+ *   add .modal-backdrop--nested to bump z-index above the parent modal.
+ */
+.modal-backdrop {
+  display: none; /* JS flips to 'flex' to show */
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  z-index: var(--z-modal);
+  align-items: center;
+  justify-content: center;
+}
+
+.modal-backdrop--nested { z-index: var(--z-modal-nested); }
+
+.modal-shell {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  width: 90%;
+  max-width: var(--modal-max-width, 560px);
+}
+
+.modal-shell--flex {
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.modal-shell--padded { padding: 20px; }
 </style>
 </head>
 <body>
@@ -852,6 +921,12 @@ tr.clickable { cursor: pointer; }
 </div>
 
 <div id="main">
+  <!-- Page-level error banner (used when something fails outside any open modal,
+       e.g. template-load failure during _openCreateZone before the modal opens) -->
+  <div id="page-error" role="alert" aria-live="polite" style="display:none;background:rgba(248,81,73,0.1);border:1px solid var(--accent-red,#ff6b6b);color:var(--accent-red,#ff6b6b);padding:8px 12px;margin:8px;border-radius:4px;font-size:12px;">
+    <span id="page-error-text"></span>
+    <button onclick="window._dismissPageError()" aria-label="Dismiss error" style="background:none;border:none;color:var(--accent-red,#ff6b6b);font-size:14px;cursor:pointer;float:right;line-height:1;padding:0 4px;">×</button>
+  </div>
   <!-- View: Overview -->
   <div id="view-overview" class="view">
     <h2>System Overview</h2>
@@ -861,9 +936,10 @@ tr.clickable { cursor: pointer; }
     <h3>Active Threads</h3>
     <div id="zone-filter" style="margin-bottom:8px;display:none;">
       <label style="font-size:12px;color:var(--text-secondary);">Zone: </label>
-      <select id="zone-filter-select" style="background:var(--bg-card);color:var(--text-primary);border:1px solid var(--border);border-radius:4px;padding:2px 6px;font-size:12px;">
+      <select id="zone-filter-select" style="background:var(--bg-secondary);color:var(--text-primary);border:1px solid var(--border);border-radius:4px;padding:2px 6px;font-size:12px;">
         <option value="">All</option>
       </select>
+      <button id="create-zone-btn" onclick="window._openCreateZone()" style="margin-left:8px;background:var(--bg-secondary);color:var(--accent-green);border:1px solid var(--accent-green);border-radius:4px;padding:1px 8px;font-size:12px;cursor:pointer;font-family:inherit;">+ Zone</button>
       <span id="zone-pending-count" style="margin-left:12px;font-size:12px;color:var(--accent-yellow);display:none;"></span>
     </div>
     <table id="threads-table">
@@ -986,11 +1062,11 @@ tr.clickable { cursor: pointer; }
   </div>
 
   <!-- Task Detail Modal -->
-  <div id="task-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:1000;align-items:center;justify-content:center;">
-    <div style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;max-width:700px;width:90%;max-height:80vh;display:flex;flex-direction:column;overflow:hidden;">
+  <div id="task-modal" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="task-modal-name">
+    <div class="modal-shell modal-shell--flex" style="--modal-max-width:700px;">
       <div style="display:flex;justify-content:space-between;align-items:center;padding:16px 20px;border-bottom:1px solid var(--border);">
         <span id="task-modal-name" style="font-weight:600;font-size:15px;"></span>
-        <button id="task-modal-close" style="background:none;border:none;color:var(--text-secondary);font-size:20px;cursor:pointer;padding:0;line-height:1;">×</button>
+        <button id="task-modal-close" aria-label="Close" style="background:none;border:none;color:var(--text-secondary);font-size:20px;cursor:pointer;padding:0;line-height:1;">×</button>
       </div>
       <div id="task-modal-meta" style="padding:12px 20px;border-bottom:1px solid var(--border);font-size:12px;color:var(--text-secondary);display:flex;flex-wrap:wrap;gap:16px;"></div>
       <div style="padding:16px 20px;overflow-y:auto;flex:1;">
@@ -1011,11 +1087,11 @@ tr.clickable { cursor: pointer; }
     <div id="webhooks-deliveries"></div>
 
     <!-- Create/Edit modal -->
-    <div id="webhook-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:1000;align-items:center;justify-content:center;">
-      <div style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;max-width:560px;width:90%;max-height:80vh;display:flex;flex-direction:column;overflow:hidden;">
+    <div id="webhook-modal" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="webhook-modal-title">
+      <div class="modal-shell modal-shell--flex">
         <div style="display:flex;justify-content:space-between;align-items:center;padding:16px 20px;border-bottom:1px solid var(--border);">
           <span id="webhook-modal-title" style="font-weight:600;font-size:15px;">Create Webhook</span>
-          <button onclick="window._closeWebhookModal()" style="background:none;border:none;color:var(--text-secondary);font-size:20px;cursor:pointer;padding:0;line-height:1;">×</button>
+          <button onclick="window._closeWebhookModal()" aria-label="Close" style="background:none;border:none;color:var(--text-secondary);font-size:20px;cursor:pointer;padding:0;line-height:1;">×</button>
         </div>
         <div style="padding:16px 20px;overflow-y:auto;flex:1;">
           <input type="hidden" id="wh-edit-id">
@@ -1064,21 +1140,64 @@ tr.clickable { cursor: pointer; }
             <label style="display:block;font-size:11px;color:var(--text-secondary);margin-bottom:4px;text-transform:uppercase;letter-spacing:0.5px;">ntfy Debounce (ms, optional)</label>
             <input id="wh-ntfy-debounce" type="number" placeholder="120000" style="width:100%;background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-primary);padding:6px 10px;border-radius:4px;font-size:12px;font-family:inherit;">
           </div>
+          <div id="wh-error" role="alert" aria-live="polite" style="display:none;color:var(--accent-red,#ff6b6b);font-size:12px;margin-bottom:12px;"></div>
           <button id="wh-submit-btn" onclick="window._submitWebhook()" class="usage-period-btn" style="border-color:var(--accent-green);color:var(--accent-green);width:100%;padding:8px;">Create</button>
         </div>
       </div>
     </div>
 
-    <!-- Secret display modal -->
-    <div id="webhook-secret-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:1001;align-items:center;justify-content:center;">
-      <div style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;max-width:500px;width:90%;padding:20px;">
-        <div style="font-weight:600;font-size:15px;margin-bottom:12px;">Webhook Created</div>
+    <!-- Secret display modal (nested on top of webhook-modal) -->
+    <div id="webhook-secret-modal" class="modal-backdrop modal-backdrop--nested" role="dialog" aria-modal="true" aria-labelledby="webhook-secret-modal-title">
+      <div class="modal-shell modal-shell--padded" style="--modal-max-width:500px;">
+        <div id="webhook-secret-modal-title" style="font-weight:600;font-size:15px;margin-bottom:12px;">Webhook Created</div>
         <div style="color:var(--accent-yellow);font-size:12px;margin-bottom:12px;">Copy this secret now — it won't be shown again.</div>
         <div style="position:relative;">
           <pre id="wh-secret-display" style="background:var(--bg-tertiary);border:1px solid var(--border);border-radius:4px;padding:12px;font-family:monospace;font-size:13px;word-break:break-all;white-space:pre-wrap;margin:0;color:var(--accent-green);"></pre>
           <button onclick="window._copyWebhookSecret()" style="position:absolute;top:6px;right:6px;background:var(--bg-secondary);border:1px solid var(--border);color:var(--text-secondary);border-radius:4px;padding:2px 8px;font-size:10px;cursor:pointer;font-family:inherit;">Copy</button>
         </div>
         <button onclick="window._closeSecretModal()" class="usage-period-btn" style="margin-top:16px;width:100%;padding:8px;">Done</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Create Zone modal -->
+  <div id="create-zone-modal" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="create-zone-modal-title">
+    <div class="modal-shell modal-shell--flex" style="--modal-max-width:480px;">
+      <div style="display:flex;justify-content:space-between;align-items:center;padding:16px 20px;border-bottom:1px solid var(--border);">
+        <span id="create-zone-modal-title" style="font-weight:600;font-size:15px;">Create New Zone</span>
+        <button onclick="window._closeCreateZone()" aria-label="Close" style="background:none;border:none;color:var(--text-secondary);font-size:20px;cursor:pointer;padding:0;line-height:1;">×</button>
+      </div>
+      <div style="padding:16px 20px;">
+        <div style="margin-bottom:12px;">
+          <label style="display:block;font-size:11px;color:var(--text-secondary);margin-bottom:4px;text-transform:uppercase;letter-spacing:0.5px;">Zone Name</label>
+          <input id="cz-name" type="text" placeholder="my-zone" autocomplete="off" style="width:100%;background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-primary);padding:6px 10px;border-radius:4px;font-size:12px;font-family:inherit;">
+          <div id="cz-name-hint" style="font-size:10px;color:var(--text-secondary);margin-top:4px;">lowercase, a–z 0–9 -, 2–31 chars</div>
+        </div>
+        <div style="margin-bottom:12px;">
+          <label style="display:block;font-size:11px;color:var(--text-secondary);margin-bottom:4px;text-transform:uppercase;letter-spacing:0.5px;">Template</label>
+          <div id="cz-templates" style="display:flex;flex-direction:column;gap:6px;"></div>
+        </div>
+        <div id="cz-error" style="display:none;color:var(--accent-red,#ff6b6b);font-size:12px;margin-bottom:12px;"></div>
+        <div style="display:flex;gap:8px;justify-content:flex-end;">
+          <button onclick="window._closeCreateZone()" class="usage-period-btn" style="padding:6px 14px;">Cancel</button>
+          <button id="cz-create-btn" onclick="window._submitCreateZone()" class="usage-period-btn" style="padding:6px 14px;border-color:var(--accent-green);color:var(--accent-green);" disabled>Create</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Manage Zones modal -->
+  <div id="manage-zones-modal" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="manage-zones-modal-title">
+    <div class="modal-shell modal-shell--flex" style="--modal-max-width:640px;">
+      <div style="display:flex;justify-content:space-between;align-items:center;padding:16px 20px;border-bottom:1px solid var(--border);">
+        <span id="manage-zones-modal-title" style="font-weight:600;font-size:15px;">Zones</span>
+        <button onclick="window._closeManageZones()" aria-label="Close" style="background:none;border:none;color:var(--text-secondary);font-size:20px;cursor:pointer;padding:0;line-height:1;">×</button>
+      </div>
+      <div id="mz-list" style="padding:8px 20px 16px 20px;overflow-y:auto;flex:1;"></div>
+      <div id="mz-error" role="alert" aria-live="polite" style="display:none;color:var(--accent-red,#ff6b6b);font-size:12px;padding:0 20px 12px 20px;"></div>
+      <div style="padding:12px 20px;border-top:1px solid var(--border);display:flex;justify-content:flex-end;gap:8px;">
+        <button onclick="window._closeManageZones()" class="usage-period-btn" style="padding:6px 14px;">Close</button>
+        <button onclick="window._closeManageZones(); window._openCreateZone();" class="usage-period-btn" style="padding:6px 14px;border-color:var(--accent-green);color:var(--accent-green);">+ Create new zone</button>
       </div>
     </div>
   </div>
@@ -1174,6 +1293,67 @@ tr.clickable { cursor: pointer; }
   function escapeAttr(str) {
     return escapeHtml(str).replace(/"/g, '&quot;').replace(/'/g, '&#39;');
   }
+
+  // ─── Modal a11y helpers ───
+  // openModal/closeModal centralize show/hide + focus management for the five
+  // dashboard modals. Existing per-modal form-setup and post-close side effects
+  // (e.g. fetchWebhooks() after closing the secret modal) stay at the call site;
+  // these helpers only own the display toggle + focus lifecycle.
+  const modalReturnFocus = new WeakMap(); // modalEl -> element to refocus on close
+  const modalTrapRelease = new WeakMap(); // modalEl -> trap teardown function
+
+  function trapFocus(modal) {
+    const focusables = modal.querySelectorAll(
+      'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+    );
+    if (focusables.length === 0) return function() {};
+    const first = focusables[0];
+    const last = focusables[focusables.length - 1];
+    function handler(e) {
+      if (e.key !== 'Tab') return;
+      if (e.shiftKey && document.activeElement === first) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault();
+        first.focus();
+      }
+    }
+    modal.addEventListener('keydown', handler);
+    return function() { modal.removeEventListener('keydown', handler); };
+  }
+
+  function openModal(modal) {
+    if (!modal) return;
+    modalReturnFocus.set(modal, document.activeElement);
+    modal.style.display = 'flex';
+    modalTrapRelease.set(modal, trapFocus(modal));
+    requestAnimationFrame(function() {
+      // Prefer form controls over buttons so the close (×) button isn't the
+      // landing focus — matches the prior _openCreateZone behavior of focusing
+      // the cz-name input. Falls back to any focusable if no form controls exist.
+      const formControl = modal.querySelector('input:not([disabled]):not([type="hidden"]), select:not([disabled]), textarea:not([disabled])');
+      const first = formControl || modal.querySelector('button:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])');
+      if (first) first.focus();
+    });
+  }
+
+  function closeModal(modal) {
+    if (!modal) return;
+    modal.style.display = 'none';
+    const release = modalTrapRelease.get(modal);
+    if (release) release();
+    modalTrapRelease.delete(modal);
+    const ret = modalReturnFocus.get(modal);
+    if (ret && document.body.contains(ret) && typeof ret.focus === 'function') {
+      ret.focus();
+    }
+    modalReturnFocus.delete(modal);
+  }
+
+  // Expose for any HTML-level callers that may want them in the future.
+  window._openModal = openModal;
+  window._closeModal = closeModal;
 
   function truncate(str, len) {
     if (!str) return '';
@@ -1477,11 +1657,46 @@ tr.clickable { cursor: pointer; }
     if (!team && !role) return '';
     var parts = [];
     if (team) parts.push('<span class="badge" style="background:var(--accent-blue);color:#000;font-size:10px;">' + escapeHtml(team) + '</span>');
-    if (role) parts.push('<span class="badge" style="background:var(--bg-alt);color:var(--text-secondary);font-size:10px;border:1px solid var(--border);">' + escapeHtml(role) + '</span>');
+    if (role) parts.push('<span class="badge" style="background:var(--bg-tertiary);color:var(--text-secondary);font-size:10px;border:1px solid var(--border);">' + escapeHtml(role) + '</span>');
     return parts.join(' ');
   }
 
   var _availableZones = []; // populated from /api/zones
+
+  // Curated palette of 16 pre-validated, visually distinct colors.
+  // Each entry's bg + text pairing clears WCAG 4.5:1 contrast (worst: 5.79:1).
+  // Adjacent entries vary in hue + lightness + saturation, so even on hash
+  // collision the visual ambiguity is bounded. Replaces a 360-hue hash that
+  // hit ~50% collision probability at ~19 zones (birthday paradox).
+  var ZONE_PALETTE = [
+    { bg: 'hsl(0, 65%, 45%)',   text: '#fff' },  // red
+    { bg: 'hsl(25, 70%, 50%)',  text: '#000' },  // orange
+    { bg: 'hsl(45, 80%, 55%)',  text: '#000' },  // yellow
+    { bg: 'hsl(80, 55%, 50%)',  text: '#000' },  // lime
+    { bg: 'hsl(140, 50%, 30%)', text: '#fff' },  // green
+    { bg: 'hsl(170, 55%, 28%)', text: '#fff' },  // teal
+    { bg: 'hsl(195, 70%, 50%)', text: '#000' },  // cyan
+    { bg: 'hsl(220, 65%, 48%)', text: '#fff' },  // blue
+    { bg: 'hsl(250, 55%, 55%)', text: '#fff' },  // indigo
+    { bg: 'hsl(280, 50%, 48%)', text: '#fff' },  // violet
+    { bg: 'hsl(310, 55%, 40%)', text: '#fff' },  // magenta
+    { bg: 'hsl(340, 65%, 45%)', text: '#fff' },  // pink
+    { bg: 'hsl(15, 60%, 70%)',  text: '#000' },  // peach
+    { bg: 'hsl(120, 30%, 70%)', text: '#000' },  // sage
+    { bg: 'hsl(200, 30%, 70%)', text: '#000' },  // sky
+    { bg: 'hsl(290, 30%, 70%)', text: '#000' },  // lilac
+  ];
+
+  function zoneColor(name) {
+    if (name === 'core') return { bg: 'var(--accent-green)', text: '#000' };
+    if (name === 'perimeter') return { bg: 'var(--accent-yellow)', text: '#000' };
+    var h = 0;
+    for (var i = 0; i < name.length; i++) {
+      h = (h * 31 + name.charCodeAt(i)) | 0;
+    }
+    var idx = Math.abs(h) % ZONE_PALETTE.length;
+    return ZONE_PALETTE[idx];
+  }
 
   function zoneBadge(zone, threadId) {
     if (!zone) {
@@ -1489,9 +1704,8 @@ tr.clickable { cursor: pointer; }
         'data-thread-id="' + escapeHtml(String(threadId)) + '" data-zone="" ' +
         'title="Click to assign zone">—</span>';
     }
-    var colors = { core: 'var(--accent-green)', perimeter: 'var(--accent-yellow)' };
-    var color = colors[zone] || 'var(--text-secondary)';
-    return '<span class="badge zone-badge" style="background:' + color + ';color:#000;font-size:10px;cursor:pointer;" ' +
+    var c = zoneColor(zone);
+    return '<span class="badge zone-badge" style="background:' + c.bg + ';color:' + c.text + ';font-size:10px;cursor:pointer;" ' +
       'data-thread-id="' + escapeHtml(String(threadId)) + '" data-zone="' + escapeHtml(zone) + '" ' +
       'title="Click to change zone">' + escapeHtml(zone) + '</span>';
   }
@@ -1507,7 +1721,7 @@ tr.clickable { cursor: pointer; }
 
     var dropdown = document.createElement('div');
     dropdown.id = 'zone-dropdown';
-    dropdown.style.cssText = 'position:fixed;z-index:1000;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;padding:4px 0;box-shadow:0 4px 12px rgba(0,0,0,0.3);' +
+    dropdown.style.cssText = 'position:fixed;z-index:var(--z-dropdown);background:var(--bg-secondary);border:1px solid var(--border);border-radius:6px;padding:4px 0;box-shadow:0 4px 12px rgba(0,0,0,0.3);' +
       'top:' + (rect.bottom + 4) + 'px;left:' + rect.left + 'px;min-width:100px;';
 
     _availableZones.forEach(function(z) {
@@ -1515,7 +1729,7 @@ tr.clickable { cursor: pointer; }
       item.textContent = z;
       item.style.cssText = 'padding:4px 12px;cursor:pointer;font-size:12px;color:var(--text-primary);';
       if (z === currentZone) item.style.color = 'var(--text-secondary)';
-      item.onmouseenter = function() { if (z !== currentZone) item.style.background = 'var(--bg-alt)'; };
+      item.onmouseenter = function() { if (z !== currentZone) item.style.background = 'var(--bg-tertiary)'; };
       item.onmouseleave = function() { item.style.background = ''; };
       item.onclick = function(e) {
         e.stopPropagation();
@@ -1540,7 +1754,7 @@ tr.clickable { cursor: pointer; }
       var removeItem = document.createElement('div');
       removeItem.textContent = 'Remove from zone';
       removeItem.style.cssText = 'padding:4px 12px;cursor:pointer;font-size:12px;color:var(--accent-red);';
-      removeItem.onmouseenter = function() { removeItem.style.background = 'var(--bg-alt)'; };
+      removeItem.onmouseenter = function() { removeItem.style.background = 'var(--bg-tertiary)'; };
       removeItem.onmouseleave = function() { removeItem.style.background = ''; };
       removeItem.onclick = function(e) {
         e.stopPropagation();
@@ -1555,6 +1769,22 @@ tr.clickable { cursor: pointer; }
       };
       dropdown.appendChild(removeItem);
     }
+
+    // Always-present "Manage zones…" entry
+    var manageSep = document.createElement('div');
+    manageSep.style.cssText = 'border-top:1px solid var(--border);margin:4px 0;';
+    dropdown.appendChild(manageSep);
+    var manageItem = document.createElement('div');
+    manageItem.textContent = 'Manage zones…';
+    manageItem.style.cssText = 'padding:4px 12px;cursor:pointer;font-size:12px;color:var(--text-secondary);';
+    manageItem.onmouseenter = function() { manageItem.style.background = 'var(--bg-tertiary)'; };
+    manageItem.onmouseleave = function() { manageItem.style.background = ''; };
+    manageItem.onclick = function(e) {
+      e.stopPropagation();
+      dropdown.remove();
+      window._openManageZones();
+    };
+    dropdown.appendChild(manageItem);
 
     document.body.appendChild(dropdown);
     // Close on outside click
@@ -2632,6 +2862,16 @@ tr.clickable { cursor: pointer; }
       }
     }
     if (sensitiveNames.length > 0) {
+      // KEPT AS native confirm() — interim. TODO(a11y): replace with a real
+      // modal dialog (role=alertdialog) for screen-reader compatibility.
+      //
+      // Justification: this is a self-destructive action (reducing memory on
+      // dashboard/docker-proxy can make the dashboard unreachable). The
+      // surrounding logic depends on confirm()'s SYNCHRONOUS blocking
+      // semantics — see the snapshot/re-validate comments above and below.
+      // Converting to an async modal here requires restructuring the entire
+      // applyMemoryChanges() function to a callback/await pattern; doing that
+      // safely is out of scope for this task and is tracked separately.
       var ok = confirm(
         'WARNING: You are adjusting memory for: ' + sensitiveNames.join(', ') + '\n\n' +
         'These containers are required for dashboard operation. ' +
@@ -2879,7 +3119,22 @@ tr.clickable { cursor: pointer; }
   }
   document.getElementById('wh-formatter').addEventListener('change', toggleGithubFilterRows);
 
+  // Show / hide the Webhook modal's inline error region.
+  function _showWhError(msg) {
+    var el = document.getElementById('wh-error');
+    if (!el) return;
+    el.textContent = msg;
+    el.style.display = 'block';
+  }
+  function _clearWhError() {
+    var el = document.getElementById('wh-error');
+    if (!el) return;
+    el.textContent = '';
+    el.style.display = 'none';
+  }
+
   window._showCreateWebhook = function() {
+    _clearWhError();
     document.getElementById('wh-edit-id').value = '';
     document.getElementById('wh-name').value = '';
     document.getElementById('wh-formatter').value = 'github';
@@ -2893,12 +3148,13 @@ tr.clickable { cursor: pointer; }
     document.getElementById('wh-submit-btn').textContent = 'Create';
     populateThreadDropdown();
     toggleGithubFilterRows();
-    document.getElementById('webhook-modal').style.display = 'flex';
+    openModal(document.getElementById('webhook-modal'));
   };
 
   window._editWebhook = function(id) {
     var wh = webhooksCache.find(function(w) { return w.id === id; });
     if (!wh) return;
+    _clearWhError();
     document.getElementById('wh-edit-id').value = id;
     document.getElementById('wh-name').value = wh.name || '';
     document.getElementById('wh-formatter').value = wh.formatter || 'raw';
@@ -2914,15 +3170,15 @@ tr.clickable { cursor: pointer; }
       document.getElementById('wh-thread').value = String(wh.threadId);
     });
     toggleGithubFilterRows();
-    document.getElementById('webhook-modal').style.display = 'flex';
+    openModal(document.getElementById('webhook-modal'));
   };
 
   window._closeWebhookModal = function() {
-    document.getElementById('webhook-modal').style.display = 'none';
+    closeModal(document.getElementById('webhook-modal'));
   };
 
   window._closeSecretModal = function() {
-    document.getElementById('webhook-secret-modal').style.display = 'none';
+    closeModal(document.getElementById('webhook-secret-modal'));
     fetchWebhooks();
   };
 
@@ -2950,7 +3206,8 @@ tr.clickable { cursor: pointer; }
     var ntfyDebounceRaw = document.getElementById('wh-ntfy-debounce').value.trim();
     var ntfyDebounceMs = ntfyDebounceRaw ? parseInt(ntfyDebounceRaw, 10) : undefined;
 
-    if (!name) { alert('Name is required'); return; }
+    _clearWhError();
+    if (!name) { _showWhError('Name is required'); return; }
 
     var requireSignature = document.getElementById('wh-require-sig').checked;
     var body = { name: name, formatter: formatter, eventFilter: eventFilter, labelFilter: labelFilter, ignoreSenders: ignoreSenders, requireSignature: requireSignature };
@@ -2974,54 +3231,443 @@ tr.clickable { cursor: pointer; }
       });
       var data = await res.json();
       if (!res.ok) {
-        alert('Error: ' + (data.error || 'Unknown error'));
+        _showWhError('Error: ' + (data.error || 'Unknown error'));
         return;
       }
       window._closeWebhookModal();
       if (!editId && data.secret) {
         // Show secret for new webhook
         document.getElementById('wh-secret-display').textContent = data.secret;
-        document.getElementById('webhook-secret-modal').style.display = 'flex';
+        openModal(document.getElementById('webhook-secret-modal'));
       } else {
         fetchWebhooks();
       }
     } catch (e) {
-      alert('Request failed: ' + e.message);
+      _showWhError('Request failed: ' + e.message);
     }
   };
 
-  window._rotateWebhook = async function(id) {
-    if (!confirm('Rotate secret for this webhook? The old secret will stop working immediately.')) return;
-    try {
-      var res = await fetch('/api/webhooks/' + id + '/rotate', { method: 'POST' });
-      var data = await res.json();
-      if (!res.ok) {
-        alert('Error: ' + (data.error || 'Unknown error'));
+  // Find a webhook row's action cell by webhook id. Used by the inline
+  // confirm/rotate flows so we can swap the row's action area in place of a
+  // blocking native confirm() dialog.
+  function _findWebhookActionCell(id) {
+    var btns = document.querySelectorAll('#webhooks-list button[onclick*="' + id + '"]');
+    for (var i = 0; i < btns.length; i++) {
+      var td = btns[i].closest('td');
+      if (td) return td;
+    }
+    return null;
+  }
+
+  // Show a "Confirm? Yes / Cancel" inline UI inside a webhook row's action
+  // cell. Returns the original innerHTML so the caller can restore it on
+  // cancel. `verb` is e.g. 'Rotate' or 'Delete'; `description` is the prompt.
+  function _showWebhookRowConfirm(id, verb, description, onYes) {
+    var cell = _findWebhookActionCell(id);
+    if (!cell) {
+      // Row not found — surface error via the webhooks list as a fallback.
+      var list = document.getElementById('webhooks-list');
+      if (list) {
+        // Remove any stale banners so repeated failures don't stack.
+        list.querySelectorAll('.webhook-row-error').forEach(function(el) { el.remove(); });
+        var err = document.createElement('div');
+        err.className = 'webhook-row-error';
+        err.setAttribute('role', 'alert');
+        err.setAttribute('aria-live', 'polite');
+        err.style.cssText = 'color:var(--accent-red,#ff6b6b);font-size:12px;padding:8px 0;';
+        err.textContent = 'Could not locate webhook row for confirmation. Please refresh.';
+        list.insertBefore(err, list.firstChild);
+      }
+      return;
+    }
+    var original = cell.innerHTML;
+    var yesId = 'wh-confirm-yes-' + id;
+    var noId = 'wh-confirm-no-' + id;
+    cell.innerHTML =
+      '<span role="alert" style="font-size:11px;color:var(--accent-red,#ff6b6b);margin-right:6px;">' +
+        escapeHtml(description) +
+      '</span>' +
+      '<button id="' + escapeAttr(yesId) + '" style="background:none;border:1px solid var(--accent-red,#ff6b6b);color:var(--accent-red,#ff6b6b);border-radius:3px;padding:1px 6px;font-size:10px;cursor:pointer;font-family:inherit;margin-right:4px;">Yes, ' + escapeHtml(verb.toLowerCase()) + '</button>' +
+      '<button id="' + escapeAttr(noId) + '" style="background:none;border:1px solid var(--border);color:var(--text-secondary);border-radius:3px;padding:1px 6px;font-size:10px;cursor:pointer;font-family:inherit;">Cancel</button>';
+    var yesBtn = document.getElementById(yesId);
+    var noBtn = document.getElementById(noId);
+    if (yesBtn) {
+      yesBtn.focus();
+      yesBtn.onclick = async function() {
+        yesBtn.disabled = true;
+        if (noBtn) noBtn.disabled = true;
+        yesBtn.textContent = verb + '…';
+        try {
+          await onYes(cell, original);
+        } catch (e) {
+          // Restore row + show inline error above the table.
+          cell.innerHTML = original;
+          var list = document.getElementById('webhooks-list');
+          if (list) {
+            // Remove any stale banners so repeated failures don't stack.
+            list.querySelectorAll('.webhook-row-error').forEach(function(el) { el.remove(); });
+            var err = document.createElement('div');
+            err.className = 'webhook-row-error';
+            err.setAttribute('role', 'alert');
+            err.setAttribute('aria-live', 'polite');
+            err.style.cssText = 'color:var(--accent-red,#ff6b6b);font-size:12px;padding:8px 0;';
+            err.textContent = verb + ' failed: ' + e.message;
+            list.insertBefore(err, list.firstChild);
+          }
+        }
+      };
+    }
+    if (noBtn) {
+      noBtn.onclick = function() { cell.innerHTML = original; };
+    }
+  }
+
+  window._rotateWebhook = function(id) {
+    _showWebhookRowConfirm(
+      id,
+      'Rotate',
+      'Rotate secret? The old secret will stop working immediately.',
+      async function() {
+        var res = await fetch('/api/webhooks/' + id + '/rotate', { method: 'POST' });
+        var data = await res.json();
+        if (!res.ok) {
+          throw new Error(data.error || 'Unknown error');
+        }
+        if (data.secret) {
+          document.getElementById('wh-secret-display').textContent = data.secret;
+          openModal(document.getElementById('webhook-secret-modal'));
+        }
+        fetchWebhooks();
+      }
+    );
+  };
+
+  window._deleteWebhook = function(id) {
+    _showWebhookRowConfirm(
+      id,
+      'Delete',
+      'Delete this webhook? This cannot be undone.',
+      async function() {
+        var res = await fetch('/api/webhooks/' + id + '/delete', { method: 'DELETE' });
+        var data = await res.json().catch(function() { return {}; });
+        if (!res.ok) {
+          throw new Error(data.error || 'Unknown error');
+        }
+        fetchWebhooks();
+      }
+    );
+  };
+
+  // ─── Create Zone modal ───
+
+  // Lazily-cached response from GET /api/zone-templates. Shared between the
+  // Create Zone modal and the Manage Zones modal so SYSTEM_ZONE_NAMES is never
+  // hardcoded client-side — the server is the source of truth.
+  var _zoneTemplatesCache = null;
+
+  async function _fetchZoneTemplates() {
+    if (_zoneTemplatesCache) return _zoneTemplatesCache;
+    var resp = await fetch('/api/zone-templates');
+    if (!resp.ok) throw new Error('Failed to load templates (HTTP ' + resp.status + ')');
+    var data = await resp.json();
+    _zoneTemplatesCache = {
+      templates: data.templates,
+      reservedNames: new Set(data.reservedNames),
+      systemNames: new Set(data.systemNames || []),
+      nameRegex: new RegExp(data.nameRegex),
+    };
+    return _zoneTemplatesCache;
+  }
+
+  var _createZoneState = { templates: null, reservedNames: null, nameRegex: null };
+
+  // Page-level error banner helpers — used when something fails outside any
+  // open modal (e.g. template-load failure before the Create Zone modal opens).
+  window._showPageError = function(msg) {
+    var el = document.getElementById('page-error');
+    var txt = document.getElementById('page-error-text');
+    if (!el || !txt) return;
+    txt.textContent = msg;
+    el.style.display = 'block';
+  };
+  window._dismissPageError = function() {
+    var el = document.getElementById('page-error');
+    if (el) el.style.display = 'none';
+  };
+
+  window._openCreateZone = async function() {
+    // Lazy-load templates the first time
+    if (!_createZoneState.templates) {
+      try {
+        var data = await _fetchZoneTemplates();
+        _createZoneState.templates = data.templates;
+        _createZoneState.reservedNames = data.reservedNames;
+        _createZoneState.nameRegex = data.nameRegex;
+      } catch (err) {
+        // No modal is open yet — surface via the page-level error banner so the
+        // failure is visible to assistive tech (role=alert, aria-live=polite).
+        window._showPageError('Could not load zone templates: ' + err.message);
         return;
       }
-      if (data.secret) {
-        document.getElementById('wh-secret-display').textContent = data.secret;
-        document.getElementById('webhook-secret-modal').style.display = 'flex';
+    }
+    // Render template radios
+    var tplContainer = document.getElementById('cz-templates');
+    tplContainer.innerHTML = '';
+    var names = Object.keys(_createZoneState.templates);
+    names.forEach(function(tplName, idx) {
+      var desc = _createZoneState.templates[tplName].description || '';
+      var radioId = 'cz-tpl-' + tplName;
+      var wrap = document.createElement('label');
+      wrap.style.cssText = 'display:flex;align-items:flex-start;gap:8px;font-size:12px;color:var(--text-primary);cursor:pointer;padding:6px;border:1px solid var(--border);border-radius:4px;';
+      wrap.innerHTML = '<input type="radio" name="cz-template" value="' + escapeAttr(tplName) + '" id="' + radioId + '"' + (idx === 0 ? ' checked' : '') + ' style="margin-top:2px;">' +
+        '<div><div style="font-weight:600;">' + escapeHtml(tplName) + '</div>' +
+        '<div style="font-size:11px;color:var(--text-secondary);">' + escapeHtml(desc) + '</div></div>';
+      tplContainer.appendChild(wrap);
+    });
+    Array.from(document.getElementsByName('cz-template')).forEach(function(r) { r.onchange = _validateCreateZone; });
+    // Reset state
+    document.getElementById('cz-name').value = '';
+    document.getElementById('cz-error').style.display = 'none';
+    document.getElementById('cz-name').oninput = _validateCreateZone;
+    _validateCreateZone();
+    // openModal will focus the first focusable element (cz-name) on next frame,
+    // replacing the prior setTimeout(..., 0) focus call.
+    openModal(document.getElementById('create-zone-modal'));
+  };
+
+  window._closeCreateZone = function() {
+    closeModal(document.getElementById('create-zone-modal'));
+  };
+
+  function _validateCreateZone() {
+    var name = document.getElementById('cz-name').value.trim();
+    var template = (document.querySelector('input[name="cz-template"]:checked') || {}).value;
+    var hint = document.getElementById('cz-name-hint');
+    var ok = true;
+    if (!name) { ok = false; hint.style.color = 'var(--text-secondary)'; }
+    else if (!_createZoneState.nameRegex.test(name)) { ok = false; hint.textContent = 'invalid format: lowercase, a–z 0–9 -, must start alphanumeric, 2–31 chars'; hint.style.color = 'var(--accent-red,#ff6b6b)'; }
+    else if (_createZoneState.reservedNames.has(name)) { ok = false; hint.textContent = 'reserved name'; hint.style.color = 'var(--accent-red,#ff6b6b)'; }
+    else { hint.textContent = 'lowercase, a–z 0–9 -, 2–31 chars'; hint.style.color = 'var(--text-secondary)'; }
+    if (!template) ok = false;
+    document.getElementById('cz-create-btn').disabled = !ok;
+  }
+
+  window._submitCreateZone = async function() {
+    var name = document.getElementById('cz-name').value.trim();
+    var template = (document.querySelector('input[name="cz-template"]:checked') || {}).value;
+    if (!name || !template) return;
+    var btn = document.getElementById('cz-create-btn');
+    var err = document.getElementById('cz-error');
+    err.style.display = 'none';
+    btn.disabled = true;
+    var origText = btn.textContent;
+    btn.textContent = 'Creating…';
+    try {
+      var resp = await fetch('/api/zones', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: name, template: template }),
+      });
+      var body = await resp.json().catch(function() { return {}; });
+      if (!resp.ok) {
+        err.textContent = (body.error || ('HTTP ' + resp.status)) + (body.step ? ' (step: ' + body.step + ')' : '');
+        err.style.display = 'block';
+        btn.disabled = false;
+        btn.textContent = origText;
+        return;
       }
+      // Success — close + refresh
+      window._closeCreateZone();
+      if (typeof fetchOverview === 'function') fetchOverview();
     } catch (e) {
-      alert('Request failed: ' + e.message);
+      err.textContent = e.message;
+      err.style.display = 'block';
+      btn.disabled = false;
+      btn.textContent = origText;
     }
   };
 
-  window._deleteWebhook = async function(id) {
-    if (!confirm('Delete this webhook? This cannot be undone.')) return;
+  // Close on background click + ESC
+  document.getElementById('create-zone-modal').addEventListener('click', function(e) {
+    if (e.target.id === 'create-zone-modal') window._closeCreateZone();
+  });
+  document.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape' && document.getElementById('create-zone-modal').style.display === 'flex') {
+      window._closeCreateZone();
+    }
+  });
+
+  // ─── Manage Zones modal ───
+
+  window._openManageZones = async function() {
+    _clearMzError();
+    openModal(document.getElementById('manage-zones-modal'));
+    await _renderManageZones();
+  };
+
+  window._closeManageZones = function() {
+    closeModal(document.getElementById('manage-zones-modal'));
+  };
+
+  async function _renderManageZones() {
+    var listEl = document.getElementById('mz-list');
+    // Note: do NOT clear #mz-error here — _deleteZone calls _showMzError then
+    // re-renders the list on failure, and we want the error to persist so the
+    // user sees why their action failed. _clearMzError is called explicitly by
+    // _deleteZone before issuing a new attempt, and when the modal is reopened.
+    listEl.innerHTML = '<div style="color:var(--text-secondary);font-size:12px;padding:12px 0;">Loading…</div>';
     try {
-      var res = await fetch('/api/webhooks/' + id + '/delete', { method: 'DELETE' });
-      var data = await res.json();
-      if (!res.ok) {
-        alert('Error: ' + (data.error || 'Unknown error'));
+      // Fetch zones + templates metadata in parallel. The templates response
+      // carries `systemNames` — the canonical set of compose-managed zones
+      // (formerly hardcoded here as ['core','perimeter','infra']).
+      var zonesPromise = fetch('/api/zones').then(function(r) {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.json();
+      });
+      var systemNames;
+      try {
+        var tpl = await _fetchZoneTemplates();
+        systemNames = tpl.systemNames;
+      } catch (e) {
+        // Fall back to an empty set rather than blocking the whole view —
+        // worst case is system zones lose their "system" badge and sort
+        // alphabetically until the templates endpoint recovers.
+        systemNames = new Set();
+      }
+      var data = await zonesPromise;
+      if (!data.configured) {
+        listEl.innerHTML = '<div style="color:var(--text-secondary);font-size:12px;padding:12px 0;">Zone config not initialized yet. Create the first zone to bootstrap.</div>';
         return;
       }
-      fetchWebhooks();
-    } catch (e) {
-      alert('Request failed: ' + e.message);
+      var zones = data.config.zones || {};
+      var containerStatus = data.containerStatus || {};
+      var names = Object.keys(zones).sort(function(a, b) {
+        // System zones first, then alphabetical
+        var aSys = systemNames.has(a), bSys = systemNames.has(b);
+        if (aSys !== bSys) return aSys ? -1 : 1;
+        return a.localeCompare(b);
+      });
+      var html = '';
+      names.forEach(function(name) {
+        var info = zones[name] || {};
+        var threads = (info.threads || []).length;
+        var status = containerStatus[name] || 'unknown';
+        var isSystem = systemNames.has(name);
+        var statusColor = (status === 'running' || status === 'managed-by-compose') ? 'var(--accent-green)'
+          : status === 'missing' ? 'var(--accent-red,#ff6b6b)'
+          : 'var(--accent-yellow)';
+        var statusText = status === 'managed-by-compose' ? 'running' : status;
+        var deleteBtn = '';
+        if (isSystem) {
+          deleteBtn = '<span style="color:var(--text-secondary);font-size:11px;">system</span>';
+        } else if (threads > 0) {
+          deleteBtn = '<button disabled title="Reassign ' + threads + ' thread' + (threads > 1 ? 's' : '') + ' first" style="background:none;border:1px solid var(--border);color:var(--text-secondary);border-radius:3px;padding:2px 8px;font-size:11px;cursor:not-allowed;font-family:inherit;">Delete</button>';
+        } else {
+          deleteBtn = '<button onclick="window._deleteZone(\'' + escapeAttr(name) + '\')" style="background:none;border:1px solid var(--accent-red,#ff6b6b);color:var(--accent-red,#ff6b6b);border-radius:3px;padding:2px 8px;font-size:11px;cursor:pointer;font-family:inherit;">Delete</button>';
+        }
+        html += '<div style="display:flex;align-items:center;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--border);">' +
+          '<div style="display:flex;align-items:center;gap:8px;">' +
+            (function() { var c = zoneColor(name); return '<span style="background:' + c.bg + ';color:' + c.text + ';font-size:10px;padding:2px 6px;border-radius:3px;">' + escapeHtml(name) + '</span>'; })() +
+            '<span style="font-size:11px;color:' + statusColor + ';">' + escapeHtml(statusText) + '</span>' +
+            (info.template ? '<span style="font-size:10px;color:var(--text-secondary);">tpl: ' + escapeHtml(info.template) + '</span>' : '') +
+            '<span style="font-size:10px;color:var(--text-secondary);">' + threads + ' thread' + (threads === 1 ? '' : 's') + '</span>' +
+          '</div>' +
+          deleteBtn +
+        '</div>';
+      });
+      listEl.innerHTML = html || '<div style="color:var(--text-secondary);font-size:12px;padding:12px 0;">No zones configured.</div>';
+    } catch (err) {
+      listEl.innerHTML = '<div style="color:var(--accent-red,#ff6b6b);font-size:12px;padding:12px 0;">Failed to load zones: ' + escapeHtml(err.message) + '</div>';
+    }
+  }
+
+  // Show / hide the Manage Zones modal's inline error region.
+  function _showMzError(msg) {
+    var el = document.getElementById('mz-error');
+    if (!el) return;
+    el.textContent = msg;
+    el.style.display = 'block';
+  }
+  function _clearMzError() {
+    var el = document.getElementById('mz-error');
+    if (!el) return;
+    el.textContent = '';
+    el.style.display = 'none';
+  }
+
+  // Inline "Are you sure?" confirm row — replaces native confirm() so we keep
+  // screen-reader compatibility (role=alert) and consistent styling. The
+  // confirm UI swaps into the row in place of the Delete button; cancel
+  // re-renders the list to restore the original button.
+  window._deleteZone = function(name) {
+    _clearMzError();
+    // Find the row containing the clicked Delete button (its label is the
+    // zone-name pill). The list re-renders on success/cancel, so we don't
+    // need a stable per-row id — we locate the row by walking the DOM.
+    var rows = document.querySelectorAll('#mz-list > div');
+    var targetRow = null;
+    for (var i = 0; i < rows.length; i++) {
+      var pill = rows[i].querySelector('span');
+      if (pill && pill.textContent === name) { targetRow = rows[i]; break; }
+    }
+    if (!targetRow) {
+      // Row disappeared mid-flight — fall back to surfacing via mz-error so
+      // the action still has visible feedback.
+      _showMzError('Could not locate row for zone "' + name + '".');
+      return;
+    }
+    // Replace the row's right-hand action area with an inline confirm.
+    var confirmHtml =
+      '<span role="alert" style="font-size:11px;color:var(--accent-red,#ff6b6b);margin-right:8px;">' +
+        'Delete "' + escapeHtml(name) + '"? Archived under .borg-zones/.archived/.' +
+      '</span>' +
+      '<button id="mz-confirm-yes-' + escapeAttr(name) + '" style="background:none;border:1px solid var(--accent-red,#ff6b6b);color:var(--accent-red,#ff6b6b);border-radius:3px;padding:2px 8px;font-size:11px;cursor:pointer;font-family:inherit;margin-right:4px;">Yes, delete</button>' +
+      '<button id="mz-confirm-no-' + escapeAttr(name) + '" style="background:none;border:1px solid var(--border);color:var(--text-secondary);border-radius:3px;padding:2px 8px;font-size:11px;cursor:pointer;font-family:inherit;">Cancel</button>';
+    // Last child of the row is the action area (the Delete button); replace it.
+    var actionEl = targetRow.lastElementChild;
+    var wrap = document.createElement('span');
+    wrap.style.cssText = 'display:flex;align-items:center;';
+    wrap.innerHTML = confirmHtml;
+    targetRow.replaceChild(wrap, actionEl);
+    var yesBtn = document.getElementById('mz-confirm-yes-' + name);
+    var noBtn = document.getElementById('mz-confirm-no-' + name);
+    if (yesBtn) {
+      yesBtn.focus();
+      yesBtn.onclick = async function() {
+        yesBtn.disabled = true;
+        if (noBtn) noBtn.disabled = true;
+        yesBtn.textContent = 'Deleting…';
+        try {
+          var resp = await fetch('/api/zones/' + encodeURIComponent(name), { method: 'DELETE' });
+          var body = await resp.json().catch(function() { return {}; });
+          if (!resp.ok) {
+            _showMzError((body.error || ('HTTP ' + resp.status)) + ' (zone: ' + name + ')');
+            // Restore the row to its original state so the user can retry.
+            await _renderManageZones();
+            return;
+          }
+          await _renderManageZones();
+          if (typeof fetchOverview === 'function') fetchOverview();
+        } catch (e) {
+          _showMzError('Delete failed: ' + e.message + ' (zone: ' + name + ')');
+          await _renderManageZones();
+        }
+      };
+    }
+    if (noBtn) {
+      noBtn.onclick = function() { _renderManageZones(); };
     }
   };
+
+  // Background click + ESC for manage modal
+  document.getElementById('manage-zones-modal').addEventListener('click', function(e) {
+    if (e.target.id === 'manage-zones-modal') window._closeManageZones();
+  });
+  document.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape' && document.getElementById('manage-zones-modal').style.display === 'flex') {
+      window._closeManageZones();
+    }
+  });
 
   // ─── View: Usage ───
 
@@ -3083,11 +3729,11 @@ tr.clickable { cursor: pointer; }
       '<span>Thread: ' + t.reportThreadId + '</span>';
     document.getElementById('task-modal-prompt').textContent = t.prompt || '(no prompt)';
     var modal = document.getElementById('task-modal');
-    modal.style.display = 'flex';
+    openModal(modal);
   }
 
   function closeTaskModal() {
-    document.getElementById('task-modal').style.display = 'none';
+    closeModal(document.getElementById('task-modal'));
   }
 
   async function fetchBackgroundTasks() {

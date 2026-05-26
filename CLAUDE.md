@@ -16,13 +16,16 @@ Compound knowledge into repos. The repo should get smarter over time — workflo
 
 ## Security Zones
 
-Container-level isolation. Agents are separated into **Core** (trusted) and **Perimeter** (untrusted) zones, with **Infra** running telegram-client + routing only. Zones are invisible to agents — `send_message` works identically; cross-zone messages are held for human approval via Telegram inline keyboard.
+Container-level isolation. Borg has a **routing layer** (`infra`) and any number of **agent zones**. Each agent zone runs in its own Docker container with `BORG_ZONE=<name>` and mounts `.borg-zones/<name>/` at `/app/.borg`. The routing layer mounts `.borg-zones/` (parent) read-only for cross-zone visibility, plus its own `.borg-infra/`. Agents see only `/app/.borg` — they don't know their zone name from filesystem inspection. `send_message` works identically across zones; cross-zone messages are held for human approval via Telegram inline keyboard.
 
-- `zone-config.json` — maps threads to zones, validated by Zod, mtime-cached via `loadZoneConfig()`
-- `BORG_ZONE` env var — always set: `"core"`, `"perimeter"`, or `"infra"`
+- `zone-config.json` — maps threads to zones, validated by Zod, mtime-cached via `loadZoneConfig()`. Reserved names: `infra`, `dashboard`, `broker`, `init`, `cloudflared`, `speaches`, `docker-proxy`, `archived`.
+- `zone-templates.json` — `trusted` (full credentials) and `untrusted` (limited credentials). Used by the dashboard's create-zone API.
+- `BORG_ZONE` env var — set per container: routing layer is `"infra"`; agent zones get their assigned name (`"core"`, `"perimeter"`, or any dashboard-created zone).
 - `ZONE_CONFIG_PATH` env var — path to zone-config.json
-- Per-zone storage: `.borg-core/`, `.borg-perimeter/`, `.borg-infra/`
-- Broadcast filtered to core-zone `mainThread` threads
+- Per-zone storage: `.borg-zones/<name>/` (replaces the old `.borg-core/`, `.borg-perimeter/`). `.borg-infra/` is the routing layer's own scratch.
+- Broadcast filtered to `mainThread: true` threads in any zone.
+
+Zone create/delete is dashboard-only (no MCP tool, no agent capability); deletion archives the data dir.
 
 ## Authentication & Dashboard
 
@@ -91,10 +94,10 @@ Cross-repo knowledge sharing via a shared Telegram group. The `broadcast` MCP to
 
 ```sh
 npm run build        # TypeScript compilation
-docker compose up    # Start infra + core + perimeter containers
+docker compose up    # Start infra + all agent-zone containers
 ```
 
-The `init` service runs automatically before other containers, creating zone directories, config files, and migrating data from old single-container `.borg/` if present. No manual `init-zones.sh` run needed.
+The `init` service runs automatically before other containers, creating per-zone directories under `.borg-zones/`, config files, and migrating data from old single-container `.borg/` or legacy `.borg-{name}/` layouts if present. No manual `init-zones.sh` run needed.
 
 
 ## Wiki

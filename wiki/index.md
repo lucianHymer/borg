@@ -6,7 +6,8 @@ Telegram forum-based multi-session Claude agent with SDK v2, sticky model select
 
 - [Core Pipeline](architecture/core-pipeline.md) — telegram-client vs queue-processor responsibilities, message coalescing, edit/delete queued messages, preview truncation
 - [Cross-Thread Messaging](architecture/cross-thread-messaging.md) — send_message flow, pending message registration, _tg suffix convention, narrating-is-not-sending gotcha
-- [Security Zones](architecture/security-zones.md) — container-level isolation (core/perimeter/infra), cross-zone approval, zone-config.json
+- [Security Zones](architecture/security-zones.md) — container-level isolation (routing layer + agent zones), templates, cross-zone approval, zone-config.json
+- [Dynamic Zone Provisioning](architecture/dynamic-zone-provisioning.md) — dashboard create/delete flow, supervisor replay at boot, templates, reserved names
 - [Model Selection](architecture/model-selection.md) — sticky per-thread model, usage extraction from SDK results, usage in message-history.jsonl, emoji reactions
 - [Teams and Workflows](architecture/teams-and-workflows.md) — MCP tools for teams, three-layer workflow abstraction, skills directory structure
 - [Voice and Images](architecture/voice-and-images.md) — TTS/STT via Speaches, image download+Read pattern, distill functions, TTS config

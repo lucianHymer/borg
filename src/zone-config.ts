@@ -5,6 +5,7 @@
  */
 
 import fs from "fs";
+import path from "path";
 import { z } from "zod/v4";
 import { writeJsonFileSafe } from "./types.js";
 
@@ -13,7 +14,15 @@ import { writeJsonFileSafe } from "./types.js";
 export const ZoneConfigSchema = z.object({
     zones: z.record(
         z.string(), // zone name (e.g. "core", "perimeter")
-        z.object({ threads: z.array(z.number().int().positive()) }),
+        z.object({
+            threads: z.array(z.number().int().positive()),
+            // Template name is just a string here — the templates record in
+            // zone-templates.json is the source of truth on which names are
+            // valid, and `resolveTemplate()` validates at container-create time.
+            // Hardcoding a closed union here would lie to the compiler if a
+            // deployment legitimately added a third template.
+            template: z.string().min(1).optional(),
+        }),
     ),
     defaults: z.object({
         newThread: z.string(),
@@ -144,4 +153,61 @@ export function saveZoneConfig(configPath: string, config: ZoneConfig): void {
 export function clearZoneConfigCache(): void {
     cachedConfig = null;
     cachedMtime = 0;
+}
+
+// ─── Zone directory enumeration ───
+
+/**
+ * List per-zone directories of the form `{zonesRoot}/{zone}/{subpath}` for
+ * every zone declared in zone-config.json. Used by infra to discover all
+ * zones at runtime instead of hardcoding zone names.
+ *
+ * Returns an empty array if the config file is missing or unreadable; callers
+ * decide whether that should be treated as fatal. Backed by `loadZoneConfig`'s
+ * mtime cache, so calling per poll is cheap.
+ *
+ * @param configPath  Path to zone-config.json.
+ * @param zonesRoot   Filesystem path that contains the per-zone directories
+ *                    (e.g. `/app/.borg-zones`).
+ * @param subpath     Sub-path within each zone dir (e.g. `"status"` or
+ *                    `"queue/outgoing"`). Pass `""` to get the zone roots.
+ */
+export function listZoneDirs(configPath: string, zonesRoot: string, subpath: string): string[] {
+    const config = loadZoneConfig(configPath);
+    if (!config) return [];
+    return Object.keys(config.zones).map((zone) =>
+        subpath ? path.join(zonesRoot, zone, subpath) : path.join(zonesRoot, zone),
+    );
+}
+
+/**
+ * Like `listZoneDirs` but returns `{zone, dir}` pairs so callers can attribute
+ * results back to the originating zone.
+ */
+export function listZoneDirsWithNames(
+    configPath: string,
+    zonesRoot: string,
+    subpath: string,
+): Array<{ zone: ZoneName; dir: string }> {
+    const config = loadZoneConfig(configPath);
+    if (!config) return [];
+    return Object.keys(config.zones).map((zone) => ({
+        zone,
+        dir: subpath ? path.join(zonesRoot, zone, subpath) : path.join(zonesRoot, zone),
+    }));
+}
+
+/**
+ * Build a `{zonesRoot}/{zone}/{subpath}` path for a single zone. Pure path
+ * construction — does not consult zone-config, does not validate that the
+ * zone exists. Callers that need validation should look the zone up in
+ * zone-config first.
+ *
+ * @param zone        Zone name (e.g. `"core"`).
+ * @param zonesRoot   Filesystem path containing the per-zone directories.
+ * @param subpath     Sub-path within the zone dir (e.g. `"queue/incoming"`).
+ *                    Pass `""` to get the zone root.
+ */
+export function resolveZoneSubdir(zone: ZoneName, zonesRoot: string, subpath: string): string {
+    return subpath ? path.join(zonesRoot, zone, subpath) : path.join(zonesRoot, zone);
 }

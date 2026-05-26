@@ -1,0 +1,38 @@
+{
+  "trusted": {
+    "_description": "Full credentials (GitHub, Claude, docker-proxy). For internal trusted agent work.",
+    "image": "borg-agent:latest",
+    "memory": "4G",
+    "networks": ["internal"],
+    "mounts": [
+      { "type": "bind", "source": "./secrets/github-installations.json", "target": "/secrets/github-installations.json", "readonly": true },
+      { "type": "bind", "source": "${CLAUDE_CREDENTIALS}", "target": "/home/node/.claude/.credentials.json" },
+      { "type": "bind", "source": "./.borg-zones/{ZONE}/claude-skills", "target": "/home/node/.claude/skills" },
+      { "type": "bind", "source": "./.borg-zones/{ZONE}/claude-settings.json", "target": "/home/node/.claude/settings.json" },
+      { "type": "volume", "name": "claude-plugins-{ZONE}", "target": "/home/node/.claude/plugins" }
+    ],
+    "env": {
+      "CREDENTIAL_BROKER_URL": "http://broker:3000",
+      "BROKER_SECRET": "${BROKER_SECRET}",
+      "PUBLIC_HOST": "${PUBLIC_HOST}",
+      "DOCKER_PROXY_URL": "http://docker-proxy:2375/v1.47"
+    }
+  },
+  "untrusted": {
+    "_description": "Limited credentials (no SSH, no docker-proxy). For sandboxed/untrusted agent work.",
+    "image": "borg-agent:latest",
+    "memory": "1G",
+    "networks": ["internal"],
+    "mounts": [
+      { "type": "bind", "source": "./secrets/github-installations.json", "target": "/secrets/github-installations.json", "readonly": true },
+      { "type": "bind", "source": "${CLAUDE_CREDENTIALS}", "target": "/home/node/.claude/.credentials.json" },
+      { "type": "bind", "source": "./.borg-zones/{ZONE}/claude-skills", "target": "/home/node/.claude/skills" },
+      { "type": "bind", "source": "./.borg-zones/{ZONE}/claude-settings.json", "target": "/home/node/.claude/settings.json" },
+      { "type": "volume", "name": "claude-plugins-{ZONE}", "target": "/home/node/.claude/plugins" }
+    ],
+    "env": {
+      "CREDENTIAL_BROKER_URL": "http://broker:3000",
+      "BROKER_SECRET": "${BROKER_SECRET}"
+    }
+  }
+}

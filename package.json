@@ -4,7 +4,7 @@
   "description": "Borg - Telegram forum-based multi-session Claude agent with SDK v2 and smart routing",
   "main": "dist/telegram-client.js",
   "scripts": {
-    "build": "tsc",
+    "build": "tsc ; tsc -p tsconfig.scripts.json",
     "telegram": "node dist/telegram-client.js",
     "queue": "node dist/queue-processor.js",
     "dashboard": "node dist/dashboard.js",

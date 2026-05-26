@@ -23,11 +23,16 @@ import { toErrorMessage, isValidSessionId, ValidationError } from "./types.js";
 import type { PendingApproval, BackgroundTaskState } from "./types.js";
 import { mergeCorrectionsOntoDecisions } from "./routing-logger.js";
 import { readRecentJsonl } from "./jsonl-reader.js";
-import { loadZoneConfig, getThreadZone, addThreadToZone, removeThreadFromZones, saveZoneConfig, clearZoneConfigCache } from "./zone-config.js";
+import { loadZoneConfig, getThreadZone, addThreadToZone, removeThreadFromZones, saveZoneConfig, clearZoneConfigCache, listZoneDirs, listZoneDirsWithNames } from "./zone-config.js";
+import { createZoneContainer, deleteZoneContainer, getZoneContainerStatus } from "./zone-supervisor.js";
+import { loadZoneTemplates, ZONE_NAME_REGEX, RESERVED_ZONE_NAMES, SYSTEM_ZONE_NAMES } from "./zone-templates.js";
+import { acquireZoneConfigLock } from "./zone-lock.js";
+import { writeTaskStopSignal } from "./task-stop.js";
 
 const SCRIPT_DIR = path.resolve(__dirname, "..");
 const BORG_DIR = path.join(SCRIPT_DIR, ".borg");
 const BORG_INFRA_DIR = path.join(SCRIPT_DIR, ".borg-infra");
+const BORG_ZONES_DIR = path.join(SCRIPT_DIR, ".borg-zones");
 const STATIC_DIR = path.join(SCRIPT_DIR, "static");
 const SESSIONS_DIR = path.join(BORG_DIR, "sessions");
 // threads.json is at project root (shared across all zone containers)
@@ -726,8 +731,7 @@ function findSessionLogFile(sessionId: string): string | null {
     // Search across all zone session directories (infra, core, perimeter)
     const sessionDirs = [
         SESSIONS_DIR,
-        path.join(SCRIPT_DIR, ".borg-core", "sessions"),
-        path.join(SCRIPT_DIR, ".borg-perimeter", "sessions"),
+        ...listZoneDirs(ZONE_CONFIG_PATH, BORG_ZONES_DIR, "sessions"),
     ];
 
     for (const dir of sessionDirs) {
@@ -849,18 +853,44 @@ app.get("/api/logs/:type", (req, res) => {
 // ─── Zone Management API ───
 
 const ZONE_CONFIG_PATH = process.env.ZONE_CONFIG_PATH || path.join(SCRIPT_DIR, "zone-config.json");
-const PENDING_DIRS = [
-    path.join(SCRIPT_DIR, ".borg-core/queue/pending"),
-    path.join(SCRIPT_DIR, ".borg-perimeter/queue/pending"),
+const ZONE_TEMPLATES_PATH = process.env.ZONE_TEMPLATES_PATH ?? path.join(SCRIPT_DIR, "zone-templates.json");
+const ZONE_CONFIG_LOCK_PATH = ZONE_CONFIG_PATH + ".lock";
+const HOST_WORKSPACES_DIR = "/host-workspaces"; // dashboard's view of ${WORKSPACE_HOST_BASE}
+const ARCHIVED_DIR = path.join(BORG_ZONES_DIR, ".archived");
+
+// Per-zone subdir layout mirrored from scripts/init-zones.sh (ZONE_DIRS array).
+// Keep in sync with that script — both are sources of truth for the same shape.
+const ZONE_SUBDIRS = [
+    "queue/incoming",
+    "queue/outgoing",
+    "queue/processing",
+    "queue/dead-letter",
+    "queue/commands",
+    "queue/cancel",
+    "queue/tasks",
+    "queue/task-stop",
+    "sessions",
+    "status",
+    "audio",
+    "audio/incoming",
+    "images",
+    "images/incoming",
+    "logs",
+    "persistent",
+    "claude-skills",
 ];
 
-// GET /api/zones — zone configuration with thread-to-zone mapping
-app.get("/api/zones", (_req, res) => {
+function pendingDirs(): string[] {
+    return listZoneDirs(ZONE_CONFIG_PATH, BORG_ZONES_DIR, "queue/pending");
+}
+
+// GET /api/zones — zone configuration with thread-to-zone mapping + container status
+app.get("/api/zones", async (_req, res) => {
     try {
         clearZoneConfigCache();
         const config = loadZoneConfig(ZONE_CONFIG_PATH);
         if (!config) {
-            res.json({ configured: false, config: null, threadZones: {} });
+            res.json({ configured: false, config: null, threadZones: {}, containerStatus: {} });
             return;
         }
 
@@ -874,7 +904,333 @@ app.get("/api/zones", (_req, res) => {
             threadZones[id] = getThreadZone(config, Number(id));
         }
 
-        res.json({ configured: true, config, threadZones });
+        // Build container status map. System zones (core/perimeter/infra) are
+        // compose-managed; for dynamic zones we ask docker-proxy. Failures
+        // fall back to "missing" so the dashboard stays usable.
+        const zoneNames = Object.keys(config.zones);
+        const containerStatus: Record<string, "running" | "created" | "exited" | "missing" | "managed-by-compose"> = {};
+
+        const dynamicLookups = zoneNames
+            .filter(name => !SYSTEM_ZONE_NAMES.has(name))
+            .map(async (name) => {
+                try {
+                    const info = await getZoneContainerStatus(name);
+                    containerStatus[name] = info.status;
+                } catch (err) {
+                    console.error(
+                        `[dashboard] getZoneContainerStatus("${name}") failed: ${toErrorMessage(err)}`,
+                    );
+                    containerStatus[name] = "missing";
+                }
+            });
+
+        for (const name of zoneNames) {
+            if (SYSTEM_ZONE_NAMES.has(name)) {
+                containerStatus[name] = "managed-by-compose";
+            }
+        }
+
+        await Promise.all(dynamicLookups);
+
+        res.json({ configured: true, config, threadZones, containerStatus });
+    } catch (err) {
+        res.status(500).json({ error: toErrorMessage(err) });
+    }
+});
+
+// POST /api/zones — create a new dynamic zone (config + dirs + container)
+app.post("/api/zones", async (req, res) => {
+    try {
+        const body = req.body as { name?: unknown; template?: unknown };
+        const name = typeof body.name === "string" ? body.name : "";
+        const template = typeof body.template === "string" ? body.template : "";
+
+        // 1. Validate
+        if (!name) {
+            res.status(400).json({ error: "Missing zone name", step: "validate" });
+            return;
+        }
+        if (!ZONE_NAME_REGEX.test(name)) {
+            res.status(400).json({
+                error: `Invalid zone name "${name}" (must match ${ZONE_NAME_REGEX.source})`,
+                step: "validate",
+            });
+            return;
+        }
+        if (SYSTEM_ZONE_NAMES.has(name)) {
+            res.status(400).json({ error: "Cannot create system zone", step: "validate" });
+            return;
+        }
+        if (RESERVED_ZONE_NAMES.has(name)) {
+            res.status(400).json({
+                error: `Zone name "${name}" is reserved`,
+                step: "validate",
+            });
+            return;
+        }
+        if (!template) {
+            res.status(400).json({ error: "Missing template", step: "validate" });
+            return;
+        }
+
+        // Validate template existence pre-lock (cheap; avoids lock + rollback path)
+        try {
+            const templates = loadZoneTemplates(ZONE_TEMPLATES_PATH);
+            if (!(template in templates)) {
+                res.status(400).json({ error: `Unknown template "${template}"`, step: "validate" });
+                return;
+            }
+        } catch (err) {
+            res.status(500).json({ error: toErrorMessage(err), step: "load-templates" });
+            return;
+        }
+
+        // 2. Acquire lock
+        let lock;
+        try {
+            lock = acquireZoneConfigLock(ZONE_CONFIG_LOCK_PATH);
+        } catch (err) {
+            res.status(503).json({
+                error: `Could not acquire zone-config lock: ${toErrorMessage(err)}`,
+                step: "lock",
+            });
+            return;
+        }
+
+        const zoneDir = path.join(BORG_ZONES_DIR, name);
+        const workspaceDir = path.join(HOST_WORKSPACES_DIR, "workspace-" + name);
+        let configAdded = false;
+        let zoneDirCreated = false;
+        let workspaceDirCreated = false;
+
+        try {
+            // 3. Re-read config
+            clearZoneConfigCache();
+            const config = loadZoneConfig(ZONE_CONFIG_PATH);
+            if (!config) {
+                res.status(500).json({
+                    error: "zone-config.json does not exist; refusing to create zone in uninitialized borg",
+                    step: "load-config",
+                });
+                return;
+            }
+
+            // 4. Exists check
+            if (config.zones[name]) {
+                res.status(409).json({ error: "Zone already exists", step: "exists" });
+                return;
+            }
+
+            // 5. Add to config + save
+            const updated = structuredClone(config);
+            updated.zones[name] = { threads: [], template };
+            saveZoneConfig(ZONE_CONFIG_PATH, updated);
+            configAdded = true;
+
+            // 6. Create per-zone dir structure (mirror init-zones.sh ZONE_DIRS)
+            try {
+                for (const sub of ZONE_SUBDIRS) {
+                    fs.mkdirSync(path.join(zoneDir, sub), { recursive: true });
+                }
+                // message-history.jsonl + claude-settings.json (touch empty)
+                const historyFile = path.join(zoneDir, "message-history.jsonl");
+                if (!fs.existsSync(historyFile)) fs.writeFileSync(historyFile, "");
+                const claudeSettings = path.join(zoneDir, "claude-settings.json");
+                if (!fs.existsSync(claudeSettings)) fs.writeFileSync(claudeSettings, "{}");
+                zoneDirCreated = true;
+            } catch (err) {
+                throw new Error(`Failed to create zone "${name}" at step "create-zone-dir": ${toErrorMessage(err)}`);
+            }
+
+            // 6b. Sync skills/global/ → claude-skills/ (mirror init-zones.sh L147-149)
+            const skillsGlobalDir = path.join(SCRIPT_DIR, "skills", "global");
+            const zoneSkillsDir = path.join(BORG_ZONES_DIR, name, "claude-skills");
+            if (fs.existsSync(skillsGlobalDir)) {
+                try {
+                    fs.cpSync(skillsGlobalDir, zoneSkillsDir, { recursive: true });
+                } catch (err) {
+                    // Best-effort — log and continue. Mirrors init-zones.sh's `|| true`.
+                    console.warn(`[dashboard] Failed to sync skills/global → ${zoneSkillsDir}: ${toErrorMessage(err)}`);
+                }
+            }
+
+            // 7. Create workspace dir (AD7)
+            try {
+                fs.mkdirSync(workspaceDir, { recursive: true });
+                workspaceDirCreated = true;
+                try {
+                    fs.chownSync(workspaceDir, 1000, 1000);
+                } catch (chownErr) {
+                    console.error(
+                        `[dashboard] chown workspace dir "${workspaceDir}" to 1000:1000 failed (continuing): ${toErrorMessage(chownErr)}`,
+                    );
+                }
+            } catch (err) {
+                throw new Error(`Failed to create zone "${name}" at step "create-workspace-dir": ${toErrorMessage(err)}`);
+            }
+
+            // 8. Create container
+            let containerInfo;
+            try {
+                containerInfo = await createZoneContainer({ zoneName: name, template });
+            } catch (err) {
+                // Parse step name from supervisor error message:
+                // "Failed to create zone "x" at step "load-template": ..."
+                const msg = toErrorMessage(err);
+                const stepMatch = msg.match(/at step "([^"]+)"/);
+                const step = stepMatch ? stepMatch[1] : "create-container";
+
+                // Rollback: undo dir creates + config addition
+                if (workspaceDirCreated) {
+                    try { fs.rmSync(workspaceDir, { recursive: true, force: true }); }
+                    catch (rmErr) { console.error(`[dashboard] rollback rm "${workspaceDir}" failed: ${toErrorMessage(rmErr)}`); }
+                }
+                if (zoneDirCreated) {
+                    try { fs.rmSync(zoneDir, { recursive: true, force: true }); }
+                    catch (rmErr) { console.error(`[dashboard] rollback rm "${zoneDir}" failed: ${toErrorMessage(rmErr)}`); }
+                }
+                if (configAdded) {
+                    try {
+                        clearZoneConfigCache();
+                        const cur = loadZoneConfig(ZONE_CONFIG_PATH);
+                        if (cur && cur.zones[name]) {
+                            const reverted = structuredClone(cur);
+                            delete reverted.zones[name];
+                            saveZoneConfig(ZONE_CONFIG_PATH, reverted);
+                        }
+                    } catch (cfgErr) {
+                        console.error(`[dashboard] rollback config for "${name}" failed: ${toErrorMessage(cfgErr)}`);
+                    }
+                }
+
+                res.status(500).json({ error: msg, step });
+                return;
+            }
+
+            // 9. (lock released in finally)
+            // 10. Success
+            res.status(201).json({
+                name,
+                containerId: containerInfo.id,
+                status: containerInfo.status,
+            });
+        } finally {
+            lock.release();
+        }
+    } catch (err) {
+        res.status(500).json({ error: toErrorMessage(err) });
+    }
+});
+
+// DELETE /api/zones/:name — delete a dynamic zone (container + archive dir + config)
+app.delete("/api/zones/:name", async (req, res) => {
+    try {
+        const name = req.params.name;
+
+        // 1. Validate name format
+        if (!name || !ZONE_NAME_REGEX.test(name)) {
+            res.status(400).json({
+                error: `Invalid zone name "${name}" (must match ${ZONE_NAME_REGEX.source})`,
+            });
+            return;
+        }
+
+        // 2. Reject system + reserved zones. SYSTEM_ZONE_NAMES ⊆
+        // RESERVED_ZONE_NAMES by construction (see zone-templates.ts), so a
+        // single RESERVED check covers both — kept explicit here for the
+        // clearer error message on the system-zone subset.
+        if (SYSTEM_ZONE_NAMES.has(name)) {
+            res.status(400).json({ error: "Cannot delete system zone" });
+            return;
+        }
+        if (RESERVED_ZONE_NAMES.has(name)) {
+            res.status(400).json({ error: `Zone name "${name}" is reserved` });
+            return;
+        }
+
+        // 3. Acquire lock
+        let lock;
+        try {
+            lock = acquireZoneConfigLock(ZONE_CONFIG_LOCK_PATH);
+        } catch (err) {
+            res.status(503).json({
+                error: `Could not acquire zone-config lock: ${toErrorMessage(err)}`,
+            });
+            return;
+        }
+
+        try {
+            // 4. Re-read config
+            clearZoneConfigCache();
+            const config = loadZoneConfig(ZONE_CONFIG_PATH);
+            if (!config || !config.zones[name]) {
+                res.status(404).json({ error: `Zone "${name}" not found` });
+                return;
+            }
+
+            // 5. Threads guard
+            const threadCount = config.zones[name].threads.length;
+            if (threadCount > 0) {
+                res.status(409).json({
+                    error: `Reassign ${threadCount} thread${threadCount === 1 ? "" : "s"} first`,
+                    threadCount,
+                });
+                return;
+            }
+
+            // 6. Delete container (best-effort)
+            try {
+                await deleteZoneContainer(name);
+            } catch (err) {
+                console.error(
+                    `[dashboard] deleteZoneContainer("${name}") failed (continuing): ${toErrorMessage(err)}`,
+                );
+            }
+
+            // 7. Archive zone dir
+            const zoneDir = path.join(BORG_ZONES_DIR, name);
+            const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+            const archivedPath = path.join(ARCHIVED_DIR, `${name}-${stamp}`);
+            if (fs.existsSync(zoneDir)) {
+                try {
+                    fs.mkdirSync(ARCHIVED_DIR, { recursive: true });
+                    fs.renameSync(zoneDir, archivedPath);
+                } catch (err) {
+                    console.error(
+                        `[dashboard] archive "${zoneDir}" -> "${archivedPath}" failed (continuing): ${toErrorMessage(err)}`,
+                    );
+                }
+            }
+
+            // 8. Remove from config
+            const updated = structuredClone(config);
+            delete updated.zones[name];
+            saveZoneConfig(ZONE_CONFIG_PATH, updated);
+
+            // 10. Success
+            res.json({ name, archivedPath });
+        } finally {
+            lock.release();
+        }
+    } catch (err) {
+        res.status(500).json({ error: toErrorMessage(err) });
+    }
+});
+
+// GET /api/zone-templates — list available templates + name validation rules
+app.get("/api/zone-templates", (_req, res) => {
+    try {
+        const templates = loadZoneTemplates(ZONE_TEMPLATES_PATH);
+        const out: Record<string, { description: string }> = {};
+        for (const [name, tpl] of Object.entries(templates)) {
+            out[name] = { description: tpl._description ?? "" };
+        }
+        res.json({
+            templates: out,
+            reservedNames: Array.from(RESERVED_ZONE_NAMES),
+            systemNames: Array.from(SYSTEM_ZONE_NAMES),
+            nameRegex: ZONE_NAME_REGEX.source,
+        });
     } catch (err) {
         res.status(500).json({ error: toErrorMessage(err) });
     }
@@ -937,7 +1293,7 @@ app.post("/api/zones/remove", (req, res) => {
 app.get("/api/zones/pending", (_req, res) => {
     try {
         const pending: Array<PendingApproval & { ageMs: number }> = [];
-        for (const dir of PENDING_DIRS) {
+        for (const dir of pendingDirs()) {
             if (!fs.existsSync(dir)) continue;
             const files = fs.readdirSync(dir).filter(f => f.endsWith(".json"));
             for (const file of files) {
@@ -969,11 +1325,9 @@ app.get("/api/usage", (_req, res) => {
 
     // Collect message history from all zone directories
     const historyFiles: string[] = [];
-    const borgDir = BORG_DIR;
     const zoneDirs = [
-        borgDir,
-        path.join(SCRIPT_DIR, ".borg-core"),
-        path.join(SCRIPT_DIR, ".borg-perimeter"),
+        BORG_DIR,
+        ...listZoneDirs(ZONE_CONFIG_PATH, BORG_ZONES_DIR, ""),
     ];
 
     for (const dir of zoneDirs) {
@@ -1152,8 +1506,7 @@ app.get("/api/usage/queries", (_req, res) => {
     const historyFiles: string[] = [];
     const zoneDirs = [
         BORG_DIR,
-        path.join(SCRIPT_DIR, ".borg-core"),
-        path.join(SCRIPT_DIR, ".borg-perimeter"),
+        ...listZoneDirs(ZONE_CONFIG_PATH, BORG_ZONES_DIR, ""),
     ];
     for (const dir of zoneDirs) {
         const main = path.join(dir, "message-history.jsonl");
@@ -1258,8 +1611,7 @@ app.get("/api/scheduled-tasks", (_req, res) => {
     // Read scheduled-tasks.json from all zone directories
     const zoneDirs = [
         BORG_DIR,
-        path.join(SCRIPT_DIR, ".borg-core"),
-        path.join(SCRIPT_DIR, ".borg-perimeter"),
+        ...listZoneDirs(ZONE_CONFIG_PATH, BORG_ZONES_DIR, ""),
     ];
 
     interface TaskEntry {
@@ -1321,18 +1673,20 @@ app.get("/api/scheduled-tasks", (_req, res) => {
 // Input validation: messageId and taskId must be safe for use in file paths
 const SAFE_ID = /^[a-zA-Z0-9_\-]+$/;
 
-// Zone directories for cross-zone task scanning (infra reads all zones)
-const TASK_ZONE_DIRS = [
-    BORG_DIR,
-    path.join(SCRIPT_DIR, ".borg-core"),
-    path.join(SCRIPT_DIR, ".borg-perimeter"),
-];
+// Zone directories for cross-zone task scanning (infra reads all zones).
+// Backed by loadZoneConfig's mtime cache, so calling per request is cheap.
+function taskZoneDirs(): string[] {
+    return [
+        BORG_DIR,
+        ...listZoneDirs(ZONE_CONFIG_PATH, BORG_ZONES_DIR, ""),
+    ];
+}
 
 // GET /api/background-tasks — returns all active background tasks across zones
 app.get("/api/background-tasks", (_req, res) => {
     const allStates: BackgroundTaskState[] = [];
 
-    for (const dir of TASK_ZONE_DIRS) {
+    for (const dir of taskZoneDirs()) {
         const tasksDir = path.join(dir, "queue/tasks");
         if (!fs.existsSync(tasksDir)) continue;
         try {
@@ -1363,8 +1717,12 @@ app.post("/api/background-tasks/:taskId/stop", (req, res) => {
     const { taskId } = req.params;
     if (!SAFE_ID.test(taskId)) { res.status(400).json({ error: "Invalid taskId" }); return; }
 
-    // Find which zone this task belongs to by scanning task state files
-    for (const dir of TASK_ZONE_DIRS) {
+    // Find which zone this task belongs to by scanning task state files.
+    // Iterate zone-keyed dirs only (no legacy BORG_DIR) because task-stop writes
+    // must land under the rw-mounted zones base (.borg-zones-rw in compose) —
+    // a separate read-write mount, distinct from the read-only zones mount.
+    // The writeTaskStopSignal helper is the only legitimate writer to that mount.
+    for (const { zone, dir } of listZoneDirsWithNames(ZONE_CONFIG_PATH, BORG_ZONES_DIR, "")) {
         const tasksDir = path.join(dir, "queue/tasks");
         if (!fs.existsSync(tasksDir)) continue;
         try {
@@ -1373,15 +1731,8 @@ app.post("/api/background-tasks/:taskId/stop", (req, res) => {
                 try {
                     const data = JSON.parse(fs.readFileSync(path.join(tasksDir, file), "utf8"));
                     if (data.tasks && data.tasks[taskId]) {
-                        // Found the task — write stop signal to this zone
-                        const stopDir = path.join(dir, "queue/task-stop");
-                        if (!fs.existsSync(stopDir)) {
-                            fs.mkdirSync(stopDir, { recursive: true });
-                        }
-                        const stopFile = path.join(stopDir, `${taskId}.json`);
-                        const tmpFile = stopFile + ".tmp";
-                        fs.writeFileSync(tmpFile, JSON.stringify({ ts: Date.now() }));
-                        fs.renameSync(tmpFile, stopFile);
+                        // Found the task — write stop signal via the helper.
+                        writeTaskStopSignal(zone, taskId, { ts: Date.now() });
                         res.json({ ok: true, taskId });
                         return;
                     }
@@ -1416,8 +1767,7 @@ function findResponseByMessageId(messageId: string): {
 } {
     const zoneDirs = [
         BORG_DIR,
-        path.join(SCRIPT_DIR, ".borg-core"),
-        path.join(SCRIPT_DIR, ".borg-perimeter"),
+        ...listZoneDirs(ZONE_CONFIG_PATH, BORG_ZONES_DIR, ""),
     ];
 
     let incoming: Record<string, unknown> | null = null;
@@ -1455,8 +1805,7 @@ function findResponseByMessageId(messageId: string): {
 function findResponseInTail(messageId: string): Record<string, unknown> | null {
     const zoneDirs = [
         BORG_DIR,
-        path.join(SCRIPT_DIR, ".borg-core"),
-        path.join(SCRIPT_DIR, ".borg-perimeter"),
+        ...listZoneDirs(ZONE_CONFIG_PATH, BORG_ZONES_DIR, ""),
     ];
     const TAIL_BYTES = 128 * 1024;
     for (const dir of zoneDirs) {
@@ -1490,7 +1839,7 @@ function findResponseInTail(messageId: string): Record<string, unknown> | null {
  * Find background task state for a given messageId across all zone directories.
  */
 function findBackgroundTasks(messageId: string): BackgroundTaskState | null {
-    for (const dir of TASK_ZONE_DIRS) {
+    for (const dir of taskZoneDirs()) {
         const taskFile = path.join(dir, "queue/tasks", `${messageId}.json`);
         if (fs.existsSync(taskFile)) {
             try {
@@ -1526,8 +1875,7 @@ app.get("/api/response/:messageId", (req, res) => {
     if (!resolvedSessionId) {
         const zoneDirs = [
             BORG_DIR,
-            path.join(SCRIPT_DIR, ".borg-core"),
-            path.join(SCRIPT_DIR, ".borg-perimeter"),
+            ...listZoneDirs(ZONE_CONFIG_PATH, BORG_ZONES_DIR, ""),
         ];
         for (const dir of zoneDirs) {
             // Try thread-keyed status file
@@ -1591,8 +1939,7 @@ app.get("/api/response/:messageId/feed", (req, res) => {
     function findStatusFile(): string | null {
         const zoneDirs = [
             BORG_DIR,
-            path.join(SCRIPT_DIR, ".borg-core"),
-            path.join(SCRIPT_DIR, ".borg-perimeter"),
+            ...listZoneDirs(ZONE_CONFIG_PATH, BORG_ZONES_DIR, ""),
         ];
         // Resolve messageId → threadId for thread-keyed status lookup
         const { incoming, outgoing } = findResponseByMessageId(messageId);
