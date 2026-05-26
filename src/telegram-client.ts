@@ -692,6 +692,35 @@ for (const cmd of ["clear", "compact"] as const) {
     });
 }
 
+// /continue resets the session timeout window without sending a real message.
+// Useful when you're about to step away from a thread that has a sessionTimeout
+// configured and want to keep the existing session alive a while longer.
+bot.command("continue", async (ctx) => {
+    if (!(await isAllowedChat(ctx, settings))) return;
+    const threadId = resolveThreadId(ctx, settings);
+    if (!threadId) return;
+    const threadConfig = loadThreads()[String(threadId)];
+    if (!threadConfig) {
+        await ctx.reply("Thread is not registered.", {
+            message_thread_id: getCtxThreadOpt(ctx),
+        });
+        return;
+    }
+    configureThread(threadId, { lastActive: Date.now() });
+    const timeout = threadConfig.sessionTimeout;
+    const hasSession = !!threadConfig.sessionId;
+    let reply: string;
+    if (!timeout) {
+        reply = "Session timeout is disabled for this thread — nothing to reset.";
+    } else if (!hasSession) {
+        reply = `No active session to continue. (Idle window reset to ${timeout}m.)`;
+    } else {
+        reply = `Session timeout reset — ${timeout}m from now.`;
+    }
+    await ctx.reply(reply, { message_thread_id: getCtxThreadOpt(ctx) });
+    log("INFO", `Thread ${threadId} /continue by ${ctx.from?.first_name ?? "unknown"}`);
+});
+
 bot.command("setdir", async (ctx) => {
     if (!(await isAllowedChat(ctx, settings))) return;
     const threadId = resolveThreadId(ctx, settings);
@@ -2848,6 +2877,7 @@ bot.start({
         await bot.api.setMyCommands([
             { command: "clear", description: "Reset session (recent history preserved)" },
             { command: "compact", description: "Reset session (recent history preserved)" },
+            { command: "continue", description: "Reset session timeout window (keeps current session alive)" },
             { command: "model", description: "Set thread model: /model <haiku|sonnet|opus|opus200>" },
             { command: "setdir", description: "Set working directory for this thread" },
             { command: "budget_on", description: "Enable budget mode (cheap model)" },
